@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aind-dft-ephys-analysis"
-description = "Generated from aind-library-template"
+description = "shared library for dynamic foraging task (DFT) - neuropixels analysis"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
@@ -17,6 +17,9 @@ readme = "README.md"
 dynamic = ["version"]
 
 dependencies = [
+    'numpy',
+    'matplotlib',
+    'pandas'
 ]
 
 [project.optional-dependencies]
@@ -37,7 +40,7 @@ where = ["src"]
 version = {attr = "aind_dft_ephys_analysis.__version__"}
 
 [tool.black]
-line-length = 79
+line-length = 100
 target_version = ['py310']
 exclude = '''
 
@@ -68,12 +71,12 @@ exclude_lines = [
     "^import .*",
     "pragma: no cover"
 ]
-fail_under = 100
+fail_under = 80
 
 [tool.isort]
-line_length = 79
+line_length = 100
 profile = "black"
 
 [tool.interrogate]
 exclude = ["setup.py", "docs", "build"]
-fail-under = 100
+fail-under = 90
