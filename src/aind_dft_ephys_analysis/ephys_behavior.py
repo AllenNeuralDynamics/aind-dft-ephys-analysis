@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Any, List, Optional
@@ -13,14 +14,17 @@ def plot_raster_graph(
     bin_size: float = 0.05,
     fitted_data: Optional[np.ndarray] = None,
     latent_name: Optional[str] = None,
-    exclude_trials: Optional[List[int]] = None
+    exclude_trials: Optional[List[int]] = None,
+    save_figure: bool = False,
+    save_format: str = 'eps',
+    save_folder: str = '/root/capsule/results',
+    figure_name_prefix: Optional[str] = None,
 ) -> None:
     """
     Plot spike raster and PSTH for a single unit, aligned to a specified event,
     with optional trial sorting based on fitted model data and exclusion of specific trials.
-
-    If `fitted_data` and `latent_name` are provided, trials are sorted by that latent measure,
-    and the title and annotations reflect the sorting by `latent_name`.
+    Optionally save the figure in the given format and folder. If `figure_name_prefix` is provided,
+    it will be prepended to the saved filename; otherwise, filenames start with `unit_<unit_index>`.
 
     Parameters
     ----------
@@ -42,12 +46,23 @@ def plot_raster_graph(
         Name of the latent variable used for sorting; displayed in title/annotations.
     exclude_trials : list of int, optional
         Trial indices to drop before sorting and plotting.
-
+    save_figure : bool, optional
+        If True, save the figure to disk (default False).
+    save_format : str, optional
+        File format for saving (e.g., 'eps', 'pdf'; default 'eps').
+    save_folder : str, optional
+        Directory to which the figure will be saved (default '/root/capsule/results').
+    figure_name_prefix : str, optional
+        Identifier for the recording session, used in saved filenames. If None, omitted.
     Returns
     -------
     None
-        Displays a raster (top) and PSTH (bottom) plot.
+        Displays a raster (top) and PSTH (bottom) plot, and saves if requested.
     """
+    # Create save directory if needed
+    if save_figure:
+        os.makedirs(save_folder, exist_ok=True)
+
     # 1. Retrieve all event timestamps (one per trial)
     all_times = np.array(
         extract_event_timestamps(nwb_behavior_data, align_to_event)
@@ -130,4 +145,19 @@ def plot_raster_graph(
     ax_psth.set_title('PSTH')
 
     plt.tight_layout()
+
+    # Save if requested
+    if save_figure:
+        # Build base filename
+        parts = []
+        if figure_name_prefix:
+            parts.append(figure_name_prefix)
+        parts.append(f'unit_{unit_index}')
+        if fitted_data is not None and latent_name:
+            parts.append(f'sorted_by_{latent_name}')
+        filename = "_".join(parts) + f'.{save_format}'
+        filepath = os.path.join(save_folder, filename)
+        fig.savefig(filepath, format=save_format)
+        print(f'Figure saved as {filepath}')
+
     plt.show()
