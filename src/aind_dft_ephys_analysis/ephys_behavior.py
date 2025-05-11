@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Any, List, Optional
+from typing import Any, List, Optional,Tuple
 
 from behavior_utils import extract_event_timestamps  # adjust import based on module path
 
@@ -161,3 +161,48 @@ def plot_raster_graph(
         print(f'Figure saved as {filepath}')
 
     plt.show()
+
+
+def get_units_passed_default_qc(nwb_ephys_data: Any) -> np.ndarray:
+    """
+    Retrieves the indices of units in an NWB ephys dataset that have passed the
+    automated default QC (`default_qc` flag) and are not labeled as 'noise'.
+
+    The `default_qc` flag is precomputed based on internal thresholds applied to the
+    following metrics:
+
+    - **presence_ratio** (float): Fraction of the recording session during which the unit was active.
+      Units must have `presence_ratio >= 0.8`.
+    - **isi_violations_ratio** (float): Proportion of inter-spike intervals violating the refractory period.
+      Units must have `isi_violations_ratio <= 0.5`.
+    - **amplitude_cutoff** (float): Estimated fraction of missed spikes due to detection threshold.
+      Units must have `amplitude_cutoff <= 0.1`.
+
+    After computing these, the `default_qc` field should be True. Additionally, units
+    labeled as 'noise' by `decoder_label` are excluded.
+
+    Input
+    -----
+    nwb_ephys_data : pynwb.NWBFile or similar
+        NWB file handle containing a `.units` DynamicTable with at least:
+        - `default_qc` (bool or str): Automated QC pass flag.
+        - `decoder_label` (str): Unit classification; 'noise' to exclude.
+
+    Output
+    ------
+    indices : numpy.ndarray of int
+        1D array of integer indices of units where `default_qc` is True 
+        (or 'True') and `decoder_label` != 'noise'.
+    """
+    tbl = nwb_ephys_data.units
+    default_qc = np.array(tbl['default_qc'].data)
+    labels = np.array(tbl['decoder_label'].data)
+
+    # Mask for QC-passed, non-noise units
+    mask = ((default_qc == True) | (default_qc == 'True')) & (labels != 'noise')
+
+    # Return indices
+    indices = np.nonzero(mask)[0]
+    print(f"Number of units passing QC: {len(indices)}")
+    return indices
+
