@@ -156,7 +156,8 @@ def format_session_name(session_name):
     Returns:
     - str: The formatted session name.
     """
-    
+    # Step 0: extract the core session name
+    session_name=extract_session_name_core(session_name)
     # Step 1: Ensure that session_name ends with '.nwb'
     if not session_name.endswith('.nwb'):
         # If the session name does not already have '.nwb', append it.
