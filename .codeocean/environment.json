@@ -1,0 +1,96 @@
+{
+	"version": 1,
+	"base_image": "codeocean/c1-vscode:4.20.0-pylint2023.10.1-copilot1.143.601",
+	"options": {
+		"registry_host_arg": true,
+		"git_ask_pass": true
+	},
+	"installers": {
+		"apt": {
+			"packages": [
+				{
+					"name": "build-essential",
+					"version": "12.9ubuntu3"
+				},
+				{
+					"name": "software-properties-common",
+					"version": "0.99.22.9"
+				}
+			],
+			"sources": [
+				"ppa:deadsnakes/ppa"
+			],
+			"install_software_properties_common": true
+		},
+		"pip3": {
+			"packages": [
+				{
+					"name": "aind-mri-utils",
+					"version": "0.3.0"
+				},
+				{
+					"name": "aind-spurious-correlation",
+					"version": "0.0.4"
+				},
+				{
+					"name": "antspyx",
+					"version": "0.5.3"
+				},
+				{
+					"name": "git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-basic-analysis.git#egg=aind-dynamic-foraging-basic-analysis",
+					"version": "5543aa88f3585200e4dc896c1a366de3803c0166"
+				},
+				{
+					"name": "git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-data-utils.git#egg=aind-dynamic-foraging-data-utils",
+					"version": "c2984af731e2d85c250091cfa3cee95c247e5758"
+				},
+				{
+					"name": "hdmf-zarr",
+					"version": "0.11.0"
+				},
+				{
+					"name": "ipykernel",
+					"version": "6.29.5"
+				},
+				{
+					"name": "jupyter",
+					"version": "1.1.1"
+				},
+				{
+					"name": "matplotlib",
+					"version": "3.10.0"
+				},
+				{
+					"name": "numpy",
+					"version": "2.2.2"
+				},
+				{
+					"name": "pandas",
+					"version": "2.2.3"
+				},
+				{
+					"name": "pynwb",
+					"version": "2.8.3"
+				},
+				{
+					"name": "scikit-learn",
+					"version": "1.6.1"
+				},
+				{
+					"name": "scipy",
+					"version": "1.15.1"
+				},
+				{
+					"name": "spikeinterface[full]",
+					"version": "0.102.2"
+				},
+				{
+					"name": "statsmodels",
+					"version": "0.14.4"
+				}
+			],
+			"options": {},
+			"pre_install_options": {}
+		}
+	}
+}
