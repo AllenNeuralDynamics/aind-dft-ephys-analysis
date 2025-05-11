@@ -5,7 +5,6 @@ from hdmf_zarr import NWBZarrIO
 from pynwb import NWBHDF5IO
 from utils import extract_session_name_core
 
-
 class NWBUtils:
     """
     Utility class offering static methods to locate and read ephys, behavior, and ophys NWB files.
