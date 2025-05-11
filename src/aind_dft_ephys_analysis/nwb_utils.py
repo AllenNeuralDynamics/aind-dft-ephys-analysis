@@ -3,7 +3,7 @@ import glob
 from typing import Optional, Any
 from hdmf_zarr import NWBZarrIO
 from pynwb import NWBHDF5IO
-from utils_general import extract_session_name_core
+from general_utils import extract_session_name_core
 
 class NWBUtils:
     """
@@ -69,7 +69,9 @@ class NWBUtils:
         file_path = files[0]
         print(f"Found ephys NWB: {file_path}")
         try:
-            data = NWBZarrIO(file_path, 'r').read()
+            io = NWBZarrIO(file_path, 'r')
+            data = io.read()
+            data.io = io  # Optional: attach so you can later call `data.io.close()` safely
             print(f"Successfully read ephys NWB from: {file_path}")
             return data
         except Exception as e:
@@ -124,13 +126,16 @@ class NWBUtils:
         print(f"Found behavior NWB: {path}")
         # Read file (HDF5 first, then Zarr)
         try:
-            with NWBHDF5IO(path, 'r') as io:
-                data = io.read()
+            io = NWBHDF5IO(path, 'r')
+            data = io.read()
+            data.io = io  # Optional: attach so you can later call `data.io.close()` safely
             print(f"Successfully read behavior NWB from: {path}")
             return data
         except Exception:
             try:
-                data = NWBZarrIO(path, 'r').read()
+                io = NWBZarrIO(path, 'r')
+                data = io.read()
+                data.io = io  # Optional: attach so you can later call `data.io.close()` safely
                 print(f"Successfully read behavior NWB from: {path}")
                 return data
             except Exception as e:
@@ -196,7 +201,9 @@ class NWBUtils:
         file_path = files[0]
         print(f"Found ophys NWB: {file_path}")
         try:
-            data = NWBZarrIO(file_path, 'r').read()
+            io = NWBZarrIO(file_path, 'r')
+            data = io.read()
+            data.io = io  # Optional: attach so you can later call `data.io.close()` safely
             print(f"Successfully read ophys NWB from: {file_path}")
             return data
         except Exception as e:
