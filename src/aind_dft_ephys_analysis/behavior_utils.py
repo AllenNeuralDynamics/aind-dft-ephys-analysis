@@ -1,5 +1,10 @@
-import numpy as np
-from typing import Optional, List, Any
+import os       
+import json     
+from typing import Optional, List, Any, Dict  
+
+import numpy as np        
+import requests           
+
 
 def extract_event_timestamps(
     nwb_behavior_data: Any,
@@ -74,7 +79,7 @@ def extract_event_timestamps(
     # Default lick_time_window when needed
     if lick_time_window is None:
         lick_time_window = 1.0
-        
+
     # Shorthand access to trials table and acquisition modules
     trials = nwb_behavior_data.trials
     acq = nwb_behavior_data.acquisition
@@ -192,3 +197,160 @@ def extract_event_timestamps(
         return sorted(out)
 
     raise ValueError(f"Unsupported event '{event_name}'")
+
+
+def get_fitted_model_names(
+    session_name: str,
+    url: str = "https://api.allenneuraldynamics-test.org/v1/behavior_analysis/mle_fitting"
+) -> List[str]:
+    """
+    Retrieves fitted model(s) from the specified URL for a given session name.
+
+    If the provided session name does not end with ".nwb", the function will
+    automatically append ".nwb" to it.
+
+    Args:
+        session_name (str):
+            The NWB session name. If the provided session name does not end with
+            ".nwb", ".nwb" will be appended to it.
+        url (str):
+            The endpoint to request model fitting results from.
+            Defaults to "https://api.allenneuraldynamics-test.org/v1/behavior_analysis/mle_fitting".
+
+    Returns:
+        List[str]:
+            A list of fitted model aliases found in the response JSON.
+
+    Raises:
+        ValueError:
+            If `session_name` is an empty string.
+        requests.exceptions.RequestException:
+            If the HTTP request fails due to network, timeout, or other errors.
+    """
+    # Validate the session_name parameter
+    if not session_name:
+        raise ValueError("The 'session_name' parameter cannot be empty.")
+
+    session_name = format_session_name(session_name)
+
+    # Construct the query parameters
+    filter_payload = {"nwb_name": session_name}
+    projection_payload = {
+        "analysis_results.fit_settings.agent_alias": 1,
+        "_id": 0,
+    }
+
+    try:
+        # Make the GET request
+        response = requests.get(
+            url,
+            params={
+                "filter": json.dumps(filter_payload),
+                "projection": json.dumps(projection_payload),
+            },
+            timeout=10  # seconds
+        )
+        # Raise an HTTPError if the response was unsuccessful
+        response.raise_for_status()
+
+        # Parse the JSON data
+        data = response.json()
+
+        # Extract the model aliases
+        fitted_models = [
+            item["analysis_results"]["fit_settings"]["agent_alias"]
+            for item in data
+        ]
+        return fitted_models
+
+    except requests.exceptions.RequestException as e:
+        # Handle potential network or HTTP errors
+        print(f"Error during the request: {e}")
+        return
+
+def get_fitted_latent(
+    session_name: str,
+    model_alias: str,
+    url: str = "https://api.allenneuraldynamics-test.org/v1/behavior_analysis/mle_fitting",
+    timeout: Optional[int] = 10
+) -> Dict[str, Any]:
+    """
+    Retrieve the fitted latent variables (and parameters) for a specific model
+    in a given NWB session.
+
+    Args:
+        session_name (str): 
+            The NWB session name. For example, "744329_2024-11-25_12-13-37.nwb".
+        model_alias (str): 
+            The alias of the model for which to retrieve the fitted latent variables.
+            For example, "QLearning_L1F1_CK1_softmax".
+        url (str): 
+            The endpoint to request data from.
+            Defaults to "https://api.allenneuraldynamics-test.org/v1/behavior_analysis/mle_fitting".
+        timeout (int, optional):
+            The request timeout in seconds. Defaults to 10.
+
+    Returns:
+        Dict[str, Any]:
+            A dictionary containing at least:
+            - "params": model-fitted parameters
+            - "fitted_latent_variables": time series or other latent variables
+
+    Raises:
+        ValueError:
+            If the JSON response is empty or does not have the expected structure.
+        requests.exceptions.RequestException:
+            If the HTTP request fails due to a network error, timeout, or other issues.
+    """
+    # Validate the session_name parameter
+    if not session_name:
+        raise ValueError("The 'session_name' parameter cannot be empty.")
+
+    session_name = format_session_name(session_name)
+
+    # Build the filter and projection payloads
+    filter_payload = {
+        "nwb_name": session_name,
+        "analysis_results.fit_settings.agent_alias": model_alias,
+    }
+    projection_payload = {
+        "analysis_results.params": 1,
+        "analysis_results.fitted_latent_variables": 1,
+        "_id": 0,
+    }
+
+    try:
+        response = requests.get(
+            url,
+            params={
+                "filter": json.dumps(filter_payload),
+                "projection": json.dumps(projection_payload),
+            },
+            timeout=timeout,
+        )
+        # Raise an HTTPError if the response was unsuccessful
+        response.raise_for_status()
+
+        data = response.json()
+        if not data:
+            print("The response returned an empty list. No data was found.")
+            return 
+
+        # Expect only one record for this session and model
+        record_dict = data[0]
+
+        # Extract fitted parameters and latent variables
+        analysis_results = record_dict.get("analysis_results", {})
+        if "params" not in analysis_results or "fitted_latent_variables" not in analysis_results:
+            raise ValueError(
+                "The expected keys ('params' and 'fitted_latent_variables') were not found in the response."
+            )
+
+        return {
+            "params": analysis_results["params"],
+            "fitted_latent_variables": analysis_results["fitted_latent_variables"]
+        }
+
+    except requests.exceptions.RequestException as e:
+        print(f"HTTP Request Error: {e}")
+        return
