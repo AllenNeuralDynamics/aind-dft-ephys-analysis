@@ -5,6 +5,7 @@ from typing import Optional, List, Any, Dict
 import numpy as np        
 import requests           
 
+from general_utils import format_session_name
 
 def extract_event_timestamps(
     nwb_behavior_data: Any,
