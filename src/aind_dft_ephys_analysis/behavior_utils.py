@@ -354,3 +354,110 @@ def get_fitted_latent(
     except requests.exceptions.RequestException as e:
         print(f"HTTP Request Error: {e}")
         return
+
+def extract_fitted_data(
+    nwb_behavior_data: Any,
+    fitted_latent: Optional[Dict[str, Any]] = None,
+    session_name: Optional[str] = None,
+    model_alias: Optional[str] = None,
+    latent_name: Optional[str] = None
+) -> Optional[np.ndarray]:
+    """
+    Extract a chosen derived time series from a behavioral model’s fitted latent variables.
+
+    You must supply **either**:
+      - `fitted_latent`: the dict returned by `get_fitted_latent(...)`, **or**
+      - all three of `session_name`, `model_alias`, and `latent_name`, so that this function can fetch it.
+
+    Parameters
+    ----------
+    nwb_behavior_data : Any
+        An open NWB object (from NWBHDF5IO.read() or NWBZarrIO.read()).
+        Must contain `.trials` with columns:
+          - 'rewarded_historyL', 'rewarded_historyR', 'animal_response'
+        (needed only for latent_name='RPE').
+
+    fitted_latent : dict, optional
+        If provided, this dict should have come from:
+            get_fitted_latent(session_name, model_alias)
+        containing at least 'fitted_latent_variables'.
+        If None, this function will fetch it using the other arguments.
+
+    session_name : str, optional
+        NWB session identifier, e.g. "744329_2024-11-25_12-13-37.nwb".
+        Required if `fitted_latent` is None.
+
+    model_alias : str, optional
+        Alias of the fitted model, e.g. "QLearning_L1F1_CK1_softmax".
+        Required if `fitted_latent` is None.
+
+    latent_name : str, optional
+        Which derived series to return. One of:
+          - 'q_value_difference'       → Q₁ − Q₀, skipping trial 0
+          - 'total_value'              → Q₁ + Q₀, skipping trial 0
+          - 'right_choice_probability' → choice_prob[1] (all trials)
+          - 'RPE'                      → reward_prediction_error on valid trials
+        Required if `fitted_latent` is None, **and** always needed to choose the output.
+
+    Returns
+    -------
+    np.ndarray or None
+        A 1-D float array:
+          - len(Q)-1 for 'q_value_difference' and 'total_value'
+          - len(choice_prob[1]) for 'right_choice_probability'
+          - number of trials with response != 2 for 'RPE'
+        Returns None if:
+          - unable to fetch or parse fitted_latent
+          - latent_name unsupported
+    """
+    # 1) Validate inputs
+    if fitted_latent is None:
+        if session_name is None or model_alias is None or latent_name is None:
+            raise ValueError(
+                "If fitted_latent is not provided, session_name, model_alias, and latent_name are required"
+            )
+        # Fetch fit
+        fit = get_fitted_latent(session_name, model_alias)
+    else:
+        if latent_name is None:
+            raise ValueError("latent_name must be provided when using fitted_latent directly")
+        fit = fitted_latent
+
+    # 2) Ensure fetched fit is valid
+    if not fit or 'fitted_latent_variables' not in fit:
+        return None
+
+    FL = fit['fitted_latent_variables']
+    q0 = np.array(FL['q_value'][0])
+    q1 = np.array(FL['q_value'][1])
+
+    # 3) Compute requested series
+    if latent_name == 'q_value_difference':
+        return (q1 - q0)[1:]
+
+    if latent_name == 'total_value':
+        return (q1 + q0)[1:]
+
+    if latent_name == 'right_choice_probability':
+        return np.array(FL['choice_prob'][1])
+
+    if latent_name == 'RPE':
+        trials = nwb_behavior_data.trials
+        rewardedL = trials['rewarded_historyL'][:]
+        rewardedR = trials['rewarded_historyR'][:]
+        responses = trials['animal_response'][:]
+
+        # drop initial trial
+        q0 = q0[1:]
+        q1 = q1[1:]
+
+        valid = responses != 2
+        rewarded = (rewardedL | rewardedR).astype(int)[valid]
+        resp     = responses[valid]
+
+        # reward prediction error = reward − Q(choice)
+        return np.where(resp == 0, rewarded - q0, rewarded - q1)
+
+    # Unsupported latent_name
+    return None
+
