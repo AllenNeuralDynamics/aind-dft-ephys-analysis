@@ -461,3 +461,56 @@ def extract_fitted_data(
     # Unsupported latent_name
     return None
 
+def find_trials(
+    nwb_behavior_data: Any,
+    trial_type: str = 'no_response'
+) -> List[int]:
+    """
+    Return trial indices matching the specified trial_type.
+
+    Parameters
+    ----------
+    nwb_behavior_data : Any
+        NWB object with .trials table containing:
+          - 'rewarded_historyL', 'rewarded_historyR', 'animal_response'
+    trial_type : str, optional
+        One of:
+          - 'no_response'      : trials where animal_response == 2
+          - 'response'         : trials where animal_response != 2
+          - 'rewarded'         : trials where either L or R was rewarded
+          - 'unrewarded'       : trials where no reward and response != 2
+          - 'left_rewarded'    : trials where left side was rewarded
+          - 'right_rewarded'   : trials where right side was rewarded
+        Default is 'no_response'.
+
+    Returns
+    -------
+    List[int]
+        List of zero-based trial indices matching the type.
+
+    Raises
+    ------
+    ValueError
+        If trial_type is unsupported.
+    """
+    trials = nwb_behavior_data.trials
+    resp = trials['animal_response'][:]
+    rewardedL = trials['rewarded_historyL'][:]
+    rewardedR = trials['rewarded_historyR'][:]
+    rewarded = np.logical_or(rewardedL, rewardedR)
+
+    if trial_type == 'no_response':
+        return np.where(resp == 2)[0].tolist()
+    elif trial_type == 'response':
+        return np.where(resp != 2)[0].tolist()
+    elif trial_type == 'rewarded':
+        return np.where(rewarded)[0].tolist()
+    elif trial_type == 'unrewarded':
+        mask = np.logical_and(~rewarded, resp != 2)
+        return np.where(mask)[0].tolist()
+    elif trial_type == 'left_rewarded':
+        return np.where(rewardedL)[0].tolist()
+    elif trial_type == 'right_rewarded':
+        return np.where(rewardedR)[0].tolist()
+    else:
+        raise ValueError(f"Unsupported trial_type '{trial_type}'")
