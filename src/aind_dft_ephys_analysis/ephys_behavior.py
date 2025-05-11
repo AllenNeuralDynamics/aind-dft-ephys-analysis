@@ -8,18 +8,19 @@ def plot_raster_graph(
     nwb_behavior_data: Any,
     nwb_ephys_data: Any,
     unit_index: int,
-    event_name: str = 'go_cue',
+    align_to_event: str = 'go_cue',
     time_window: List[float] = [-2, 3],
     bin_size: float = 0.05,
     fitted_data: Optional[np.ndarray] = None,
+    latent_name: Optional[str] = None,
     exclude_trials: Optional[List[int]] = None
 ) -> None:
     """
     Plot spike raster and PSTH for a single unit, aligned to a specified event,
     with optional trial sorting based on fitted model data and exclusion of specific trials.
 
-    If `fitted_data` is provided, trials are sorted and the bottom of the raster (row 1)
-    corresponds to the lowest fitted value, while the top corresponds to the highest.
+    If `fitted_data` and `latent_name` are provided, trials are sorted by that latent measure,
+    and the title and annotations reflect the sorting by `latent_name`.
 
     Parameters
     ----------
@@ -29,7 +30,7 @@ def plot_raster_graph(
         NWB object containing unit spike times under `.units['spike_times']`.
     unit_index : int
         Index of the unit to plot.
-    event_name : str, optional
+    align_to_event : str, optional
         The event to align spikes to (default 'go_cue').
     time_window : list of float, optional
         [start, end] times (in seconds) relative to event for alignment (default [-2, 3]).
@@ -37,6 +38,8 @@ def plot_raster_graph(
         Bin size for PSTH in seconds (default 0.05).
     fitted_data : ndarray, optional
         1D array of trial-specific values for sorting; must correspond to each trial.
+    latent_name : str, optional
+        Name of the latent variable used for sorting; displayed in title/annotations.
     exclude_trials : list of int, optional
         Trial indices to drop before sorting and plotting.
 
@@ -47,7 +50,7 @@ def plot_raster_graph(
     """
     # 1. Retrieve all event timestamps (one per trial)
     all_times = np.array(
-        extract_event_timestamps(nwb_behavior_data, event_name)
+        extract_event_timestamps(nwb_behavior_data, align_to_event)
     )
     n_trials = len(all_times)
     trials_idx = np.arange(n_trials)
@@ -101,7 +104,10 @@ def plot_raster_graph(
         ax_raster.vlines(spks, row_idx + 0.5, row_idx + 1.5, color='black')
     ax_raster.axvline(0, color='red', linestyle='--')
     ax_raster.set_ylabel('Trials')
-    ax_raster.set_title(f'Raster: Unit {unit_index} aligned to {event_name}')
+    title = f'Raster: Unit {unit_index} aligned to {align_to_event}'
+    if fitted_data is not None and latent_name:
+        title += f' (sorted by {latent_name})'
+    ax_raster.set_title(title)
     ax_raster.set_ylim(0.5, num_plotted + 0.5)
 
     # If sorted by fitted_data, annotate low/high positions
