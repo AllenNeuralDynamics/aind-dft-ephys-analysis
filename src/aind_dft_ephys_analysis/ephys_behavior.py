@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import Any, List, Optional
 
-from extract_event_timestamps_refactor import extract_event_timestamps  # adjust import based on module path
+from behavior_utils import extract_event_timestamps  # adjust import based on module path
 
 def plot_raster_graph(
     nwb_behavior_data: Any,
