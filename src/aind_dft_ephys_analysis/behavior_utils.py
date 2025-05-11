@@ -4,7 +4,7 @@ from typing import Optional, List, Any
 def extract_event_timestamps(
     nwb_behavior_data: Any,
     event_name: str,
-    lick_time_window: float = 1.0,
+    lick_time_window: Optional[float] = None,
     before_go_cue_lick_time_window: Optional[List[float]] = None,
     quiet_window: Optional[List[float]] = None
 ) -> List[float]:
@@ -71,7 +71,10 @@ def extract_event_timestamps(
         before_go_cue_lick_time_window = [-3.0, -2.0]
     if quiet_window is None:
         quiet_window = [-0.5, 0.5]
-
+    # Default lick_time_window when needed
+    if lick_time_window is None:
+        lick_time_window = 1.0
+        
     # Shorthand access to trials table and acquisition modules
     trials = nwb_behavior_data.trials
     acq = nwb_behavior_data.acquisition
