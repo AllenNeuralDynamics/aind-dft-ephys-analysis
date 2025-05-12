@@ -214,7 +214,7 @@ def get_the_mean_firing_rate(
     nwb_data: Any,
     unit_index: Union[int, List[int], None] = None,
     align_to_event: str = 'go_cue',
-    time_windows: List[List[float]] = [[-1, 0]],
+    time_windows: List[List[float]] = [[-1, 0],[0,2]],
     z_score: bool = False
 ) -> pd.DataFrame:
     """
