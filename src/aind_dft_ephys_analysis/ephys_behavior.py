@@ -6,6 +6,7 @@ from typing import Any, List, Optional, Union, Tuple
 
 from behavior_utils import extract_event_timestamps 
 from general_utils import extract_session_name_core
+from nwb_utils import NWBUtils
 
 def plot_raster_graph(
     nwb_data: Any,
@@ -324,7 +325,6 @@ def get_the_mean_firing_rate_combined_sessions(
             z_score=z_score
         )
         nwb_data.io.close()
-        df['session_name'] = sess
         all_dfs.append(df)
 
     if not all_dfs:
