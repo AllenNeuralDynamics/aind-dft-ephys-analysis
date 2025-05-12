@@ -2,13 +2,13 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from typing import Any, List, Optional,Tuple,Union
+from typing import Any, List, Optional, Union, Tuple
 
 from behavior_utils import extract_event_timestamps  # adjust import based on module path
 
+
 def plot_raster_graph(
-    nwb_behavior_data: Any,
-    nwb_ephys_data: Any,
+    nwb_data: Any,
     unit_index: int,
     align_to_event: str = 'go_cue',
     time_window: List[float] = [-2, 3],
@@ -22,67 +22,69 @@ def plot_raster_graph(
     figure_name_prefix: Optional[str] = None,
 ) -> None:
     """
-    Plot spike raster and PSTH for a single unit, aligned to a specified event,
-    with optional trial sorting based on fitted model data and exclusion of specific trials.
-    Optionally save the figure in the given format and folder. If `figure_name_prefix` is provided,
-    it will be prepended to the saved filename; otherwise, filenames start with `unit_<unit_index>`.
+    Plot spike raster and PSTH for a single unit from a combined NWB file.
+
+    This function takes a combined NWB object (containing both behavior trials and ephys unit data),
+    extracts spike times for the specified unit, aligns them to a behavioral event for each trial,
+    constructs a raster plot and corresponding peri-stimulus time histogram (PSTH),
+    and optionally saves the figure.
 
     Parameters
     ----------
-    nwb_behavior_data : NWB behavior handle
-        NWB object containing trial timestamps and behavior metadata.
-    nwb_ephys_data : NWB ephys handle
-        NWB object containing unit spike times under `.units['spike_times']`.
+    nwb_data : NWB file handle
+        Combined NWB object containing:
+        - `trials` table or times as used by `extract_event_timestamps`.
+        - `units` DynamicTable with a `spike_times` column.
     unit_index : int
-        Index of the unit to plot.
+        Index of the unit to plot (row in `nwb_data.units`).
     align_to_event : str, optional
-        The event to align spikes to (default 'go_cue').
-    time_window : list of float, optional
-        [start, end] times (in seconds) relative to event for alignment (default [-2, 3]).
+        The event name to align spikes to (default 'go_cue'). Passed to `extract_event_timestamps`.
+    time_window : list of two floats, optional
+        [start, end] times (seconds) relative to event for alignment (default [-2, 3]).
     bin_size : float, optional
-        Bin size for PSTH in seconds (default 0.05).
-    fitted_data : ndarray, optional
-        1D array of trial-specific values for sorting; must correspond to each trial.
+        Bin width (seconds) for PSTH histogram (default 0.05).
+    fitted_data : 1D numpy.ndarray, optional
+        Trial-specific values (length equal to number of trials) to sort the raster by;
+        must match number of included trials if provided (default None).
     latent_name : str, optional
-        Name of the latent variable used for sorting; displayed in title/annotations.
+        Name of the latent variable in `fitted_data`; used for title annotation if sorting.
     exclude_trials : list of int, optional
-        Trial indices to drop before sorting and plotting.
+        List of trial indices to exclude before sorting and plotting (default None).
     save_figure : bool, optional
-        If True, save the figure to disk (default False).
+        If True, saves the figure to disk (default False).
     save_format : str, optional
-        File format for saving (e.g., 'eps', 'pdf'; default 'eps').
+        File format for saving figure (e.g., 'eps', 'pdf'; default 'eps').
     save_folder : str, optional
-        Directory to which the figure will be saved (default '/root/capsule/results').
+        Directory path to save figures (default '/root/capsule/results').
     figure_name_prefix : str, optional
-        Identifier for the recording session, used in saved filenames. If None, omitted.
+        Filename prefix for saved figure (omit extension). If None, filename built from unit
+        index and sorting information.
+
     Returns
     -------
     None
-        Displays a raster (top) and PSTH (bottom) plot, and saves if requested.
+        Displays the raster and PSTH plot. If `save_figure` is True, prints the saved file path.
     """
     # Create save directory if needed
     if save_figure:
         os.makedirs(save_folder, exist_ok=True)
 
-    # 1. Retrieve all event timestamps (one per trial)
-    all_times = np.array(
-        extract_event_timestamps(nwb_behavior_data, align_to_event)
-    )
+    # 1. Retrieve event timestamps per trial
+    all_times = np.array(extract_event_timestamps(nwb_data, align_to_event))
     n_trials = len(all_times)
-    trials_idx = np.arange(n_trials)
 
-    # 2. Exclude specified trials
+    # 2. Exclude specified trials if any
+    trials_idx = np.arange(n_trials)
     if exclude_trials:
-        mask_exclude = np.ones(n_trials, dtype=bool)
-        mask_exclude[exclude_trials] = False
-        all_times = all_times[mask_exclude]
-        trials_idx = trials_idx[mask_exclude]
+        mask_exc = np.ones(n_trials, dtype=bool)
+        mask_exc[exclude_trials] = False
+        all_times = all_times[mask_exc]
+        trials_idx = trials_idx[mask_exc]
 
     # 3. Validate fitted_data length
     if fitted_data is not None and len(fitted_data) != len(all_times):
         raise ValueError(
-            f"After exclusion, fitted_data length ({len(fitted_data)}) does not match "
-            f"number of trials ({len(all_times)})."
+            f"After exclusion, fitted_data length ({len(fitted_data)}) does not match number of trials ({len(all_times)})"
         )
 
     # 4. Sort trials by fitted_data if provided
@@ -91,19 +93,19 @@ def plot_raster_graph(
         all_times = all_times[sort_idx]
         trials_idx = trials_idx[sort_idx]
 
-    # 5. Load spike times
+    # 5. Load spike times for the unit
     try:
-        unit_spike_times = nwb_ephys_data.units['spike_times'][unit_index]
+        unit_spike_times = np.array(nwb_data.units['spike_times'][unit_index])
     except Exception:
         raise ValueError(f"Spike times not found for unit {unit_index}.")
 
     # 6. Align spikes and collect for PSTH
-    spikes_aligned = []  # (row_idx, aligned_times)
+    spikes_aligned = []  # list of (trial_idx, aligned_spikes)
     all_spikes = []
     for row_idx, t0 in enumerate(all_times):
         start, end = t0 + time_window[0], t0 + time_window[1]
-        mask = (unit_spike_times >= start) & (unit_spike_times <= end)
-        aligned = unit_spike_times[mask] - t0
+        mask_spk = (unit_spike_times >= start) & (unit_spike_times <= end)
+        aligned = unit_spike_times[mask_spk] - t0
         spikes_aligned.append((row_idx, aligned))
         all_spikes.extend(aligned.tolist())
 
@@ -164,12 +166,12 @@ def plot_raster_graph(
     plt.show()
 
 
-def get_units_passed_default_qc(nwb_ephys_data: Any) -> np.ndarray:
+def get_units_passed_default_qc(nwb_data: Any) -> np.ndarray:
     """
-    Retrieves the indices of units in an NWB ephys dataset that have passed the
-    automated default QC (`default_qc` flag) and are not labeled as 'noise'.
+    Retrieves the indices of units in a combined NWB dataset that have passed
+    the automated default QC checks and are not labeled as 'noise'.
 
-    The `default_qc` flag is precomputed based on internal thresholds applied to the
+    The `default_qc` flag is precomputed based on the
     following metrics:
 
     - **presence_ratio** (float): Fraction of the recording session during which the unit was active.
@@ -182,20 +184,19 @@ def get_units_passed_default_qc(nwb_ephys_data: Any) -> np.ndarray:
     After computing these, the `default_qc` field should be True. Additionally, units
     labeled as 'noise' by `decoder_label` are excluded.
 
-    Input
-    -----
-    nwb_ephys_data : pynwb.NWBFile or similar
-        NWB file handle containing a `.units` DynamicTable with at least:
-        - `default_qc` (bool or str): Automated QC pass flag.
-        - `decoder_label` (str): Unit classification; 'noise' to exclude.
+    Parameters
+    ----------
+    nwb_data : NWB file handle
+        Combined NWB object containing a `units` table with columns:
+        `default_qc` and `decoder_label`.
 
-    Output
-    ------
-    indices : numpy.ndarray of int
-        1D array of integer indices of units where `default_qc` is True 
-        (or 'True') and `decoder_label` != 'noise'.
+    Returns
+    -------
+    indices : numpy.ndarray
+        1D array of integer indices of units where `default_qc` is True
+        and `decoder_label` != 'noise'.
     """
-    tbl = nwb_ephys_data.units
+    tbl = nwb_data.units
     default_qc = np.array(tbl['default_qc'].data)
     labels = np.array(tbl['decoder_label'].data)
 
@@ -207,9 +208,9 @@ def get_units_passed_default_qc(nwb_ephys_data: Any) -> np.ndarray:
     print(f"Number of units passing QC: {len(indices)}")
     return indices
 
+
 def get_the_mean_firing_rate(
-    nwb_behavior_data: Any,
-    nwb_ephys_data: Any,
+    nwb_data: Any,
     unit_index: Union[int, List[int], None] = None,
     align_to_event: str = 'go_cue',
     time_windows: List[List[float]] = [[-1, 0]],
@@ -222,33 +223,33 @@ def get_the_mean_firing_rate(
 
     Parameters
     ----------
-    nwb_behavior_data : NWB behavior handle
-        NWB object containing trial timestamps (.trials.goCue_start_time or via extract_event_timestamps).
-    nwb_ephys_data : NWB ephys handle
-        NWB object containing unit spike times under `.units['spike_times']`.
+    nwb_data : NWB file handle
+        Combined NWB object containing behavior trials and `units` spike_times.
     unit_index : int, list of int, or None
-        Index or list of indices of units to process. If None, uses all units with default QC pass.
+        Unit index or list of indices to process. If None, uses all units passing default QC.
     align_to_event : str
-        Name of the event to align to (passed to extract_event_timestamps).
+        Event name to align spikes to (default 'go_cue').
     time_windows : list of [start, end]
-        List of time windows (in seconds relative to event) for which to compute firing rates.
-        Example: [[-2, 1], [1, 2]].
+        Windows (seconds relative to event) for computing firing rates; e.g., [[-2,1],[1,2]].
     z_score : bool
-        If True, z-score normalize firing rates across trials for each unit.
+        If True, normalize each unit's firing rates (per window) across trials to z-scores.
 
     Returns
     -------
     firing_rate_df : pd.DataFrame
-        Rows correspond to units; columns correspond to windows (named "window_<start>_<end>").
-        Each cell contains a NumPy array of length N_trials with mean firing rates (spikes/sec) per trial.
+        MultiIndex DataFrame with:
+          - Rows: Trial number (Trial_1, Trial_2, ...).
+          - Columns: MultiIndex (Unit, Window) indicating unit index and window label
+            ("window_<start>_<end>").
+        Each cell contains the mean firing rate (spikes/sec) for that trial, unit, and window.
     """
     # Retrieve event times per trial
-    all_times = np.array(extract_event_timestamps(nwb_behavior_data, align_to_event))
+    all_times = np.array(extract_event_timestamps(nwb_data, align_to_event))
     num_trials = len(all_times)
 
     # Determine units to process
     if unit_index is None:
-        units_to_process = list(get_units_passed_default_qc(nwb_ephys_data))
+        units_to_process = list(get_units_passed_default_qc(nwb_data))
     elif isinstance(unit_index, list):
         units_to_process = unit_index
     else:
@@ -260,7 +261,7 @@ def get_the_mean_firing_rate(
     data = {}
 
     for u in units_to_process:
-        unit_spike_times = np.array(nwb_ephys_data.units['spike_times'][u])
+        unit_spike_times = np.array(nwb_data.units['spike_times'][u])
         rates_matrix = np.zeros((num_trials, len(time_windows)))
         for wi, (start_offset, end_offset) in enumerate(time_windows):
             duration = end_offset - start_offset
