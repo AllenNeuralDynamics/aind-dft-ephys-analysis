@@ -1,7 +1,8 @@
 import os
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-from typing import Any, List, Optional,Tuple
+from typing import Any, List, Optional,Tuple,Union
 
 from behavior_utils import extract_event_timestamps  # adjust import based on module path
 
@@ -206,3 +207,84 @@ def get_units_passed_default_qc(nwb_ephys_data: Any) -> np.ndarray:
     print(f"Number of units passing QC: {len(indices)}")
     return indices
 
+def get_the_mean_firing_rate(
+    nwb_behavior_data: Any,
+    nwb_ephys_data: Any,
+    unit_index: Union[int, List[int], None] = None,
+    align_to_event: str = 'go_cue',
+    time_windows: List[List[float]] = [[-1, 0]],
+    z_score: bool = False
+) -> pd.DataFrame:
+    """
+    Calculate mean firing rates per trial for specified units over one or more time windows
+    aligned to a behavioral event. If `unit_index` is None, only units passing default QC
+    (via `default_qc`) are processed.
+
+    Parameters
+    ----------
+    nwb_behavior_data : NWB behavior handle
+        NWB object containing trial timestamps (.trials.goCue_start_time or via extract_event_timestamps).
+    nwb_ephys_data : NWB ephys handle
+        NWB object containing unit spike times under `.units['spike_times']`.
+    unit_index : int, list of int, or None
+        Index or list of indices of units to process. If None, uses all units with default QC pass.
+    align_to_event : str
+        Name of the event to align to (passed to extract_event_timestamps).
+    time_windows : list of [start, end]
+        List of time windows (in seconds relative to event) for which to compute firing rates.
+        Example: [[-2, 1], [1, 2]].
+    z_score : bool
+        If True, z-score normalize firing rates across trials for each unit.
+
+    Returns
+    -------
+    firing_rate_df : pd.DataFrame
+        Rows correspond to units; columns correspond to windows (named "window_<start>_<end>").
+        Each cell contains a NumPy array of length N_trials with mean firing rates (spikes/sec) per trial.
+    """
+    # Retrieve event times per trial
+    all_times = np.array(extract_event_timestamps(nwb_behavior_data, align_to_event))
+    num_trials = len(all_times)
+
+    # Determine units to process
+    if unit_index is None:
+        units_to_process = list(get_units_passed_default_qc(nwb_ephys_data))
+    elif isinstance(unit_index, list):
+        units_to_process = unit_index
+    else:
+        units_to_process = [unit_index]
+
+    # Prepare labels
+    window_labels = [f"window_{int(w[0])}_{int(w[1])}" for w in time_windows]
+    # Data dict: unit -> matrix trials x windows
+    data = {}
+
+    for u in units_to_process:
+        unit_spike_times = np.array(nwb_ephys_data.units['spike_times'][u])
+        rates_matrix = np.zeros((num_trials, len(time_windows)))
+        for wi, (start_offset, end_offset) in enumerate(time_windows):
+            duration = end_offset - start_offset
+            for ti, t0 in enumerate(all_times):
+                start = t0 + start_offset
+                end = t0 + end_offset
+                count = np.sum((unit_spike_times >= start) & (unit_spike_times <= end))
+                rates_matrix[ti, wi] = count / duration if duration > 0 else np.nan
+        if z_score:
+            means = rates_matrix.mean(axis=0)
+            stds = rates_matrix.std(axis=0)
+            rates_matrix = (rates_matrix - means) / stds
+            rates_matrix = np.nan_to_num(rates_matrix)
+        data[u] = rates_matrix
+
+    # Build DataFrame: MultiIndex columns (unit, window, trial)
+    tuples = []
+    values = []
+    for u, matrix in data.items():
+        for wi, label in enumerate(window_labels):
+            tuples.append((u, label))
+            values.append(matrix[:, wi])
+    index = pd.Index([f'Trial_{i+1}' for i in range(num_trials)], name='Trial')
+    columns = pd.MultiIndex.from_tuples(tuples, names=['Unit', 'Window'])
+    df = pd.DataFrame(np.stack(values, axis=1), index=index, columns=columns)
+
+    return df
