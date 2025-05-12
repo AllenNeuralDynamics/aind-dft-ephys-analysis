@@ -248,17 +248,17 @@ class NWBUtils:
         # Neither loaded?
         if ephys_data is None and behavior_data is None:
             print("Warning: Could not load either ephys or behavior NWB.")
-            return None
+            return None, 'none_loaded'
 
         # Only ephys
         if behavior_data is None:
             print("Warning: Behavior NWB failed to load; returning ephys NWB only.")
-            return ephys_data
+            return ephys_data, 'ephys_only'
 
         # Only behavior
         if ephys_data is None:
             print("Warning: Ephys NWB failed to load; returning behavior NWB only.")
-            return behavior_data
+            return behavior_data, 'behavior_only'
 
         # Both loaded → combine
         try:
@@ -273,4 +273,4 @@ class NWBUtils:
             except Exception:
                 pass
 
-        return behavior_data
+        return behavior_data, 'both'
