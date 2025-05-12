@@ -209,7 +209,7 @@ class NWBUtils:
         except Exception as e:
             print(f"Error reading ophys NWB file '{file_path}': {e}")
             return None
-            
+
     @staticmethod
     def combine_nwb(
         ephys_folder_path: str = '/root/capsule/data/',
@@ -220,62 +220,62 @@ class NWBUtils:
     ) -> Optional[Any]:
         """
         Reads both ephys and behavior NWB for a session, appends the ephys `units` table into
-        the behavior NWB file, and returns the combined NWB object.
+        the behavior NWB file if both are present, closes file handles, and returns:
 
-        If both `ephys_nwb_full_path` and `behavior_nwb_full_path` are None, then
-        `session_name` (along with `ephys_folder_path` and `behavior_folder_path`) is required
-        to locate the files. If either full path is provided, folder paths and session_name
-        are not necessary.
+          - The combined behavior NWB if both loaded,
+          - The only-loaded NWB if one failed (with a warning),
+          - None if neither could load.
 
-        Parameters
-        ----------
-        ephys_folder_path : str
-            Base directory for ephys sessions.
-        behavior_folder_path : str
-            Base directory for behavior sessions.
-        session_name : str, optional
-            Session identifier for locating files when full paths are not given.
-        ephys_nwb_full_path : str, optional
-            Direct path to the ephys NWB file.
-        behavior_nwb_full_path : str, optional
-            Direct path to the behavior NWB file.
-
-        Returns
-        -------
-        combined_nwb : pynwb.NWBFile or similar, or None
-            Behavior NWB object with `units` table appended from ephys data,
-            or None if reading failed.
+        If neither full path is provided, session_name (plus folder paths) is required.
         """
-        # Validate requirement of session_name if no full paths
-        if not ephys_nwb_full_path and not behavior_nwb_full_path:
-            if not session_name:
-                print("Warning: session_name is required when no full paths are provided.")
-                return None
+        # Require session_name if no explicit paths
+        if not ephys_nwb_full_path and not behavior_nwb_full_path and not session_name:
+            print("Warning: session_name is required when no full paths are provided.")
+            return None
 
-        # Load ephys data
+        # Attempt to load each
         ephys_data = NWBUtils.read_ephys_nwb(
             folder_path=ephys_folder_path,
             nwb_full_path=ephys_nwb_full_path,
             session_name=session_name
         )
-        # Load behavior data
         behavior_data = NWBUtils.read_behavior_nwb(
             folder_path=behavior_folder_path,
             nwb_full_path=behavior_nwb_full_path,
             session_name=session_name
         )
 
-        # Verify loads
-        if ephys_data is None or behavior_data is None:
-            print("Warning: Could not load both ephys and behavior NWB files.")
+        # Neither loaded
+        if ephys_data is None and behavior_data is None:
+            print("Warning: Could not load either ephys or behavior NWB.")
             return None
 
-        # Append units table
+        # Only ephys loaded
+        if behavior_data is None:
+            print("Warning: Behavior NWB failed to load; returning ephys NWB only.")
+            try: ephys_data.io.close()
+            except: pass
+            return ephys_data
+
+        # Only behavior loaded
+        if ephys_data is None:
+            print("Warning: Ephys NWB failed to load; returning behavior NWB only.")
+            try: behavior_data.io.close()
+            except: pass
+            return behavior_data
+
+        # Both loaded: combine units into behavior
         try:
             behavior_data.units = ephys_data.units
             print("Successfully appended units table to behavior NWB.")
         except Exception as e:
             print(f"Error appending units table: {e}")
-            return None
+            # fall through to cleanup & return behavior_data
+        finally:
+            # close both readers
+            try: ephys_data.io.close()
+            except: pass
+            try: behavior_data.io.close()
+            except: pass
 
         return behavior_data
