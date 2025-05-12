@@ -314,8 +314,8 @@ def get_the_mean_firing_rate_combined_sessions(
     all_dfs = []
     for sess in session_names:
         print(f"Processing session {sess}...")
-        nwb_data = NWBUtils.combine_nwb(session_name=sess)
-        if nwb_data is None:
+        nwb_data,tag = NWBUtils.combine_nwb(session_name=sess)
+        if tag in ['none_loaded','behavior_only']:
             print(f"Warning: could not load session {sess}, skipping.")
             continue
         df = get_the_mean_firing_rate(
