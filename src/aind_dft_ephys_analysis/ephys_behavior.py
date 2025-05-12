@@ -4,8 +4,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Any, List, Optional, Union, Tuple
 
-from behavior_utils import extract_event_timestamps  # adjust import based on module path
-
+from behavior_utils import extract_event_timestamps 
+from general_utils import extract_session_name_core
 
 def plot_raster_graph(
     nwb_data: Any,
@@ -209,6 +209,7 @@ def get_units_passed_default_qc(nwb_data: Any) -> np.ndarray:
     return indices
 
 
+
 def get_the_mean_firing_rate(
     nwb_data: Any,
     unit_index: Union[int, List[int], None] = None,
@@ -218,13 +219,13 @@ def get_the_mean_firing_rate(
 ) -> pd.DataFrame:
     """
     Calculate mean firing rates per trial for specified units over one or more time windows
-    aligned to a behavioral event. If `unit_index` is None, only units passing default QC
-    (via `default_qc`) are processed.
+    aligned to a behavioral event, and return a tidy DataFrame with session, unit, window,
+    and a list of firing rates per trial.
 
     Parameters
     ----------
     nwb_data : NWB file handle
-        Combined NWB object containing behavior trials and `units` spike_times.
+        Combined NWB object containing `session_id`, behavior trials, and units spike_times.
     unit_index : int, list of int, or None
         Unit index or list of indices to process. If None, uses all units passing default QC.
     align_to_event : str
@@ -237,17 +238,16 @@ def get_the_mean_firing_rate(
     Returns
     -------
     firing_rate_df : pd.DataFrame
-        MultiIndex DataFrame with:
-          - Rows: Trial number (Trial_1, Trial_2, ...).
-          - Columns: MultiIndex (Unit, Window) indicating unit index and window label
-            ("window_<start>_<end>").
-        Each cell contains the mean firing rate (spikes/sec) for that trial, unit, and window.
+        A DataFrame with columns:
+          - session_id: the NWB session identifier
+          - unit_index: integer unit index
+          - time_window: string label of the form "start_end"
+          - rates: list of mean firing rates (spikes/sec) per trial
     """
-    # Retrieve event times per trial
+    session_id = extract_session_name_core(getattr(nwb_data, 'session_id', None))
     all_times = np.array(extract_event_timestamps(nwb_data, align_to_event))
-    num_trials = len(all_times)
+    n_trials = len(all_times)
 
-    # Determine units to process
     if unit_index is None:
         units_to_process = list(get_units_passed_default_qc(nwb_data))
     elif isinstance(unit_index, list):
@@ -255,37 +255,27 @@ def get_the_mean_firing_rate(
     else:
         units_to_process = [unit_index]
 
-    # Prepare labels
-    window_labels = [f"window_{int(w[0])}_{int(w[1])}" for w in time_windows]
-    # Data dict: unit -> matrix trials x windows
-    data = {}
-
+    rows = []
     for u in units_to_process:
-        unit_spike_times = np.array(nwb_data.units['spike_times'][u])
-        rates_matrix = np.zeros((num_trials, len(time_windows)))
-        for wi, (start_offset, end_offset) in enumerate(time_windows):
+        spikes = np.array(nwb_data.units['spike_times'][u])
+        for start_offset, end_offset in time_windows:
             duration = end_offset - start_offset
-            for ti, t0 in enumerate(all_times):
-                start = t0 + start_offset
-                end = t0 + end_offset
-                count = np.sum((unit_spike_times >= start) & (unit_spike_times <= end))
-                rates_matrix[ti, wi] = count / duration if duration > 0 else np.nan
-        if z_score:
-            means = rates_matrix.mean(axis=0)
-            stds = rates_matrix.std(axis=0)
-            rates_matrix = (rates_matrix - means) / stds
-            rates_matrix = np.nan_to_num(rates_matrix)
-        data[u] = rates_matrix
+            rates = []
+            for t0 in all_times:
+                cnt = np.sum((spikes >= t0 + start_offset) & (spikes <= t0 + end_offset))
+                rates.append(cnt / duration if duration > 0 else np.nan)
+            rates = np.array(rates)
+            if z_score:
+                m = np.nanmean(rates)
+                sd = np.nanstd(rates)
+                rates = (rates - m) / sd
+                rates = np.nan_to_num(rates)
+            rows.append({
+                'session_id': session_id,
+                'unit_index': u,
+                'time_window': f"{start_offset}_{end_offset}",
+                'rates': rates.tolist()
+            })
 
-    # Build DataFrame: MultiIndex columns (unit, window, trial)
-    tuples = []
-    values = []
-    for u, matrix in data.items():
-        for wi, label in enumerate(window_labels):
-            tuples.append((u, label))
-            values.append(matrix[:, wi])
-    index = pd.Index([f'Trial_{i+1}' for i in range(num_trials)], name='Trial')
-    columns = pd.MultiIndex.from_tuples(tuples, names=['Unit', 'Window'])
-    df = pd.DataFrame(np.stack(values, axis=1), index=index, columns=columns)
-
-    return df
+    firing_rate_df = pd.DataFrame(rows, columns=['session_id', 'unit_index', 'time_window', 'rates'])
+    return firing_rate_df
