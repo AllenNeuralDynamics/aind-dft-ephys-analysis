@@ -245,37 +245,32 @@ class NWBUtils:
             session_name=session_name
         )
 
-        # Neither loaded
+        # Neither loaded?
         if ephys_data is None and behavior_data is None:
             print("Warning: Could not load either ephys or behavior NWB.")
             return None
 
-        # Only ephys loaded
+        # Only ephys
         if behavior_data is None:
             print("Warning: Behavior NWB failed to load; returning ephys NWB only.")
-            try: ephys_data.io.close()
-            except: pass
             return ephys_data
 
-        # Only behavior loaded
+        # Only behavior
         if ephys_data is None:
             print("Warning: Ephys NWB failed to load; returning behavior NWB only.")
-            try: behavior_data.io.close()
-            except: pass
             return behavior_data
 
-        # Both loaded: combine units into behavior
+        # Both loaded → combine
         try:
             behavior_data.units = ephys_data.units
             print("Successfully appended units table to behavior NWB.")
         except Exception as e:
             print(f"Error appending units table: {e}")
-            # fall through to cleanup & return behavior_data
         finally:
-            # close both readers
-            try: ephys_data.io.close()
-            except: pass
-            try: behavior_data.io.close()
-            except: pass
+            # **Only close the ephys reader** so behavior_data stays usable
+            try:
+                ephys_data.io.close()
+            except Exception:
+                pass
 
         return behavior_data
