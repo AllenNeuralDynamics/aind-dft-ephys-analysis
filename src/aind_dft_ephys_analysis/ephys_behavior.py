@@ -209,13 +209,12 @@ def get_units_passed_default_qc(nwb_data: Any) -> np.ndarray:
     return indices
 
 
-
 def get_the_mean_firing_rate(
     nwb_data: Any,
     unit_index: Union[int, List[int], None] = None,
     align_to_event: str = 'go_cue',
     time_windows: List[List[float]] = [[-1, 0],[0,2]],
-    z_score: bool = False
+    z_score: Union[bool, List[bool]] = False
 ) -> pd.DataFrame:
     """
     Calculate mean firing rates per trial for specified units over one or more time windows
@@ -255,6 +254,9 @@ def get_the_mean_firing_rate(
     else:
         units_to_process = [unit_index]
 
+    if isinstance(z_score, bool):
+        z_score = [z_score]
+
     rows = []
     for u in units_to_process:
         spikes = np.array(nwb_data.units['spike_times'][u])
@@ -264,18 +266,69 @@ def get_the_mean_firing_rate(
             for t0 in all_times:
                 cnt = np.sum((spikes >= t0 + start_offset) & (spikes <= t0 + end_offset))
                 rates.append(cnt / duration if duration > 0 else np.nan)
-            rates = np.array(rates)
-            if z_score:
-                m = np.nanmean(rates)
-                sd = np.nanstd(rates)
-                rates = (rates - m) / sd
-                rates = np.nan_to_num(rates)
-            rows.append({
-                'session_id': session_id,
-                'unit_index': u,
-                'time_window': f"{start_offset}_{end_offset}",
-                'rates': rates.tolist()
-            })
+            orig_rates = np.array(rates)
+            for flag in z_score:
+                rates_to_store = orig_rates.copy()
+                if flag:
+                    m, sd = np.nanmean(rates_to_store), np.nanstd(rates_to_store)
+                    rates_to_store = (rates_to_store - m) / sd
+                    rates_to_store = np.nan_to_num(rates_to_store)
+                rows.append({
+                    'session_id': session_id,
+                    'unit_index': u,
+                    'time_window': f"{start_offset}_{end_offset}",
+                    'z_score': flag,
+                    'rates': rates_to_store.tolist()
+                })
 
-    firing_rate_df = pd.DataFrame(rows, columns=['session_id', 'unit_index', 'time_window', 'rates'])
+    firing_rate_df = pd.DataFrame(rows, columns=['session_id', 'unit_index', 'time_window','z_score', 'rates'])
     return firing_rate_df
+
+def get_the_mean_firing_rate_combined_sessions(
+    session_names: List[str],
+    align_to_event: str = 'go_cue',
+    time_windows: List[List[float]] = [[-1, 0], [0, 2]],
+    z_score: Union[bool, List[bool]] = False
+) -> pd.DataFrame:
+    """
+    Computes mean firing rates for multiple sessions and combines them into one DataFrame.
+
+    Parameters
+    ----------
+    session_names : list of str
+        List of session identifiers to process.
+    align_to_event : str
+        Event name to align spikes to (default 'go_cue').
+    time_windows : list of [start, end]
+        Windows (seconds relative to event) for computing firing rates.
+    z_score : bool
+        If True, normalize firing rates per window across trials within each session.
+
+    Returns
+    -------
+    combined_df : pd.DataFrame
+        Concatenated DataFrame of `get_the_mean_firing_rate` output for each session,
+        with an additional `session_name` column.
+    """
+    all_dfs = []
+    for sess in session_names:
+        print(f"Processing session {sess}...")
+        nwb_data = NWBUtils.combine_nwb(session_name=sess)
+        if nwb_data is None:
+            print(f"Warning: could not load session {sess}, skipping.")
+            continue
+        df = get_the_mean_firing_rate(
+            nwb_data,
+            align_to_event=align_to_event,
+            time_windows=time_windows,
+            z_score=z_score
+        )
+        nwb_data.io.close()
+        df['session_name'] = sess
+        all_dfs.append(df)
+
+    if not all_dfs:
+        return pd.DataFrame(columns=['session_name', 'unit_index', 'time_window', 'z_score' 'rates'])
+
+    combined_df = pd.concat(all_dfs, ignore_index=True)
+    return combined_df
