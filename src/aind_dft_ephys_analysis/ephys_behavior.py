@@ -328,7 +328,7 @@ def get_the_mean_firing_rate_combined_sessions(
         all_dfs.append(df)
 
     if not all_dfs:
-        return pd.DataFrame(columns=['session_name', 'unit_index', 'time_window', 'z_score' 'rates'])
+        return pd.DataFrame(columns=['session_id', 'unit_index', 'time_window', 'z_score' 'rates'])
 
     combined_df = pd.concat(all_dfs, ignore_index=True)
     return combined_df
