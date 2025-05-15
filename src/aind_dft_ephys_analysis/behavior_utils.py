@@ -1,6 +1,6 @@
 import os       
 import json     
-from typing import Optional, List, Any, Dict  
+from typing import Optional, List, Any, Dict ,Union
 
 import numpy as np        
 import requests           
@@ -467,7 +467,7 @@ def find_trials(
     trial_type: Union[str, List[str]] = 'no_response'
 ) -> List[int]:
     """
-    Return trial indices matching the specified trial_type(s).
+    Return trial indices matching one or more trial_type values.
 
     Parameters
     ----------
@@ -489,12 +489,12 @@ def find_trials(
     List[int]
         Sorted list of zero-based trial indices matching the type(s).
     """
-    # support a list of trial types by unioning each result
+    # If given a list, union together each single-type result
     if isinstance(trial_type, (list, tuple)):
-        all_idx = set()
+        idx_set = set()
         for t in trial_type:
-            all_idx.update(find_trials(nwb_behavior_data, t))
-        return sorted(all_idx)
+            idx_set.update(find_trials(nwb_behavior_data, t))
+        return sorted(idx_set)
 
     # single-trial_type logic
     trials = nwb_behavior_data.trials
@@ -518,3 +518,4 @@ def find_trials(
         return np.where(rewardedR)[0].tolist()
     else:
         raise ValueError(f"Unsupported trial_type '{trial_type}'")
+
