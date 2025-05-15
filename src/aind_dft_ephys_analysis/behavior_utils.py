@@ -1,11 +1,14 @@
 import os       
-import json     
+import json   
+import requests   
 from typing import Optional, List, Any, Dict ,Union
 
-import numpy as np        
-import requests           
+import numpy as np   
+import pandas as pd
 
 from general_utils import format_session_name
+from general_utils import extract_session_name_core
+from nwb_utils import NWBUtils
 
 def extract_event_timestamps(
     nwb_behavior_data: Any,
@@ -334,7 +337,7 @@ def get_fitted_latent(
 
         data = response.json()
         if not data:
-            print("The response returned an empty list. No data was found.")
+            print(f"The response returned an empty list. No data was found for session:{session_name} model:{model_alias}.")
             return 
 
         # Expect only one record for this session and model
@@ -519,3 +522,130 @@ def find_trials(
     else:
         raise ValueError(f"Unsupported trial_type '{trial_type}'")
 
+
+def generate_behavior_summary(
+    nwb_data: Any,
+    model_alias:  Union[str, List[str]] = ['QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax'],
+    latent_names: Optional[List[str]] = None,
+    trial_types: Optional[List[str]] = None
+) -> pd.DataFrame:
+    """
+    Generate a one‑row DataFrame summarizing behavior for a session.
+
+    Columns:
+      - session_id: session identifier (cleaned)
+      - <alias>_<latent_name>: list of latent values per trial or None
+      - <trial_type>_trials: list of trial indices matching that type
+    """
+    # obtain session information from nwb_data
+    full_session_name = getattr(nwb_data, 'session_id', None)
+    session_id = extract_session_name_core(full_session_name) or full_session_name
+
+    # normalize model_alias to list
+    aliases = [model_alias] if isinstance(model_alias, str) else list(model_alias)
+
+    # default latent names
+    if latent_names is None:
+        latent_names = [
+            'q_value_difference',      
+            'total_value',            
+            'right_choice_probability',
+            'RPE'                      
+        ]
+    # default trial types
+    if trial_types is None:
+        trial_types = [
+            'no_response','response','rewarded','unrewarded',
+            'left_rewarded','right_rewarded'
+        ]
+
+    # build summary dict
+    summary: dict = {'session_id': session_id}
+
+    # collect latent values for each alias and latent_name
+    for alias in aliases:
+        for ln in latent_names:
+            values = extract_fitted_data(
+                nwb_behavior_data=nwb_data,
+                session_name=full_session_name,
+                model_alias=alias,
+                latent_name=ln
+            )
+            col = f"{alias}_{ln}"
+            summary[col] = values.tolist() if values is not None else None
+
+    # collect trial indices per type
+    for tt in trial_types:
+        idxs = find_trials(nwb_data, tt)
+        summary[f"{tt}_trials"] = idxs
+
+    # return single-row DataFrame
+    return pd.DataFrame([summary])
+
+
+def generate_behavior_summary_combined(
+    session_names: List[str],
+    model_alias:  Union[str, List[str]] = ['QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax'],
+    latent_names: Optional[List[str]] = None,
+    trial_types: Optional[List[str]] = None,
+    save_folder: str = '/root/capsule/results',
+    save_name: str = 'combined_behavior_summary.csv',
+    save_result: bool = False
+) -> pd.DataFrame:
+    """
+    Generate and optionally save combined behavior summaries across sessions.
+
+    Parameters
+    ----------
+    session_names : list of str
+        NWB session identifiers.
+    model_alias : str or list of str
+        Alias(es) for the fitted model(s) to summarize.
+    latent_names : list of str, optional
+        Which latent variables to include (defaults to all supported).
+    trial_types : list of str, optional
+        Which trial categories to flag (defaults to key types).
+    save_folder : str
+        Directory in which to save the combined CSV if requested.
+    save_name : str
+        Filename for saving the combined summary CSV.
+    save_result : bool
+        If True, save the combined summary to disk.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per session with summary columns.
+    """
+    all_summaries: List[pd.DataFrame] = []
+    for sess in session_names:
+        nwb_data = NWBUtils.read_ophys_or_behavior_nwb(
+            session_name=sess
+        )
+        if nwb_data is None:
+            print(f"Warning: could not load session {sess}, skipping.")
+            continue
+        summary_df = generate_behavior_summary(
+            nwb_data=nwb_data,
+            model_alias=model_alias,
+            latent_names=latent_names,
+            trial_types=trial_types
+        )
+        try:
+            nwb_data.io.close()
+        except Exception:
+            pass
+        all_summaries.append(summary_df)
+
+    if all_summaries:
+        combined_df = pd.concat(all_summaries, ignore_index=True)
+    else:
+        combined_df = pd.DataFrame()
+
+    if save_result:
+        os.makedirs(save_folder, exist_ok=True)
+        save_path = os.path.join(save_folder, save_name)
+        combined_df.to_csv(save_path, index=False)
+        print(f"Combined summary saved to {save_path}")
+
+    return combined_df
