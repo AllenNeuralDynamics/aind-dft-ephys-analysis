@@ -464,36 +464,39 @@ def extract_fitted_data(
 
 def find_trials(
     nwb_behavior_data: Any,
-    trial_type: str = 'no_response'
+    trial_type: Union[str, List[str]] = 'no_response'
 ) -> List[int]:
     """
-    Return trial indices matching the specified trial_type.
+    Return trial indices matching the specified trial_type(s).
 
     Parameters
     ----------
     nwb_behavior_data : Any
         NWB object with .trials table containing:
           - 'rewarded_historyL', 'rewarded_historyR', 'animal_response'
-    trial_type : str, optional
-        One of:
+    trial_type : str or list of str, optional
+        One or more of:
           - 'no_response'      : trials where animal_response == 2
           - 'response'         : trials where animal_response != 2
           - 'rewarded'         : trials where either L or R was rewarded
           - 'unrewarded'       : trials where no reward and response != 2
           - 'left_rewarded'    : trials where left side was rewarded
           - 'right_rewarded'   : trials where right side was rewarded
-        Default is 'no_response'.
+        Default is 'no_response'. If a list is provided, results are unioned.
 
     Returns
     -------
     List[int]
-        List of zero-based trial indices matching the type.
-
-    Raises
-    ------
-    ValueError
-        If trial_type is unsupported.
+        Sorted list of zero-based trial indices matching the type(s).
     """
+    # support a list of trial types by unioning each result
+    if isinstance(trial_type, (list, tuple)):
+        all_idx = set()
+        for t in trial_type:
+            all_idx.update(find_trials(nwb_behavior_data, t))
+        return sorted(all_idx)
+
+    # single-trial_type logic
     trials = nwb_behavior_data.trials
     resp = trials['animal_response'][:]
     rewardedL = trials['rewarded_historyL'][:]
