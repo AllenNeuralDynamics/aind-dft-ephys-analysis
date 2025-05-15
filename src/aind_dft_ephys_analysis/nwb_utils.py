@@ -209,6 +209,35 @@ class NWBUtils:
         except Exception as e:
             print(f"Error reading ophys NWB file '{file_path}': {e}")
             return None
+            
+    @staticmethod
+    def read_ophys_or_behavior_nwb(
+        ophys_folder_path: str = '/root/capsule/data/',
+        behavior_folder_path: str = '/root/capsule/data/behavior_nwb',
+        ophys_nwb_full_path: Optional[str] = None,
+        behavior_nwb_full_path: Optional[str] = None,
+        session_name: Optional[str] = None
+    ) -> Optional[Any]:
+        """
+        Try to read an ophys NWB file first; if that fails (returns None),
+        fall back to reading a behavior NWB file. Returns whichever data
+        object was successfully read, or None if both fail.
+        """
+        # 1) attempt ophys
+        data = NWBUtils.read_ophys_nwb(
+            folder_path=ophys_folder_path,
+            nwb_full_path=ophys_nwb_full_path,
+            session_name=session_name
+        )
+        if data is not None:
+            return data
+
+        # 2) fallback to behavior
+        return NWBUtils.read_behavior_nwb(
+            folder_path=behavior_folder_path,
+            nwb_full_path=behavior_nwb_full_path,
+            session_name=session_name
+        )
 
     @staticmethod
     def combine_nwb(
