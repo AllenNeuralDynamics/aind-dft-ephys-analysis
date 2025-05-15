@@ -289,10 +289,14 @@ def get_the_mean_firing_rate_combined_sessions(
     session_names: List[str],
     align_to_event: str = 'go_cue',
     time_windows: List[List[float]] = [[-1, 0], [0, 2]],
-    z_score: Union[bool, List[bool]] = False
+    z_score: Union[bool, List[bool]] = [True,False],
+    save_folder: str = '/root/capsule/results',
+    save_name: str = 'combined_firing_rates.csv',
+    save_result: bool = False
 ) -> pd.DataFrame:
     """
-    Computes mean firing rates for multiple sessions and combines them into one DataFrame.
+    Computes mean firing rates for multiple sessions, combines them into one DataFrame,
+    and optionally saves the result to disk.
 
     Parameters
     ----------
@@ -302,20 +306,25 @@ def get_the_mean_firing_rate_combined_sessions(
         Event name to align spikes to (default 'go_cue').
     time_windows : list of [start, end]
         Windows (seconds relative to event) for computing firing rates.
-    z_score : bool
-        If True, normalize firing rates per window across trials within each session.
+    z_score : bool or list of bool
+        Whether to normalize firing rates per window across trials within each session.
+    save_folder : str
+        Directory path to save the combined DataFrame (default '/root/capsule/results').
+    save_name : str
+        Filename for the saved combined DataFrame (default 'combined_firing_rates.csv').
+    save_result : bool
+        If True, saves the combined DataFrame to disk (default False).
 
     Returns
     -------
     combined_df : pd.DataFrame
-        Concatenated DataFrame of `get_the_mean_firing_rate` output for each session,
-        with an additional `session_name` column.
+        Concatenated DataFrame of firing rates across all sessions.
     """
     all_dfs = []
     for sess in session_names:
         print(f"Processing session {sess}...")
-        nwb_data,tag = NWBUtils.combine_nwb(session_name=sess)
-        if tag in ['none_loaded','behavior_only']:
+        nwb_data, tag = NWBUtils.combine_nwb(session_name=sess)
+        if tag in ['none_loaded', 'behavior_only']:
             print(f"Warning: could not load session {sess}, skipping.")
             continue
         df = get_the_mean_firing_rate(
@@ -324,11 +333,21 @@ def get_the_mean_firing_rate_combined_sessions(
             time_windows=time_windows,
             z_score=z_score
         )
-        nwb_data.io.close()
+        try:
+            nwb_data.io.close()
+        except Exception:
+            pass
         all_dfs.append(df)
 
     if not all_dfs:
-        return pd.DataFrame(columns=['session_id', 'unit_index', 'time_window', 'z_score' 'rates'])
+        combined_df = pd.DataFrame(columns=['session_id', 'unit_index', 'time_window', 'z_score', 'rates'])
+    else:
+        combined_df = pd.concat(all_dfs, ignore_index=True)
 
-    combined_df = pd.concat(all_dfs, ignore_index=True)
+    if save_result:
+        os.makedirs(save_folder, exist_ok=True)
+        save_path = os.path.join(save_folder, save_name)
+        combined_df.to_csv(save_path, index=False)
+        print(f"Combined DataFrame saved to {save_path}")
+
     return combined_df
