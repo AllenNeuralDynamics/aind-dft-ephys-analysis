@@ -290,7 +290,7 @@ def get_the_mean_firing_rate(
 def get_the_mean_firing_rate_combined(
     session_names: List[str],
     align_to_event: str = 'go_cue',
-    time_windows: List[List[float]] = [[-1, 0], [0, 2]],
+    time_windows: List[List[float]] = [[-1, 0], [0.3, 2]],
     z_score: Union[bool, List[bool]] = [True,False],
     save_folder: str = '/root/capsule/results',
     save_name: str = 'combined_firing_rates.csv',
