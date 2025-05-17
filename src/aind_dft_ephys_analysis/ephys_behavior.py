@@ -369,7 +369,7 @@ def correlate_firing_latent(
     For each entry in df_firing, regress its firing rates against each specified
     behavior time series under one or more models. Appends one new column per
     (model, variable) pair; each cell is a dict with keys
-    'slope', 'intercept', 'r2', 'pvalue' (for simple_LR) or the full result object for other models.
+    'slope', 'intercept', 'r2', 'pvalue' (for simple_LR) or other results for other models.
 
     Parameters
     ----------
