@@ -176,43 +176,105 @@ def format_session_name(session_name):
 
 def smart_read_csv(
     filepath: Union[str, Path],
-    object_columns: Optional[List[str]] = None
+    object_columns: Optional[List[str]] = None,
+    bool_columns: Optional[List[str]] = None,
+    n_rows: Optional[int] = None,
+    auto_numeric: bool = True,
 ) -> pd.DataFrame:
     """
-    Read a CSV file into a DataFrame, automatically parsing any columns that
-    contain Python literal structures (lists or dicts).
-
-    The function will:
-      1. If `object_columns` is None, read the first row of the file to detect
-         columns whose string values start with '[' or '{'.
-      2. Use `ast.literal_eval` on those columns when reading the full CSV.
+    Read a CSV into a DataFrame, safely parsing columns that contain Python
+    literal structures (lists or dicts) and converting obvious boolean and
+    numeric columns.
 
     Parameters
     ----------
     filepath : str or Path
         Path to the CSV file to read.
-    object_columns : List[str], optional
-        Explicit list of column names to parse as Python objects. If None,
-        detection is performed automatically.
+    object_columns : list[str], optional
+        Columns to parse as Python objects.  If None, the first row is
+        inspected for values beginning with '[' or '{'.
+    bool_columns : list[str], optional
+        Columns to coerce to bool.  If None, detection is based on the first
+        row containing the literal strings TRUE / FALSE.
+    n_rows : int, optional
+        If given, only read that many rows (handy for a quick preview).
+    auto_numeric : bool, default True
+        When True, the function attempts to convert the remaining non-object /
+        non-bool columns to numeric dtypes.
 
     Returns
     -------
     pd.DataFrame
-        DataFrame with parsed list/dict columns.
+        Parsed DataFrame with lists/dicts, booleans, and numeric columns
+        converted to native Python / pandas types where possible.
     """
-    # Ensure filepath is string
     path_str = str(filepath)
 
-    # Detect object columns if not provided
+    # ------------------------------------------------------------------
+    # 1) Inspect the first row (as strings) to auto-detect object / bool columns
+    # ------------------------------------------------------------------
+    sample = pd.read_csv(path_str, nrows=1, dtype=str)
+
     if object_columns is None:
-        sample = pd.read_csv(path_str, nrows=1, dtype=str)
         object_columns = [
             col for col, val in sample.iloc[0].items()
-            if isinstance(val, str) and val.strip().startswith(('[' ,'{' ))
+            if isinstance(val, str) and val.strip().startswith(('[', '{'))
         ]
 
-    # Build converters for pandas
-    converters = {col: ast.literal_eval for col in object_columns}
+    if bool_columns is None:
+        bool_columns = [
+            col for col in sample.columns
+            if str(sample.at[0, col]).strip() in {"TRUE", "FALSE", "True", "False"}
+        ]
 
-    # Read full CSV with converters applied
-    return pd.read_csv(path_str, converters=converters)
+    # ------------------------------------------------------------------
+    # 2) Regex to strip np.float64(...) → plain number inside strings
+    # ------------------------------------------------------------------
+    float64_re = re.compile(r"np\.float64\(\s*([^)]+?)\s*\)")
+
+    # ------------------------------------------------------------------
+    # 3) Safe parser for any object-column value
+    # ------------------------------------------------------------------
+    def _safe_parse(val: str):
+        if not isinstance(val, str):
+            return val
+        s = val.strip()
+        if not (s.startswith("[") or s.startswith("{")):
+            return val  # nothing to parse
+
+        clean = float64_re.sub(r"\1", s)
+        try:
+            return ast.literal_eval(clean)
+        except (ValueError, SyntaxError):
+            return val  # fall back to original string
+
+    # ------------------------------------------------------------------
+    # 4) Build converters mapping for read_csv
+    # ------------------------------------------------------------------
+    converters = {col: _safe_parse for col in object_columns}
+    converters.update({
+        col: (lambda x: str(x).strip().upper() == "TRUE") for col in bool_columns
+    })
+
+    # ------------------------------------------------------------------
+    # 5) Read the CSV
+    # ------------------------------------------------------------------
+    df = pd.read_csv(path_str, converters=converters, nrows=n_rows)
+
+    # ------------------------------------------------------------------
+    # 6) Optionally convert remaining non-object, non-bool columns to numeric
+    #     • Avoid deprecated errors="ignore".
+    #     • Attempt conversion column-by-column; silently skip failures.
+    # ------------------------------------------------------------------
+    if auto_numeric:
+        other_cols = df.columns.difference(object_columns + bool_columns)
+        for col in other_cols:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                continue  # already numeric, nothing to do
+            try:
+                df[col] = pd.to_numeric(df[col])
+            except (ValueError, TypeError):
+                # leave the original values untouched if conversion fails
+                pass
+
+    return df
