@@ -354,17 +354,20 @@ def get_the_mean_firing_rate_combined_sessions(
 
     return combined_df
 
-def correlate_firing_behavior(
+def correlate_firing_latent(
     df_firing: pd.DataFrame,
     df_behavior: pd.DataFrame,
     variables: List[str],
     correlation_model: Union[str, List[str]] = 'simple_LR',
+    save_folder: str = '/root/capsule/results',
+    save_name: str = 'correlations.csv',
+    save_result: bool = False
 ) -> pd.DataFrame:
     """
     For each entry in df_firing, regress its firing rates against each specified
     behavior time series under one or more models. Appends one new column per
     (model, variable) pair; each cell is a dict with keys
-    'slope', 'intercept', 'r2', 'pvalue'.
+    'slope', 'intercept', 'r2', 'pvalue' (for simple_LR) or the full result object for other models.
 
     Parameters
     ----------
@@ -373,12 +376,24 @@ def correlate_firing_behavior(
         'rates' is a list-like of floats (one per trial).
     df_behavior : pd.DataFrame
         Must contain 'session_id', each name in `variables` as list-like, and
-        'no_response_trials' as a list of ints.
+        variable-specific no-response trial lists.
     variables : List[str]
         Names of the behavior columns to correlate.
     correlation_model : Union[str, List[str]]
-        Model name or list of names of functions in
-        aind_spurious_correlation.methods.
+        Model name or list of names of functions in aind_spurious_correlation.methods.
+        Supported models:
+          - 'simple_LR'
+          - 'ARMA_model'
+          - 'ARDL_model'
+          - 'cyclic_shift'
+          - 'linear_shift'
+          - 'phase_randomization'
+    save_folder : str
+        Directory to write the CSV if `save_result` is True.
+    save_name : str
+        Filename (with .csv) to use when saving.
+    save_result : bool
+        If True, writes the returned DataFrame to disk.
 
     Returns
     -------
@@ -386,26 +401,30 @@ def correlate_firing_behavior(
         Copy of df_firing with additional dict-valued columns. Column names:
         `{model}_{variable}`.
     """
-    # Ensure model list
+    # Normalize model list
     models = [correlation_model] if isinstance(correlation_model, str) else list(correlation_model)
 
-    # Copy to avoid modifying original
+    # Copy for output
     result = df_firing.copy().reset_index(drop=True)
-
-    # Pre-create columns
+    total_rows = len(result)
+    # Pre-create result columns
     for model in models:
         for var in variables:
             result[f"{model}_{var}"] = None
 
-    # Index behavior by session_id
+    # Index behavior by session
     beh = df_behavior.set_index('session_id')
 
-    # Iterate each row
+    # Iterate over each firing row
     for i, row in result.iterrows():
         sess = row['session_id']
+        unit = row['unit_index']
+        # Print processing status
+        print(f"Processing session '{sess}', unit {unit} (row {i+1}/{total_rows})...")
 
-        # Skip if no behavior record for this session ---
+        # Skip if no behavior data
         if sess not in beh.index:
+            print(f"  Skipping: no behavior for session '{sess}'")
             continue
 
         rates = np.array(row['rates'], dtype=float)
@@ -413,56 +432,63 @@ def correlate_firing_behavior(
 
         for model in models:
             if not hasattr(methods, model):
-                raise ValueError(f"Model '{model}' not found in methods")
+                print(f"  Model '{model}' not found in methods, skipping")
+                continue
             reg_fn = getattr(methods, model)
 
             for var in variables:
                 col = f"{model}_{var}"
+                print(f"  -> Model: {model}, Variable: {var}")
                 raw = beh.at[sess, var]
-                
-                # Get the correct mask column for this variable
+
+                # Exclusion mask per variable
                 mask_col = get_mask_trial_type(var)
                 no_resp = beh.at[sess, mask_col]
                 mask = np.ones(n_trials, dtype=bool)
                 mask[no_resp] = False
-
-                # Cleaned arrays
                 rates_clean = rates[mask]
 
-                # Skip invalid raw data
+                # Validate behavior series
                 if raw is None or (isinstance(raw, float) and np.isnan(raw)) \
                    or not isinstance(raw, (list, tuple)) or len(raw) != len(rates_clean):
+                    print(f"    Invalid raw data for '{var}', skipping")
                     result.at[i, col] = None
                     continue
 
-
-                # Run regression using raw_clean instead of undefined beh_ts
-                res = reg_fn(rates_clean, raw, behavior_name=col)
-
-                # Extract stats
+                # Dispatch to model-specific reg function
                 if model == 'simple_LR':
-                    slope     = float(res.params[col])
-                    intercept = float(res.params['const'])
-                    r2        = float(res.rsquared_adj)
-                    pval      = float(res.pvalues[col])
+                    res = reg_fn(rates_clean, raw, behavior_name=col)
                 elif model == 'ARMA_model':
-                    # TODO: adapt to ARMA_model's output
-                    slope = intercept = r2 = pval = np.nan
+                    res = reg_fn(rates_clean, raw, behavior_name=col, AR_p=3, MA_q=0)
+                elif model == 'ARDL_model':
+                    res = reg_fn(rates_clean, raw, behavior_name=col, y_lag=5, x_order=0)
+                elif model in ('cyclic_shift', 'linear_shift'):
+                    res = reg_fn(rates_clean, raw, behavior_name=col, ensemble_size=100, min_shift=3)
+                elif model == 'phase_randomization':
+                    res = reg_fn(rates_clean, raw, behavior_name=col, ensemble_size=100)
                 else:
-                    slope     = float(res.params.get(var, np.nan))
-                    intercept = float(res.params.get('const', np.nan))
-                    r2        = float(getattr(res, 'rsquared_adj', np.nan))
-                    pval      = float(res.pvalues.get(var, np.nan))
+                    print(f"    Unsupported model '{model}', skipping")
+                    continue
 
-                # Assign dict
-                result.at[i, col] = {
-                    'slope': slope,
-                    'intercept': intercept,
-                    'r2': r2,
-                    'pvalue': pval
-                }
+                # Store results
+                if model == 'simple_LR':
+                    result.at[i, col] = {
+                        'slope': float(res.params[col]),
+                        'intercept': float(res.params['const']),
+                        'r2': float(res.rsquared_adj),
+                        'pvalue': float(res.pvalues[col])
+                    }
+                else:
+                    result.at[i, col] = res
+
+    if save_result:
+        os.makedirs(save_folder, exist_ok=True)
+        path = os.path.join(save_folder, save_name)
+        result.to_csv(path, index=False)
+        print(f"Correlation results saved to {path}")
 
     return result
+
 
 def get_mask_trial_type(var: str) -> str:
     """
