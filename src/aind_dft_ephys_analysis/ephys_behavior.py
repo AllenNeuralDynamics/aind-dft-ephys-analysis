@@ -1,4 +1,6 @@
 import os
+import glob
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -7,7 +9,7 @@ from typing import Any, List, Optional, Union, Tuple
 from behavior_utils import extract_event_timestamps 
 from general_utils import extract_session_name_core
 from nwb_utils import NWBUtils
-
+from general_utils import smart_read_csv
 from aind_spurious_correlation import methods
 
 def plot_raster_graph(
@@ -656,5 +658,88 @@ def significance_and_direction_summary(
         summary[f"{col}_dir"] = dir_labels
 
     return summary
+
+def significance_and_direction_summary_combined(
+    csv_paths: Optional[List[str]] = None,
+    search_folder: str = '/root/capsule/results',
+    pattern: str = 'correlations_ecephys-*.csv',
+    save_folder: str = '/root/capsule/results',
+    save_name: str = 'sig_dir_all_sessions.csv',
+    save_result: bool = False,
+    p_threshold: Union[float, List[float]] = 0.05,
+    meta_cols: Optional[List[str]] = None
+) -> pd.DataFrame:
+    """
+    Batch version of ``significance_and_direction_summary`` that accepts
+    multiple correlation CSVs, reads them with *smart_read_csv*, converts
+    each into a significance / direction table, and concatenates the lot.
+
+    Parameters
+    ----------
+    csv_paths : list[str] | None
+        Explicit list of CSV files to process.  If None, files are discovered
+        with *pattern* inside *search_folder*.
+    search_folder : str
+        Directory used when *csv_paths* is not supplied.
+    pattern : str
+        Glob pattern for auto-discovery (default 'correlations_ephys-*.csv').
+    save_folder, save_name, save_result
+        Controls for optional saving of the combined DataFrame.
+    p_threshold, meta_cols
+        Forwarded to ``significance_and_direction_summary``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Combined significance / direction table from all input files.
+    """
+    # ────────────────────────────────────────────────
+    # 1) Resolve which CSVs to load
+    # ────────────────────────────────────────────────
+    if csv_paths is None:
+        csv_paths = sorted(
+            str(p) for p in Path(search_folder).expanduser().glob(pattern)
+        )
+
+    if not csv_paths:
+        raise FileNotFoundError(
+            "No correlation CSV files found – "
+            "check *csv_paths*, *search_folder*, or *pattern*."
+        )
+
+    print(f"Found {len(csv_paths)} correlation file(s):")
+    for p in csv_paths:
+        print(f"  – {p}")
+
+    # ────────────────────────────────────────────────
+    # 2) Convert each CSV → summary DataFrame
+    # ────────────────────────────────────────────────
+    summaries = []
+    for p in csv_paths:
+        corr_df = smart_read_csv(p)                      # ←  CHANGED LINE
+        summary_df = significance_and_direction_summary(
+            corr_df,
+            p_threshold=p_threshold,
+            meta_cols=meta_cols
+        )
+        summary_df.insert(0, 'source_file', os.path.basename(p))
+        summaries.append(summary_df)
+
+    combined = (
+        pd.concat(summaries, ignore_index=True)
+          .sort_values(['source_file', 'session_id', 'unit_index'])
+          .reset_index(drop=True)
+    )
+
+    # ────────────────────────────────────────────────
+    # 3) Optional save
+    # ────────────────────────────────────────────────
+    if save_result:
+        Path(save_folder).mkdir(parents=True, exist_ok=True)
+        out_path = Path(save_folder) / save_name
+        combined.to_csv(out_path, index=False)
+        print(f"Combined summary saved to {out_path}")
+
+    return combined
 
 
