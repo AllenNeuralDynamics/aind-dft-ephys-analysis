@@ -8,6 +8,8 @@ from behavior_utils import extract_event_timestamps
 from general_utils import extract_session_name_core
 from nwb_utils import NWBUtils
 
+from aind_spurious_correlation import methods
+
 def plot_raster_graph(
     nwb_data: Any,
     unit_index: int,
@@ -351,3 +353,126 @@ def get_the_mean_firing_rate_combined_sessions(
         print(f"Combined DataFrame saved to {save_path}")
 
     return combined_df
+
+def correlate_firing_behavior(
+    df_firing: pd.DataFrame,
+    df_behavior: pd.DataFrame,
+    variables: List[str],
+    correlation_model: Union[str, List[str]] = 'simple_LR',
+) -> pd.DataFrame:
+    """
+    For each entry in df_firing, regress its firing rates against each specified
+    behavior time series under one or more models. Appends one new column per
+    (model, variable) pair; each cell is a dict with keys
+    'slope', 'intercept', 'r2', 'pvalue'.
+
+    Parameters
+    ----------
+    df_firing : pd.DataFrame
+        Must contain ['session_id','unit_index','time_window','z_score','rates'].
+        'rates' is a list-like of floats (one per trial).
+    df_behavior : pd.DataFrame
+        Must contain 'session_id', each name in `variables` as list-like, and
+        'no_response_trials' as a list of ints.
+    variables : List[str]
+        Names of the behavior columns to correlate.
+    correlation_model : Union[str, List[str]]
+        Model name or list of names of functions in
+        aind_spurious_correlation.methods.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of df_firing with additional dict-valued columns. Column names:
+        `{model}_{variable}`.
+    """
+    # Ensure model list
+    models = [correlation_model] if isinstance(correlation_model, str) else list(correlation_model)
+
+    # Copy to avoid modifying original
+    result = df_firing.copy().reset_index(drop=True)
+
+    # Pre-create columns
+    for model in models:
+        for var in variables:
+            result[f"{model}_{var}"] = None
+
+    # Index behavior by session_id
+    beh = df_behavior.set_index('session_id')
+
+    # Iterate each row
+    for i, row in result.iterrows():
+        sess = row['session_id']
+
+        # Skip if no behavior record for this session ---
+        if sess not in beh.index:
+            continue
+
+        rates = np.array(row['rates'], dtype=float)
+        n_trials = len(rates)
+
+        for model in models:
+            if not hasattr(methods, model):
+                raise ValueError(f"Model '{model}' not found in methods")
+            reg_fn = getattr(methods, model)
+
+            for var in variables:
+                col = f"{model}_{var}"
+                raw = beh.at[sess, var]
+                
+                # Get the correct mask column for this variable
+                mask_col = get_mask_trial_type(var)
+                no_resp = beh.at[sess, mask_col]
+                mask = np.ones(n_trials, dtype=bool)
+                mask[no_resp] = False
+
+                # Cleaned arrays
+                rates_clean = rates[mask]
+
+                # Skip invalid raw data
+                if raw is None or (isinstance(raw, float) and np.isnan(raw)) \
+                   or not isinstance(raw, (list, tuple)) or len(raw) != len(rates_clean):
+                    result.at[i, col] = None
+                    continue
+
+
+                # Run regression using raw_clean instead of undefined beh_ts
+                res = reg_fn(rates_clean, raw, behavior_name=col)
+
+                # Extract stats
+                if model == 'simple_LR':
+                    slope     = float(res.params[col])
+                    intercept = float(res.params['const'])
+                    r2        = float(res.rsquared_adj)
+                    pval      = float(res.pvalues[col])
+                elif model == 'ARMA_model':
+                    # TODO: adapt to ARMA_model's output
+                    slope = intercept = r2 = pval = np.nan
+                else:
+                    slope     = float(res.params.get(var, np.nan))
+                    intercept = float(res.params.get('const', np.nan))
+                    r2        = float(getattr(res, 'rsquared_adj', np.nan))
+                    pval      = float(res.pvalues.get(var, np.nan))
+
+                # Assign dict
+                result.at[i, col] = {
+                    'slope': slope,
+                    'intercept': intercept,
+                    'r2': r2,
+                    'pvalue': pval
+                }
+
+    return result
+
+def get_mask_trial_type(var: str) -> str:
+    """
+    Return the name of the behavior column indicating which trials to exclude
+    for this particular variable.
+    """
+    # You can extend this mapping if some variables use different exclusion columns.
+    mapping = {
+        # e.g. 'movement_time': 'no_movement_trials',
+        # 'reaction_time': 'no_response_trials',
+    }
+    #return mapping.get(var, 'no_response_trials')
+    return 'no_response_trials'
