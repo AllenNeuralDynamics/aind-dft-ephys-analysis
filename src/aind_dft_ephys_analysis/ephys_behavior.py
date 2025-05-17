@@ -470,7 +470,7 @@ def correlate_firing_latent(
                     print(f"    Unsupported model '{model}', skipping")
                     continue
 
-                result.at[i, col] = res
+                result.at[i, col] = res.summary()
 
     if save_result:
         os.makedirs(save_folder, exist_ok=True)
