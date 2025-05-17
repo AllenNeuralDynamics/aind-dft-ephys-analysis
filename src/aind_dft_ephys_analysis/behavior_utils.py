@@ -379,7 +379,7 @@ def extract_fitted_data(
         An open NWB object (from NWBHDF5IO.read() or NWBZarrIO.read()).
         Must contain `.trials` with columns:
           - 'rewarded_historyL', 'rewarded_historyR', 'animal_response'
-        (needed only for latent_name='RPE').
+        (needed only for latent_name='RPE', 'chosen_q', 'unchosen_q').
 
     fitted_latent : dict, optional
         If provided, this dict should have come from:
@@ -400,27 +400,25 @@ def extract_fitted_data(
           - 'q_value_difference'       → Q₁ − Q₀, skipping trial 0
           - 'total_value'              → Q₁ + Q₀, skipping trial 0
           - 'right_choice_probability' → choice_prob[1] (all trials)
+          - 'left_choice_probability'  → choice_prob[0] (all trials)
           - 'RPE'                      → reward_prediction_error on valid trials
+          - 'QL'                       → Q for option 0 (all trials)
+          - 'QR'                       → Q for option 1 (all trials)
+          - 'chosen_q'                 → Q of the chosen option on valid trials
+          - 'unchosen_q'               → Q of the unchosen option on valid trials
         Required if `fitted_latent` is None, **and** always needed to choose the output.
 
     Returns
     -------
     np.ndarray or None
-        A 1-D float array:
-          - len(Q)-1 for 'q_value_difference' and 'total_value'
-          - len(choice_prob[1]) for 'right_choice_probability'
-          - number of trials with response != 2 for 'RPE'
-        Returns None if:
-          - unable to fetch or parse fitted_latent
-          - latent_name unsupported
+        A 1-D float array for the requested latent series, or None if unsupported.
     """
-    # 1) Validate inputs
+    # 1) Validate inputs and fetch if needed
     if fitted_latent is None:
         if session_name is None or model_alias is None or latent_name is None:
             raise ValueError(
                 "If fitted_latent is not provided, session_name, model_alias, and latent_name are required"
             )
-        # Fetch fit
         fit = get_fitted_latent(session_name, model_alias)
     else:
         if latent_name is None:
@@ -445,6 +443,9 @@ def extract_fitted_data(
     if latent_name == 'right_choice_probability':
         return np.array(FL['choice_prob'][1])
 
+    if latent_name == 'left_choice_probability':
+        return np.array(FL['choice_prob'][0])
+
     if latent_name == 'RPE':
         trials = nwb_behavior_data.trials
         rewardedL = trials['rewarded_historyL'][:]
@@ -462,8 +463,39 @@ def extract_fitted_data(
         # reward prediction error = reward − Q(choice)
         return np.where(resp == 0, rewarded - q0, rewarded - q1)
 
+    if latent_name == 'QL':
+        # drop initial trial
+        return q0[1:]
+
+    if latent_name == 'QR':
+        # drop initial trial
+        return q1[1:]
+
+    if latent_name == 'chosen_q':
+        # drop initial trial
+        q0 = q0[1:]
+        q1 = q1[1:]
+
+        valid = responses != 2
+        rewarded = (rewardedL | rewardedR).astype(int)[valid]
+        resp     = responses[valid]
+
+        return np.where(resp == 0, q0, q1)
+
+    if latent_name == 'unchosen_q':
+        # drop initial trial
+        q0 = q0[1:]
+        q1 = q1[1:]
+
+        valid = responses != 2
+        rewarded = (rewardedL | rewardedR).astype(int)[valid]
+        resp     = responses[valid]
+
+        return np.where(resp == 0, q1, q0)
+
     # Unsupported latent_name
     return None
+
 
 def find_trials(
     nwb_behavior_data: Any,
@@ -550,7 +582,11 @@ def generate_behavior_summary(
             'q_value_difference',      
             'total_value',            
             'right_choice_probability',
-            'RPE'                      
+            'RPE',
+            'chosen_q',
+            'unchosen_q',
+            'QL',
+            'QR'                      
         ]
     # default trial types
     if trial_types is None:
