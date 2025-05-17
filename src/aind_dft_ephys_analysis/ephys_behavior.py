@@ -458,19 +458,41 @@ def correlate_firing_latent(
                 # Dispatch to model-specific reg function
                 if model == 'simple_LR':
                     res = reg_fn(rates_clean, raw, behavior_name=col)
+                    result.at[i, col] = {
+                        'slope':     res.params.get(col, np.nan),
+                        'intercept': res.params.get('const', np.nan),
+                        'r_squared': getattr(res, 'rsquared_adj', np.nan),
+                        'p_value':   res.pvalues.get(col, np.nan)
+                    }
                 elif model == 'ARMA_model':
                     res = reg_fn(rates_clean, raw, behavior_name=col, AR_p=3, MA_q=0)
+                    result.at[i, col] = {
+                            'aic':      getattr(res, 'aic', np.nan),
+                            'bic':      getattr(res, 'bic', np.nan),
+                            'llf':      getattr(res, 'llf', np.nan),
+                            'params':   res.params.to_dict(),
+                            'pvalues':  res.pvalues.to_dict(),
+                        }
                 elif model == 'ARDL_model':
                     res = reg_fn(rates_clean, raw, behavior_name=col, y_lag=5, x_order=0)
+                    result.at[i, col] = {
+                            'aic':      getattr(res, 'aic', np.nan),
+                            'bic':      getattr(res, 'bic', np.nan),
+                            'llf':      getattr(res, 'llf', np.nan),
+                            'params':   res.params.to_dict(),
+                            'pvalues':  res.pvalues.to_dict(),
+                        }
                 elif model in ('cyclic_shift', 'linear_shift'):
                     res = reg_fn(rates_clean, raw, behavior_name=col, ensemble_size=100, min_shift=3)
+                    result.at[i, col] = res
                 elif model == 'phase_randomization':
                     res = reg_fn(rates_clean, raw, behavior_name=col, ensemble_size=100)
+                    result.at[i, col] = res
                 else:
                     print(f"    Unsupported model '{model}', skipping")
                     continue
 
-                result.at[i, col] = res.summary()
+                
 
     if save_result:
         os.makedirs(save_folder, exist_ok=True)
