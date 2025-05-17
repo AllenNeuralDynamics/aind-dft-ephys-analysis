@@ -472,6 +472,11 @@ def extract_fitted_data(
         return q1[1:]
 
     if latent_name == 'chosen_q':
+        trials = nwb_behavior_data.trials
+        rewardedL = trials['rewarded_historyL'][:]
+        rewardedR = trials['rewarded_historyR'][:]
+        responses = trials['animal_response'][:]
+
         # drop initial trial
         q0 = q0[1:]
         q1 = q1[1:]
@@ -483,6 +488,11 @@ def extract_fitted_data(
         return np.where(resp == 0, q0, q1)
 
     if latent_name == 'unchosen_q':
+        trials = nwb_behavior_data.trials
+        rewardedL = trials['rewarded_historyL'][:]
+        rewardedR = trials['rewarded_historyR'][:]
+        responses = trials['animal_response'][:]
+
         # drop initial trial
         q0 = q0[1:]
         q1 = q1[1:]
