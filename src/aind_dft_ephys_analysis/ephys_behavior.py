@@ -662,7 +662,7 @@ def significance_and_direction_summary(
 def significance_and_direction_summary_combined(
     csv_paths: Optional[List[str]] = None,
     search_folder: str = '/root/capsule/results',
-    pattern: str = 'correlations_ecephys-*.csv',
+    pattern: str = 'correlations-*.csv',
     save_folder: str = '/root/capsule/results',
     save_name: str = 'sig_dir_all_sessions.csv',
     save_result: bool = False,
