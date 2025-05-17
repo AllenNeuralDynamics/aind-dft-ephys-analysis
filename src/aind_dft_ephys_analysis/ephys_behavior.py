@@ -513,3 +513,148 @@ def get_mask_trial_type(var: str) -> str:
     }
     #return mapping.get(var, 'no_response_trials')
     return 'no_response_trials'
+
+
+def significance_and_direction_summary(
+    corr_df: pd.DataFrame,
+    p_threshold: Union[float, List[float]] = 0.05,   # kept for API-compat but no longer used
+    meta_cols: List[str] | None = None
+) -> pd.DataFrame:
+    """
+    Return a **trimmed DataFrame** that keeps only
+    
+        ┌─────────────────────────────────────────────────────────────┐
+        │ session_id | unit_index | time_window | z_score |           │
+        │ <orig>_pval | <orig>_dir     (for every correlation column) │
+        └─────────────────────────────────────────────────────────────┘
+    
+    where *<orig>* is each original correlation column in ``corr_df``.
+    
+    * ``<orig>_pval``  – extracted *p*-value (``NaN`` if it cannot be found)  
+    * ``<orig>_dir``   – the sign of the behavioural coefficient:
+        'positive' · 'negative' · 'none' · 'unknown'
+    
+    ────────────────────────────────────────────────────────────────────
+    HOW *p*-VALUE & COEFFICIENT (β) ARE EXTRACTED
+    ────────────────────────────────────────────────────────────────────
+    
+    ╭────────────────────┬────────────────────────────────────────────────╮
+    │ Model family       │ Extraction rule                                │
+    ├────────────────────┼────────────────────────────────────────────────┤
+    │ simple_LR          │ {'slope', 'p_value'}                           │
+    │                    │   pval = cell['p_value']                       │
+    │                    │   β    = cell['slope']                         │
+    │                    │                                                │
+    │ ARMA_model         │ {'params', 'pvalues'}                          │
+    │                    │   pval = cell['pvalues'][col_name]             │
+    │                    │   β    = cell['params'][col_name]              │
+    │                    │                                                │
+    │ ARDL_model         │ same keys but lagged '<col>.L0', '.L1', …      │
+    │                    │   pval = **min** p across matching lag keys    │
+    │                    │   β    = first matching coefficient            │
+    │                    │                                                │
+    │ phase_randomization│ cell is a percentile (0–100)                   │
+    │ cyclic_shift       │   pval = 2·min(pct, 100−pct) / 100             │
+    │ linear_shift       │ same as above; β reported as NaN → 'unknown'   │
+    ╰────────────────────┴────────────────────────────────────────────────╯
+    
+    Direction (dir) is assigned as:
+        • 'positive'  if β > 0  
+        • 'negative'  if β < 0  
+        • 'none'      if β == 0 or β is NaN  
+        • 'unknown'   if β is not available
+    
+    Parameters
+    ----------
+    corr_df : pd.DataFrame
+        Output of ``correlate_firing_latent`` – a table of correlation results
+        (dicts or numeric values) plus identifying metadata.
+    p_threshold : float | list[float], optional
+        Ignored in this version (left for backward-compatibility).
+    meta_cols : list[str] | None, optional
+        Metadata columns to preserve verbatim.  Defaults to
+        ``['session_id', 'unit_index', 'time_window', 'z_score']``.
+    
+    Returns
+    -------
+    pd.DataFrame
+        The four metadata columns +
+        one ``_pval`` and one ``_dir`` column for every correlation metric.
+    """
+    # ─────────────────────────────────────────────────────────────── #
+    # 1) Figure out which columns belong to metadata and which are    #
+    #    correlation results.                                         #
+    # ─────────────────────────────────────────────────────────────── #
+    if meta_cols is None:
+        meta_cols = ["session_id", "unit_index", "time_window", "z_score"]
+
+    # Start the output with metadata only.
+    summary = corr_df[meta_cols].copy()
+
+    # Every non-meta, non-'rates' column is treated as a correlation fit.
+    corr_cols = [
+        col for col in corr_df.columns
+        if col not in meta_cols and col != "rates"
+    ]
+
+    # ─────────────────────────────────────────────────────────────── #
+    # 2) Helper: given a single cell + its column name, return        #
+    #       (p_value, beta)                                           #
+    # ─────────────────────────────────────────────────────────────── #
+    def _extract_p_beta(cell: object, col_name: str) -> tuple[float, float]:
+        """
+        Handle all model families and return a tuple:
+            (p_value, beta)
+        beta may be NaN if not available.
+        """
+        # — simple_LR —------------------------------------------------
+        if isinstance(cell, dict) and {"slope", "p_value"} <= cell.keys():
+            return cell["p_value"], cell["slope"]
+
+        # — ARMA / ARDL —---------------------------------------------
+        if isinstance(cell, dict) and {"params", "pvalues"} <= cell.keys():
+            params, pvals = cell["params"], cell["pvalues"]
+
+            if col_name in params:            # ARMA: exact key present
+                return pvals.get(col_name, np.nan), params[col_name]
+
+            # ARDL: need to look for lagged keys that start with col_name
+            lag_keys = [k for k in params if k.startswith(col_name)]
+            if lag_keys:
+                p_min = min(pvals.get(k, np.nan) for k in lag_keys)
+                return p_min, params[lag_keys[0]]
+
+            return np.nan, np.nan             # no matching key
+
+        # — permutation / shift — numeric percentile —----------------
+        if isinstance(cell, (float, int, np.floating)):
+            percentile = float(cell)          # 0–100
+            p_two_tailed = 2 * min(percentile, 100 - percentile) / 100.0
+            return p_two_tailed, np.nan       # beta unknown
+
+        # — fallback — unknown cell type —----------------------------
+        return np.nan, np.nan
+
+    # ─────────────────────────────────────────────────────────────── #
+    # 3) Loop through each correlation column and append two new cols #
+    # ─────────────────────────────────────────────────────────────── #
+    for col in corr_cols:
+        # Vectorised extraction of p-values and betas for this column
+        p_series, beta_series = zip(*corr_df[col].apply(_extract_p_beta, col_name=col))
+        p_array   = np.asarray(p_series, dtype=float)
+        beta_array = np.asarray(beta_series, dtype=float)
+
+        # Store p-values
+        summary[f"{col}_pval"] = p_array
+
+        # Determine direction as per rules
+        dir_labels = np.where(
+            np.isnan(beta_array), "unknown",
+            np.where(beta_array > 0, "positive",
+                     np.where(beta_array < 0, "negative", "none"))
+        )
+        summary[f"{col}_dir"] = dir_labels
+
+    return summary
+
+
