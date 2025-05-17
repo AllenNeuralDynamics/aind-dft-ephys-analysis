@@ -412,7 +412,7 @@ def correlate_firing_latent(
     # Pre-create result columns
     for model in models:
         for var in variables:
-            result[f"{model}_{var}"] = None
+            result[f"{model}-{var}"] = None
 
     # Index behavior by session
     beh = df_behavior.set_index('session_id')
