@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
-from typing import List, Dict, Tuple, Optional,Any
+from typing import List, Dict, Tuple, Optional,Any,Union
 
 def extract_session_name_core(session_name: str) -> str | None:
     """
@@ -170,3 +170,47 @@ def format_session_name(session_name):
     
     # Return the formatted session name
     return session_name
+
+
+def smart_read_csv(
+    filepath: Union[str, Path],
+    object_columns: Optional[List[str]] = None
+) -> pd.DataFrame:
+    """
+    Read a CSV file into a DataFrame, automatically parsing any columns that
+    contain Python literal structures (lists or dicts).
+
+    The function will:
+      1. If `object_columns` is None, read the first row of the file to detect
+         columns whose string values start with '[' or '{'.
+      2. Use `ast.literal_eval` on those columns when reading the full CSV.
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to the CSV file to read.
+    object_columns : List[str], optional
+        Explicit list of column names to parse as Python objects. If None,
+        detection is performed automatically.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with parsed list/dict columns.
+    """
+    # Ensure filepath is string
+    path_str = str(filepath)
+
+    # Detect object columns if not provided
+    if object_columns is None:
+        sample = pd.read_csv(path_str, nrows=1, dtype=str)
+        object_columns = [
+            col for col, val in sample.iloc[0].items()
+            if isinstance(val, str) and val.strip().startswith(('[' ,'{' ))
+        ]
+
+    # Build converters for pandas
+    converters = {col: ast.literal_eval for col in object_columns}
+
+    # Read full CSV with converters applied
+    return pd.read_csv(path_str, converters=converters)
