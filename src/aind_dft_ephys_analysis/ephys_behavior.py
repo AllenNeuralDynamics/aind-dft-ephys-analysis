@@ -492,8 +492,6 @@ def correlate_firing_latent(
                     print(f"    Unsupported model '{model}', skipping")
                     continue
 
-                
-
     if save_result:
         os.makedirs(save_folder, exist_ok=True)
         path = os.path.join(save_folder, save_name)
