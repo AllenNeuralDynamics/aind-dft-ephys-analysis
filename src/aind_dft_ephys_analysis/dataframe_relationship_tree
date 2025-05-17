@@ -1,0 +1,75 @@
+┌─────────────────────────┐      per-session ┌─────────────────────────┐
+│  get_the_mean_firing_rate│───────────────▶  │  firing-rate DataFrame  │
+│  (needs open NWB)        │                 │  • session_id           │
+└────────┬────────────────┘                 │  • unit_index           │
+         │                                   │  • time_window          │
+         │                                   │  • z_score              │
+         │                                   │  • rates  (list)        │
+         ▼                                   └───────────┬─────────────┘
+┌─────────────────────────┐                    accumulate │
+│ get_the_mean_firing_    │        loops over sessions    │
+│   rate_combined         │───────────────┐               │
+│ (reads many NWBs via    │               ▼               │
+│  NWBUtils.combine_nwb)  │       ┌────────────────────────────┐
+└─────────────────────────┘       │ **df_firing**              │
+                                  │ combined firing rates      │
+                                  └───────────┬────────────────┘
+                                              │
+                                              │
+                                              ▼
+                                   ┌────────────────────────────┐
+┌──────────────────────────┐       │   generate_behavior_       │
+│ generate_behavior_summary│──────▶│       summary             │
+│ (needs open behavior NWB)│       │   per session DataFrame   │
+└──────────┬───────────────┘       └───────────┬────────────────┘
+           │                                   │
+           │ accumulate                        │ accumulate
+           ▼                                   ▼
+┌─────────────────────────┐         ┌────────────────────────────┐
+│ generate_behavior_      │────────▶│ **df_behavior**            │
+│   summary_combined      │         │ combined behavioural data  │
+└─────────────────────────┘         └───────────┬────────────────┘
+                                              │
+            df_firing ────────────────────────┘ (left input)
+                                              │
+            df_behavior ──────────────────────┐ (right input)
+                                              ▼
+                         ┌────────────────────────────────────────┐
+                         │ correlate_firing_latent               │
+                         │  • fits each (model, variable)        │
+                         │  • RETURNS **corr_df** (full results) │
+                         └───────────┬───────────────────────────┘
+                                     │
+                                     ▼
+                     ┌────────────────────────────────────┐
+                     │ significance_and_direction_summary │
+                     │  extracts *_pval & *_dir columns   │
+                     │  RETURNS **sig_df**                │
+                     └───────────┬────────────────────────┘
+                                 │ many CSV files
+                                 ▼
+              ┌─────────────────────────────────────────────────┐
+              │ significance_and_direction_summary_combined    │
+              │  reads many correlation-CSV files (smart_read) │
+              │  stacks their sig_df → **sig_dir_all_sessions**│
+              │  (can also save CSV)                           │
+              └──────────┬──────────────────────────────────────┘
+                         │
+                         ▼
+       ┌───────────────────────────────────────────────┐
+       │ plot_unitwise_pvalues_across_models           │
+       │  consumes sig_dir_all_sessions (or any sig_df)│
+       │  → produces figures; **does not return df**   │
+       └───────────────────────────────────────────────┘
+
+
+
+       
+| Stage                          | Function(s)                                                                      | **Input**                           | **Output DataFrame / file**                              | Used by next                                          |
+| ------------------------------ | -------------------------------------------------------------------------------- | ----------------------------------- | -------------------------------------------------------- | ----------------------------------------------------- |
+| ① compute firing rates         | `get_the_mean_firing_rate` (per-session) → `get_the_mean_firing_rate_combined`   | open NWB                            | `df_firing` (`combined_firing_rates.csv` if saved)       | `correlate_firing_latent`                             |
+| ② summarise behaviour          | `generate_behavior_summary` (per-session) → `generate_behavior_summary_combined` | open behaviour-NWB & API            | `df_behavior` (`combined_behavior_summary.csv` if saved) | `correlate_firing_latent`                             |
+| ③ correlations                 | `correlate_firing_latent`                                                        | `df_firing`, `df_behavior`          | `corr_df` (`correlations-<…>.csv` if saved)              | `significance_and_direction_summary`                  |
+| ④ p-value/direction extraction | `significance_and_direction_summary`                                             | single `corr_df`                    | `sig_df` (in-memory)                                     | `significance_and_direction_summary_combined` (batch) |
+| ⑤ batch combine                | `significance_and_direction_summary_combined`                                    | many `corr_df` CSVs                 | `sig_dir_all_sessions.csv`                               | plotting                                              |
+| ⑥ visualisation                | `plot_unitwise_pvalues_across_models`                                            | any **sig\_df** or the combined CSV | (plots only)                                             | —                                                     |
