@@ -439,7 +439,7 @@ def correlate_firing_latent(
             reg_fn = getattr(methods, model)
 
             for var in variables:
-                col = f"{model}_{var}"
+                col = f"{model}-{var}"
                 print(f"  -> Model: {model}, Variable: {var}")
                 raw = beh.at[sess, var]
 

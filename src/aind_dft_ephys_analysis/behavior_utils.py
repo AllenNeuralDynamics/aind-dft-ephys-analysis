@@ -617,7 +617,7 @@ def generate_behavior_summary(
                 model_alias=alias,
                 latent_name=ln
             )
-            col = f"{alias}_{ln}"
+            col = f"{alias}-{ln}"
             summary[col] = values.tolist() if values is not None else None
 
     # collect trial indices per type
