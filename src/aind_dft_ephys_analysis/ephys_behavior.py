@@ -287,7 +287,7 @@ def get_the_mean_firing_rate(
     firing_rate_df = pd.DataFrame(rows, columns=['session_id', 'unit_index', 'time_window','z_score', 'rates'])
     return firing_rate_df
 
-def get_the_mean_firing_rate_combined_sessions(
+def get_the_mean_firing_rate_combined(
     session_names: List[str],
     align_to_event: str = 'go_cue',
     time_windows: List[List[float]] = [[-1, 0], [0, 2]],
@@ -358,7 +358,7 @@ def correlate_firing_latent(
     df_firing: pd.DataFrame,
     df_behavior: pd.DataFrame,
     variables: List[str],
-    correlation_model: Union[str, List[str]] = 'simple_LR',
+    correlation_model: Union[str, List[str]] = ['simple_LR','ARMA_model'],
     save_folder: str = '/root/capsule/results',
     save_name: str = 'correlations.csv',
     save_result: bool = False
@@ -373,10 +373,10 @@ def correlate_firing_latent(
     ----------
     df_firing : pd.DataFrame
         Must contain ['session_id','unit_index','time_window','z_score','rates'].
-        'rates' is a list-like of floats (one per trial).
+        'rates' is a list-like of floats (one per trial). Output from get_the_mean_firing_rate_combined. 
     df_behavior : pd.DataFrame
         Must contain 'session_id', each name in `variables` as list-like, and
-        variable-specific no-response trial lists.
+        variable-specific no-response trial lists. Output from generate_behavior_summary_combined. 
     variables : List[str]
         Names of the behavior columns to correlate.
     correlation_model : Union[str, List[str]]
@@ -470,16 +470,7 @@ def correlate_firing_latent(
                     print(f"    Unsupported model '{model}', skipping")
                     continue
 
-                # Store results
-                if model == 'simple_LR':
-                    result.at[i, col] = {
-                        'slope': float(res.params[col]),
-                        'intercept': float(res.params['const']),
-                        'r2': float(res.rsquared_adj),
-                        'pvalue': float(res.pvalues[col])
-                    }
-                else:
-                    result.at[i, col] = res
+                result.at[i, col] = res
 
     if save_result:
         os.makedirs(save_folder, exist_ok=True)
