@@ -360,7 +360,7 @@ def correlate_firing_latent(
     df_firing: pd.DataFrame,
     df_behavior: pd.DataFrame,
     variables: List[str],
-    correlation_model: Union[str, List[str]] = ['simple_LR','ARMA_model'],
+    correlation_model: Union[str, List[str]] = ('simple_LR', 'ARMA_model'),
     save_folder: str = '/root/capsule/results',
     save_name: str = 'correlations.csv',
     save_result: bool = False
@@ -403,33 +403,50 @@ def correlate_firing_latent(
         Copy of df_firing with additional dict-valued columns. Column names:
         `{model}_{variable}`.
     """
-    # Normalize model list
+
+    # ---------------------------------------------------------------------
+    # 1. Normalize arguments
+    # ---------------------------------------------------------------------
     models = [correlation_model] if isinstance(correlation_model, str) else list(correlation_model)
 
-    # Copy for output
+    # ---------------------------------------------------------------------
+    # 2. Identify sessions whose *all* requested variables are missing/NaN
+    # ---------------------------------------------------------------------
+    beh = df_behavior.set_index('session_id')
+    invalid_sessions: set[str] = {
+        sess for sess, row in beh[variables].iterrows()
+        if all((val is None) or (isinstance(val, float) and np.isnan(val)) for val in row)
+    }
+
+    # ---------------------------------------------------------------------
+    # 3. Prepare output frame
+    # ---------------------------------------------------------------------
     result = df_firing.copy().reset_index(drop=True)
     total_rows = len(result)
-    # Pre-create result columns
     for model in models:
         for var in variables:
-            result[f"{model}-{var}"] = None
+            result[f"{model}-{var}"] = None  # pre-allocate columns
 
-    # Index behavior by session
-    beh = df_behavior.set_index('session_id')
-
-    # Iterate over each firing row
+    # ---------------------------------------------------------------------
+    # 4. Iterate over firing rows
+    # ---------------------------------------------------------------------
     for i, row in result.iterrows():
         sess = row['session_id']
         unit = row['unit_index']
-        # Print processing status
-        print(f"Processing session '{sess}', unit {unit} (row {i+1}/{total_rows})...")
 
-        # Skip if no behavior data
-        if sess not in beh.index:
-            print(f"  Skipping: no behavior for session '{sess}'")
+        # Skip if this session has no usable behavioral data at all
+        if sess in invalid_sessions:
+            print(f"Skipping session '{sess}' (all behavior variables invalid)")
             continue
 
-        rates = np.array(row['rates'], dtype=float)
+        # Skip if behavior session entirely absent (should be rare)
+        if sess not in beh.index:
+            print(f"Skipping session '{sess}' (behavior data missing)")
+            continue
+
+        print(f"Processing session '{sess}', unit {unit} (row {i+1}/{total_rows})…")
+
+        rates = np.asarray(row['rates'], dtype=float)
         n_trials = len(rates)
 
         for model in models:
@@ -440,24 +457,30 @@ def correlate_firing_latent(
 
             for var in variables:
                 col = f"{model}-{var}"
-                print(f"  -> Model: {model}, Variable: {var}")
                 raw = beh.at[sess, var]
 
-                # Exclusion mask per variable
+                # ----------------------------------------------------------
+                # Build mask for trials to exclude (e.g., no-response)
+                # ----------------------------------------------------------
                 mask_col = get_mask_trial_type(var)
                 no_resp = beh.at[sess, mask_col]
                 mask = np.ones(n_trials, dtype=bool)
                 mask[no_resp] = False
                 rates_clean = rates[mask]
 
-                # Validate behavior series
-                if raw is None or (isinstance(raw, float) and np.isnan(raw)) \
-                   or not isinstance(raw, (list, tuple)) or len(raw) != len(rates_clean):
-                    print(f"    Invalid raw data for '{var}', skipping")
-                    result.at[i, col] = None
+                # Validate raw behavior series
+                if (
+                    raw is None
+                    or (isinstance(raw, float) and np.isnan(raw))
+                    or not isinstance(raw, (list, tuple))
+                    or len(raw) != len(rates_clean)
+                ):
+                    # Leave cell as None to indicate unusable
                     continue
 
-                # Dispatch to model-specific reg function
+                # ----------------------------------------------------------
+                # Dispatch to the selected correlation / regression model
+                # ----------------------------------------------------------
                 if model == 'simple_LR':
                     res = reg_fn(rates_clean, raw, behavior_name=col)
                     result.at[i, col] = {
@@ -466,41 +489,51 @@ def correlate_firing_latent(
                         'r_squared': getattr(res, 'rsquared_adj', np.nan),
                         'p_value':   res.pvalues.get(col, np.nan)
                     }
+
                 elif model == 'ARMA_model':
                     res = reg_fn(rates_clean, raw, behavior_name=col, AR_p=3, MA_q=0)
                     result.at[i, col] = {
-                            'aic':      getattr(res, 'aic', np.nan),
-                            'bic':      getattr(res, 'bic', np.nan),
-                            'llf':      getattr(res, 'llf', np.nan),
-                            'params':   res.params.to_dict(),
-                            'pvalues':  res.pvalues.to_dict(),
-                        }
+                        'aic':     getattr(res, 'aic', np.nan),
+                        'bic':     getattr(res, 'bic', np.nan),
+                        'llf':     getattr(res, 'llf', np.nan),
+                        'params':  res.params.to_dict(),
+                        'pvalues': res.pvalues.to_dict(),
+                    }
+
                 elif model == 'ARDL_model':
                     res = reg_fn(rates_clean, raw, behavior_name=col, y_lag=5, x_order=0)
                     result.at[i, col] = {
-                            'aic':      getattr(res, 'aic', np.nan),
-                            'bic':      getattr(res, 'bic', np.nan),
-                            'llf':      getattr(res, 'llf', np.nan),
-                            'params':   res.params.to_dict(),
-                            'pvalues':  res.pvalues.to_dict(),
-                        }
+                        'aic':     getattr(res, 'aic', np.nan),
+                        'bic':     getattr(res, 'bic', np.nan),
+                        'llf':     getattr(res, 'llf', np.nan),
+                        'params':  res.params.to_dict(),
+                        'pvalues': res.pvalues.to_dict(),
+                    }
+
                 elif model in ('cyclic_shift', 'linear_shift'):
-                    res = reg_fn(rates_clean, raw, behavior_name=col, ensemble_size=100, min_shift=3)
+                    res = reg_fn(rates_clean, raw, behavior_name=col,
+                                 ensemble_size=100, min_shift=3)
                     result.at[i, col] = res
+
                 elif model == 'phase_randomization':
                     res = reg_fn(rates_clean, raw, behavior_name=col, ensemble_size=100)
                     result.at[i, col] = res
+
                 else:
-                    print(f"    Unsupported model '{model}', skipping")
+                    # Unsupported model – already warned above
                     continue
 
+    # ---------------------------------------------------------------------
+    # 5. Optionally save to disk
+    # ---------------------------------------------------------------------
     if save_result:
         os.makedirs(save_folder, exist_ok=True)
-        path = os.path.join(save_folder, save_name)
-        result.to_csv(path, index=False)
-        print(f"Correlation results saved to {path}")
+        out_path = os.path.join(save_folder, save_name)
+        result.to_csv(out_path, index=False)
+        print(f"Correlation results saved to {out_path}")
 
     return result
+
 
 
 def get_mask_trial_type(var: str) -> str:
