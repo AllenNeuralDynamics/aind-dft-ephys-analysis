@@ -1,10 +1,13 @@
 import numpy as np
-from typing import Optional, Dict
+from typing import Any, Optional, Tuple, Dict, List
 from scipy.optimize import minimize
 
 import numpy as np
 from typing import Optional, Dict
 from scipy.optimize import minimize
+import statsmodels.api as sm
+from statsmodels.discrete.discrete_model import BinaryResults 
+
 
 
 def fit_q_learning_model(
@@ -192,5 +195,139 @@ def fit_q_learning_model(
         'qr_values'               : qr_vals,
         'success'                 : True
     }
+
+
+
+__all__ = ["fit_choice_logistic_regression"]
+
+
+def fit_choice_logistic_regression(
+    nwb_data: Any,
+    lag: int = 10,
+) -> Optional[Tuple[BinaryResults, Dict[str, Any]]]:
+    """
+    Utility helper to fit a two‑kernel logistic regression model to
+    left/right choice behaviour captured in NWB files.
+
+    The model estimates how past rewarded and unrewarded choices bias the
+    probability of selecting **right** on the current trial.
+
+    Mathematical form
+    -----------------
+    ::
+
+        logit(P(c_r(t)=1)) = β0
+                             + sum_{i=1}^{L} β_i^R   * (R_r(t−i) − R_l(t−i))
+                             + sum_{i=1}^{L} β_i^{NR} * (N_r(t−i) − N_l(t−i))
+
+    where
+      * *R_r*, *R_l* – rewarded right/left choice indicators;
+      * *N_r*, *N_l* – **un**rewarded right/left indicators;
+      * *L* – history length (``lag``).
+
+    Parameters
+    ----------
+    nwb_data : Any
+        Open NWB file handle whose ``trials`` table contains at least the
+        columns ``animal_response``, ``rewarded_historyL``, and
+        ``rewarded_historyR``.
+    lag : int, default 10
+        Number of past trials to include for each kernel.
+
+    Returns
+    -------
+    (BinaryResults, Dict[str, Any]) | None
+        ``BinaryResults``
+            The fitted logistic‑regression results object returned by
+            :class:`statsmodels.discrete.discrete_model.Logit`.
+        ``Dict[str, Any]``
+            Serializable summary with keys:
+
+            * ``model_summary`` – text from ``result.summary()``.
+            * ``fitted_latent_variables['choice_prob']`` – list ``[P(left), P(right)]``.
+            * ``used_trial_indices`` – indices of trials contributing to the
+              regression.
+
+        The function returns **None** if the session is too short, lacks
+        analysable trials, or the optimiser fails.
+
+    Notes
+    -----
+    * Trials with ``animal_response == 2`` (no response) are skipped.
+    * To fit a single model across multiple sessions, concatenate the design
+      matrices produced here and call :func:`statsmodels.Logit` once on the
+      combined arrays.
+    """
+
+    # 1. Extract arrays
+    trials = nwb_data.trials
+    resp: np.ndarray = np.asarray(trials["animal_response"][:])
+    rL: np.ndarray = np.asarray(trials["rewarded_historyL"][:], dtype=int)
+    rR: np.ndarray = np.asarray(trials["rewarded_historyR"][:], dtype=int)
+
+    n_tot: int = len(resp)
+    if n_tot <= lag + 1:
+        print(f"[log-reg] ✖ session too short (n={n_tot}) for lag={lag}")
+        return None
+
+    # 2. Pre-compute Boolean flags
+    Rl: np.ndarray = (resp == 0) & (rL == 1)  # rewarded LEFT
+    Rr: np.ndarray = (resp == 1) & (rR == 1)  # rewarded RIGHT
+    Nl: np.ndarray = (resp == 0) & (rL == 0)  # unrewarded LEFT
+    Nr: np.ndarray = (resp == 1) & (rR == 0)  # unrewarded RIGHT
+
+    # 3. Construct X and y
+    X_rows: List[List[float]] = []
+    y_list: List[int] = []
+    used_idx: List[int] = []
+
+    for t in range(lag, n_tot):
+        this_resp = resp[t]
+        if this_resp not in (0, 1):
+            continue  # skip no-response trials
+
+        row: List[int] = []
+
+        # Rewarded kernel
+        for i in range(1, lag + 1):
+            row.append(int(Rr[t - i]) - int(Rl[t - i]))
+
+        # Unrewarded kernel
+        for i in range(1, lag + 1):
+            row.append(int(Nr[t - i]) - int(Nl[t - i]))
+
+        X_rows.append(row)
+        y_list.append(int(this_resp))  # 0 = left, 1 = right
+        used_idx.append(t)
+
+    if not X_rows:
+        print("[log-reg] ✖ no analysable trials after filtering")
+        return None
+
+    X = sm.add_constant(np.asarray(X_rows, dtype=float))
+    y = np.asarray(y_list, dtype=int)
+
+    # 4. Fit the model
+    try:
+        result = sm.Logit(y, X).fit(disp=False)
+    except Exception as err:  # pragma: no cover
+        print(f"[log-reg] ✖ fit failed: {err}")
+        return None
+
+    # 5. Build companion summary dict
+    p_right: np.ndarray = result.predict()
+    p_left: np.ndarray = 1.0 - p_right
+
+    fit_dict: Dict[str, Any] = {
+        "fit_result": result,
+        "model_summary": result.summary().as_text(),
+        "fitted_latent_variables": {
+            "choice_prob": [p_left, p_right],
+        },
+        "used_trial_indices": np.asarray(used_idx, dtype=int),
+    }
+
+    return fit_dict, result 
+
 
 
