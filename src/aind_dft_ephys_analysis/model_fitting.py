@@ -316,6 +316,11 @@ def build_choice_design_matrix(
                 X_all.append(row)
                 y_all.append(int(resp_c[t]))
                 idx_all.append((sess_id << 32) + int(valid_idx[t]))
+        except Exception as err:
+            # Catch and report any error for this session, then continue
+            print(f"[log-reg] ✖ error processing session {item}: {err}")
+            # Skip to the next item without aborting the whole routine
+            continue
         finally:
             if opened_here and hasattr(nwb, "io"):
                 try:
