@@ -431,8 +431,10 @@ def extract_fitted_data(
         return None
 
     FL = fit['fitted_latent_variables']
-    q0 = np.array(FL['q_value'][0])
-    q1 = np.array(FL['q_value'][1])
+
+    if 'q_value' in FL:
+        q0 = np.array(FL['q_value'][0])
+        q1 = np.array(FL['q_value'][1])
 
     # 3) Compute requested series
     if latent_name == 'q_value_difference':
