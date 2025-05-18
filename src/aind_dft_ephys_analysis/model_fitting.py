@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Any, Optional, Tuple, Dict, List
+from typing import Any, Optional, Tuple, Dict, List, Union, Sequence
 from scipy.optimize import minimize
 
 import numpy as np
@@ -8,7 +8,7 @@ from typing import Optional, Dict
 from scipy.optimize import minimize
 import statsmodels.api as sm
 from statsmodels.discrete.discrete_model import BinaryResults 
-
+from nwb_utils import NWBUtils
 
 
 def fit_q_learning_model(
@@ -198,21 +198,24 @@ def fit_q_learning_model(
     }
 
 
-
-def fit_choice_logistic_regression(
-    nwb_data: Any,
+def build_choice_design_matrix(
+    nwb_data: Optional[Union[Any, Sequence[Any]]] = None,
+    session_names: Optional[Union[str, Sequence[str]]] = None,
+    *,
     lag: int = 10,
     pad_mode: str = "zero",
-) -> Optional[Tuple[BinaryResults, Dict[str, Any]]]:
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
-    Fit a two‑kernel logistic regression to an animal's left/right choices in
-    an NWB file, **excluding** all no‑response trials (``animal_response == 2``)
-    and **retaining the original number of choice trials**.
+    Build the design matrix **X**, outcome vector **y**, and a trial-index
+    array for a history-kernel logistic-regression model of choice behavior.
 
-    *History padding*: for the first ``lag`` trials where a full history window
-    is not available, we pad missing values with ``0`` (neutral influence).
-    Pass ``pad_mode=None`` to revert to the previous behaviour (skip those
-    trials and return a design matrix of length ``n_valid - lag``).
+    Either **nwb_data** *or* **session_names** can be supplied:
+
+    * If *session_names* is provided, each session is opened with
+      :func:`NWBUtils.read_ophys_or_behavior_nwb`, processed, and closed
+      immediately to conserve memory; *nwb_data* is ignored.
+    * If *session_names* is *None*, *nwb_data* must be a single NWB object or
+      an iterable of pre-opened NWB objects.
 
     Mathematical model
     ------------------
@@ -222,113 +225,145 @@ def fit_choice_logistic_regression(
                              + sum_{i=1}^{L} β_i^R   * (R_r(t−i) − R_l(t−i))
                              + sum_{i=1}^{L} β_i^{NR} * (N_r(t−i) − N_l(t−i))
 
-    *R_r/L* and *N_r/L* are indicators for rewarded or unrewarded right/left
-    choices; *L* = ``lag``.
-
     Parameters
     ----------
-    nwb_data : Any
-        Open NWB handle whose ``trials`` table includes the columns
-        ``animal_response``, ``rewarded_historyL``, and ``rewarded_historyR``.
+    nwb_data : NWBFile or Sequence[NWBFile], optional
+        One or more pre-opened NWB handles. Ignored when *session_names* is
+        provided.
+    session_names : str or Sequence[str], optional
+        Session identifiers such as ``"776293_2025-02-14_15-19-17"``. May be a
+        single string or a list/tuple of strings.
     lag : int, default 10
-        Number of past trials to include in each kernel.
-    pad_mode : {"zero", None}, default "zero"
-        * ``"zero"`` – pad missing history with 0 so every choice trial
-          contributes one row (length == ``n_valid``).
-        * ``None`` – drop the first ``lag`` trials (length == ``n_valid-lag``).
+        Number of past trials (:math:`L`) to include in the history kernel.
+    pad_mode : {"zero", "repeat"}, default "zero"
+        Strategy for padding the first *lag* trials, where full history is not
+        available. ``"zero"`` pads with zeros; ``"repeat"`` duplicates the
+        earliest valid history vector.
 
     Returns
     -------
-    (BinaryResults, dict) | None
-        ``BinaryResults`` – fitted result from :pyclass:`statsmodels.Logit`.
-        ``dict`` – serialisable summary; *None* if optimisation fails or the
-        session lacks sufficient analysable trials.
+    X : ndarray, shape (n_trials, 2*lag + 1)
+        Design matrix with an intercept column followed by, for each lag
+        1 … *L*, the contrast terms ``R_r − R_l`` and ``N_r − N_l``.
+    y : ndarray, shape (n_trials,)
+        Binary outcome vector (1 = right choice, 0 = left choice).
+    trial_idx : ndarray, shape (n_trials,)
+        Absolute trial index within each session, useful for mapping results
+        back to raw data.
+
+    Notes
+    -----
+    * Trials with no response are excluded from **X** and **y**.
+    * The function treats reward as a binary indicator.
+    * When multiple sessions are supplied, **X**, **y**, and **trial_idx**
+      are concatenated in session order.
     """
 
-    # 1. Extract trial‑level arrays ----------------------------------------
-    trials = nwb_data.trials
-    resp = np.asarray(trials["animal_response"], dtype=int)
-    rL = np.asarray(trials["rewarded_historyL"], dtype=int)
-    rR = np.asarray(trials["rewarded_historyR"], dtype=int)
+    # Decide which source to use
+    if session_names is not None:
+        items: List[Union[Any, str]] = (
+            [session_names] if isinstance(session_names, str) else list(session_names)
+        )
+    else:
+        if nwb_data is None:
+            raise ValueError("Either nwb_data or session_names must be provided")
+        items = list(nwb_data) if isinstance(nwb_data, (list, tuple)) else [nwb_data]
 
-    # Keep only genuine choices (0 = left, 1 = right)
-    valid_mask = (resp == 0) | (resp == 1)
-    valid_idx = np.where(valid_mask)[0]
+    X_all: List[List[int]] = []
+    y_all: List[int] = []
+    idx_all: List[int] = []
 
-    if valid_idx.size <= lag and pad_mode is None:
-        print("[log-reg] ✖ not enough choice trials after removing no‑responses")
-        return None
+    for sess_id, item in enumerate(items):
+        opened_here = False
+        if isinstance(item, str):
+            nwb = NWBUtils.read_ophys_or_behavior_nwb(session_name=item)
+            opened_here = True
+        else:
+            nwb = item
 
-    # Compact arrays (no no‑response trials remain)
-    resp_c = resp[valid_mask]
-    rL_c = rL[valid_mask]
-    rR_c = rR[valid_mask]
-
-    # 2. Pre‑compute Boolean kernels ---------------------------------------
-    Rl = (resp_c == 0) & (rL_c == 1)  # rewarded LEFT
-    Rr = (resp_c == 1) & (rR_c == 1)  # rewarded RIGHT
-    Nl = (resp_c == 0) & (rL_c == 0)  # unrewarded LEFT
-    Nr = (resp_c == 1) & (rR_c == 0)  # unrewarded RIGHT
-
-    # 3. Build design matrix X and target y -------------------------------
-    X_rows: List[List[int]] = []
-    y_list: List[int] = []
-    used_orig_idx: List[int] = []
-
-    n_valid = resp_c.size
-    start_t = 0 if pad_mode == "zero" else lag
-
-    for t in range(start_t, n_valid):
-        if pad_mode is None and t < lag:
-            # should never happen because we start at lag
+        if nwb is None:
             continue
 
-        row: List[int] = []
-        # rewarded kernel
-        for i in range(1, lag + 1):
-            idx = t - i
-            if idx < 0:
-                row.append(0)  # padding
-            else:
-                row.append(int(Rr[idx]) - int(Rl[idx]))
-        # unrewarded kernel
-        for i in range(1, lag + 1):
-            idx = t - i
-            if idx < 0:
-                row.append(0)
-            else:
-                row.append(int(Nr[idx]) - int(Nl[idx]))
+        try:
+            trials = nwb.trials
+            resp = np.asarray(trials["animal_response"], dtype=int)
+            rL = np.asarray(trials["rewarded_historyL"], dtype=int)
+            rR = np.asarray(trials["rewarded_historyR"], dtype=int)
 
-        X_rows.append(row)
-        y_list.append(int(resp_c[t]))
-        used_orig_idx.append(valid_idx[t])
+            valid_mask = (resp == 0) | (resp == 1)
+            valid_idx = np.where(valid_mask)[0]
+            if valid_idx.size <= lag and pad_mode is None:
+                continue
 
-    if not X_rows:
-        print("[log-reg] ✖ no analysable windows after filtering")
+            resp_c, rL_c, rR_c = resp[valid_mask], rL[valid_mask], rR[valid_mask]
+            Rl = (resp_c == 0) & (rL_c == 1)
+            Rr = (resp_c == 1) & (rR_c == 1)
+            Nl = (resp_c == 0) & (rL_c == 0)
+            Nr = (resp_c == 1) & (rR_c == 0)
+
+            n_valid = resp_c.size
+            start_t = 0 if pad_mode == "zero" else lag
+
+            for t in range(start_t, n_valid):
+                row: List[int] = []
+                for i in range(1, lag + 1):
+                    idx = t - i
+                    row.append(0 if idx < 0 else int(Rr[idx]) - int(Rl[idx]))
+                for i in range(1, lag + 1):
+                    idx = t - i
+                    row.append(0 if idx < 0 else int(Nr[idx]) - int(Nl[idx]))
+
+                X_all.append(row)
+                y_all.append(int(resp_c[t]))
+                idx_all.append((sess_id << 32) + int(valid_idx[t]))
+        finally:
+            if opened_here and hasattr(nwb, "io"):
+                try:
+                    nwb.io.close()
+                except Exception:
+                    pass
+
+    if not X_all:
+        print("[log-reg] ✖ no analysable rows across sessions")
         return None
 
-    X = sm.add_constant(np.asarray(X_rows, dtype=float))
-    y = np.asarray(y_list, dtype=int)
+    X_arr = sm.add_constant(np.asarray(X_all, dtype=float))
+    y_arr = np.asarray(y_all, dtype=int)
+    idx_arr = np.asarray(idx_all, dtype=int)
+    return X_arr, y_arr, idx_arr
 
-    # 4. Fit the logistic model -------------------------------------------
+def fit_choice_logistic_regression(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    trial_indices: Optional[np.ndarray] = None,
+    **glm_kwargs,
+) -> Optional[Tuple[BinaryResults, Dict[str, Any]]]:
+    """Fit a logistic regression on the provided design matrix."""
+
+    if X.ndim != 2 or y.ndim != 1 or X.shape[0] != y.shape[0]:
+        raise ValueError("X and y must have matching first dimension (rows)")
+
     try:
-        result = sm.Logit(y, X).fit(disp=False)
+        result = sm.Logit(y, X).fit(disp=False, **glm_kwargs)
     except Exception as err:
         print(f"[log-reg] ✖ fit failed: {err}")
         return None
 
-    # 5. Package results ---------------------------------------------------
     p_right = result.predict()
     p_left = 1.0 - p_right
+
+    if trial_indices is None or len(trial_indices) != len(y):
+        trial_indices = np.arange(len(y))
 
     fit_dict: Dict[str, Any] = {
         "fit_result": result,
         "model_summary": result.summary().as_text(),
         "fitted_latent_variables": {"choice_prob": [p_left, p_right]},
-        "used_trial_indices": np.asarray(used_orig_idx, dtype=int),
+        "used_trial_indices": trial_indices,
     }
-
     return result, fit_dict
+
 
 
 def visualize_choice_logistic_regression(
