@@ -3,6 +3,7 @@ from typing import Any, Optional, Tuple, Dict, List
 from scipy.optimize import minimize
 
 import numpy as np
+import matplotlib.pyplot as plt
 from typing import Optional, Dict
 from scipy.optimize import minimize
 import statsmodels.api as sm
@@ -330,6 +331,109 @@ def fit_choice_logistic_regression(
     return result, fit_dict
 
 
+def visualize_choice_logistic_regression(
+    result: BinaryResults,
+    *,
+    lag: Optional[int] = None,
+    used_trial_indices: Optional[np.ndarray] = None,
+    title_font_size: int = 16,
+    label_font_size: int = 12,
+) -> None:
+    """Plot kernel coefficients and fit quality for a fitted logistic model.
+
+    Parameters
+    ----------
+    result : BinaryResults
+        Object returned by :pyclass:`statsmodels.Logit.fit`.
+    lag : int, optional
+        History length used when fitting. If *None*, it is inferred from the
+        parameter vector length, which must follow the pattern ``1 + 2·lag``.
+    used_trial_indices : np.ndarray, optional
+        Trial indices corresponding to rows in the design matrix – used for
+        the x‑axis on the probability/choice panel.
+    title_font_size / label_font_size : int, optional
+        Font sizes for figure elements.
+    """
+
+    # ─── Infer lag automatically if not provided ──────────────────────────
+    if lag is None:
+        n_coeff = len(result.params)
+        lag = (n_coeff - 1) // 2
+        if 1 + 2 * lag != n_coeff or lag <= 0:
+            raise ValueError(
+                "Could not infer lag – parameter vector length does not match 1 + 2·lag pattern"
+            )
+
+    # ─── Extract coefficients and CI half‑widths ──────────────────────────
+    params = result.params
+    conf_int = result.conf_int(alpha=0.05)
+    ci_half = (conf_int[:, 1] - conf_int[:, 0]) / 2.0
+
+    intercept = params[0]
+    intercept_ci = ci_half[0]
+
+    rewarded = params[1 : lag + 1]
+    rewarded_ci = ci_half[1 : lag + 1]
+
+    unrewarded = params[lag + 1 : 2 * lag + 1]
+    unrewarded_ci = ci_half[lag + 1 : 2 * lag + 1]
+
+    x_lags = np.arange(1, lag + 1)
+
+    # ─── Coefficient plot ─────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(0, intercept, width=0.4, color="lightblue", edgecolor="black", label="Intercept")
+    ax.errorbar(0, intercept, yerr=intercept_ci, fmt="none", ecolor="black", capsize=4)
+
+    ax.errorbar(
+        x_lags,
+        rewarded,
+        yerr=rewarded_ci,
+        fmt="-o",
+        color="blue",
+        ecolor="blue",
+        capsize=4,
+        label="Rewarded",
+    )
+
+    ax.errorbar(
+        x_lags,
+        unrewarded,
+        yerr=unrewarded_ci,
+        fmt="-o",
+        color="red",
+        ecolor="red",
+        capsize=4,
+        label="Unrewarded",
+    )
+
+    ax.set_xticks(np.arange(0, lag + 1))
+    ax.set_xticklabels(["0"] + [str(i) for i in x_lags])
+    ax.set_xlabel("Lag (0 = intercept)", fontsize=label_font_size)
+    ax.set_ylabel("Coefficient value", fontsize=label_font_size)
+    ax.set_title("Logistic regression coefficients (95% CI)", fontsize=title_font_size)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # ─── Probability vs. choice plot ──────────────────────────────────────
+    pred_p_right = result.predict()
+    actual_choice = result.model.endog
+
+    if used_trial_indices is None or len(used_trial_indices) != len(pred_p_right):
+        x_axis = np.arange(len(pred_p_right))
+    else:
+        x_axis = used_trial_indices
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(x_axis, pred_p_right, "-o", color="blue", label="Predicted P(Right)", alpha=0.7)
+    ax.scatter(x_axis, actual_choice, color="red", label="Actual choice", alpha=0.5)
+    ax.set_xlabel("Trial index (filtered)")
+    ax.set_ylabel("Probability / choice")
+    ax.set_title("Predicted probability vs. actual choice")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
 
 
 
