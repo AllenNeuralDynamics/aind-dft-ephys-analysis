@@ -9,6 +9,7 @@ import pandas as pd
 from general_utils import format_session_name
 from general_utils import extract_session_name_core
 from nwb_utils import NWBUtils
+from model_fitting import fit_q_learning_model
 
 def extract_event_timestamps(
     nwb_behavior_data: Any,
@@ -569,64 +570,99 @@ def generate_behavior_summary(
     nwb_data: Any,
     model_alias:  Union[str, List[str]] = ['QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax'],
     latent_names: Optional[List[str]] = None,
-    trial_types: Optional[List[str]] = None
+    trial_types : Optional[List[str]]  = None
 ) -> pd.DataFrame:
     """
-    Generate a one‑row DataFrame summarizing behavior for a session.
+    Build a one-row behavioral summary for a single session.
 
-    Columns:
-      - session_id: session identifier (cleaned)
-      - <alias>_<latent_name>: list of latent values per trial or None
-      - <trial_type>_trials: list of trial indices matching that type
+    If *model_alias* includes "q_learning_Y1", the function fits that model
+    locally with `fit_q_learning_model(...)` and uses its latent variables
+    instead of calling the remote API.
     """
-    # obtain session information from nwb_data
+    # ------------------------------------------------------------------
+    # 0. Session identifier
+    # ------------------------------------------------------------------
     full_session_name = getattr(nwb_data, 'session_id', None)
     session_id = extract_session_name_core(full_session_name) or full_session_name
 
-    # normalize model_alias to list
+    # ------------------------------------------------------------------
+    # 1. Normalise inputs
+    # ------------------------------------------------------------------
     aliases = [model_alias] if isinstance(model_alias, str) else list(model_alias)
 
-    # default latent names
     if latent_names is None:
         latent_names = [
-            'q_value_difference',      
-            'total_value',            
+            'q_value_difference',
+            'total_value',
             'right_choice_probability',
             'RPE',
             'chosen_q',
             'unchosen_q',
             'QL',
-            'QR'                      
+            'QR',
         ]
-    # default trial types
+
     if trial_types is None:
         trial_types = [
-            'no_response','response','rewarded','unrewarded',
-            'left_rewarded','right_rewarded'
+            'no_response', 'response', 'rewarded', 'unrewarded',
+            'left_rewarded', 'right_rewarded'
         ]
 
-    # build summary dict
-    summary: dict = {'session_id': session_id}
+    # ------------------------------------------------------------------
+    # 2. Cache for any locally fitted model
+    # ------------------------------------------------------------------
+    local_fit_cache: dict[str, dict] = {}
 
-    # collect latent values for each alias and latent_name
+    # ------------------------------------------------------------------
+    # 3. Assemble summary
+    # ------------------------------------------------------------------
+    summary: dict[str, Any] = {'session_id': session_id}
+
     for alias in aliases:
+        # --------------------------------------------------------------
+        # 3a. Obtain (or compute) fitted_latent for this alias
+        # --------------------------------------------------------------
+        if alias == 'q_learning_Y1':
+            # Fit only once per session
+            if alias not in local_fit_cache:
+                fit_dict = fit_q_learning_model(nwb_data, model_name=alias)
+                local_fit_cache[alias] = fit_dict
+            fit_source = 'local'   # just for clarity / debugging
+        else:
+            fit_source = 'remote'
+
+        # --------------------------------------------------------------
+        # 3b. Add each requested latent series
+        # --------------------------------------------------------------
         for ln in latent_names:
-            values = extract_fitted_data(
-                nwb_behavior_data=nwb_data,
-                session_name=full_session_name,
-                model_alias=alias,
-                latent_name=ln
-            )
-            col = f"{alias}-{ln}"
-            summary[col] = values.tolist() if values is not None else None
+            if fit_source == 'local':
+                values = extract_fitted_data(
+                    nwb_behavior_data=nwb_data,
+                    fitted_latent=local_fit_cache[alias],
+                    latent_name=ln
+                )
+            else:
+                values = extract_fitted_data(
+                    nwb_behavior_data=nwb_data,
+                    session_name=full_session_name,
+                    model_alias=alias,
+                    latent_name=ln
+                )
 
-    # collect trial indices per type
+            col_name = f"{alias}-{ln}"
+            summary[col_name] = values.tolist() if values is not None else None
+
+    # ------------------------------------------------------------------
+    # 4. Add trial-type index lists
+    # ------------------------------------------------------------------
     for tt in trial_types:
-        idxs = find_trials(nwb_data, tt)
-        summary[f"{tt}_trials"] = idxs
+        summary[f"{tt}_trials"] = find_trials(nwb_data, tt)
 
-    # return single-row DataFrame
+    # ------------------------------------------------------------------
+    # 5. Return single-row DataFrame
+    # ------------------------------------------------------------------
     return pd.DataFrame([summary])
+
 
 
 def generate_behavior_summary_combined(
