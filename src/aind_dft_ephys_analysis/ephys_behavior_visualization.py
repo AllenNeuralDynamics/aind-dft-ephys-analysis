@@ -192,59 +192,59 @@ def _all_variables(df: pd.DataFrame) -> List[str]:
 # ---------------------------------------------------------------------
 # Main plotting function
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Main plotting function (updated)
+# ---------------------------------------------------------------------
 def plot_unitwise_pvalues_across_models(
     data: Union[str, os.PathLike, pd.DataFrame],
     variable: Optional[str] = None,
     z_scores: Optional[List[bool]] = None,
     time_windows: Optional[List[str]] = None,
     fdr_line: float = 0.05,
+    skip_incomplete: bool = False,
     figsize: Tuple[int, int] = (12, 6),
     dpi: int = 120,
     lw: float = 1.0,
     alpha: float = 0.7
 ) -> None:
-    """
-    Visualise per-unit p-values across multiple correlation models.
+    """Visualise per‑unit p‑values across multiple correlation models.
 
     Typical workflow
     ----------------
-    1. Run your correlation pipeline to get one or more
-       ``correlations-*.csv`` files.
-
-    2. Combine them with
-           ``ephys_behavior.significance_and_direction_summary_combined(...)``
+    1. Run your correlation pipeline to get one or more ``correlations-*.csv`` files.
+    2. Merge them with ``ephys_behavior.significance_and_direction_summary_combined``
        → e.g. ``/root/capsule/results/sig_dir_all_sessions.csv``.
-
-    3. Pass that CSV (or an already-loaded DataFrame) to
-       ``plot_unitwise_pvalues_across_models``.
+    3. Feed that CSV (or an in‑memory DataFrame) to ``plot_unitwise_pvalues_across_models``.
 
     What the plot shows
     -------------------
-    • **One poly-line per unit** (session_id × unit_index) connecting its
-      p-values across all models.
-
-    • Panels are split by every ``time_window × z_score`` combination.
-
-    • If *variable* is *None*, the function loops over **all** variables that
-      appear in “*-<variable>_pval” columns and draws one figure per variable.
+    • **One poly‑line per unit** (session_id × unit_index) connecting its p‑values
+      across all models.
+    • Panels are split by every ``time_window × z_score`` combination.
+    • If *variable* is *None*, the function auto‑detects every variable that appears
+      in “*-<variable>_pval” columns and renders one figure per variable.
 
     Parameters
     ----------
     data : str | os.PathLike | pd.DataFrame
         Path to the CSV produced by
         ``ephys_behavior.significance_and_direction_summary_combined`` **or**
-        the DataFrame itself (already in memory).  The CSV is read with
-        ``smart_read_csv`` to preserve list/dict columns.
+        the DataFrame itself.  The CSV is read with ``smart_read_csv`` so list / dict
+        columns survive.
     variable : str | None
-        Behaviour variable part of the column name.  ``None`` → auto-detect all.
+        Behaviour variable to plot.  ``None`` → loop over all detected.
     z_scores : list[bool] | None
-        Which ``z_score`` values to plot.  ``None`` → auto-detect.
+        ``z_score`` values to include.  ``None`` → auto‑detect.
     time_windows : list[str] | None
-        Which ``time_window`` labels to plot.  ``None`` → auto-detect.
+        ``time_window`` labels to include.  ``None`` → auto‑detect.
     fdr_line : float
-        Horizontal reference line (default 0.05).
+        Horizontal reference line (default 0.05).
+    skip_incomplete : bool, default False
+        If True, **omit** any unit whose p‑value vector contains **either** NaN
+        **or** a non‑numeric value (e.g. "unknown").  This keeps the plot tidy when
+        some models failed.
     figsize, dpi : figure size / resolution.
-    lw, alpha : line width and transparency of unit traces.
+    lw, alpha : line width and transparency for unit traces.
     """
     # 1) Load DataFrame -------------------------------------------------
     df = smart_read_csv(data) if isinstance(data, (str, os.PathLike)) else data.copy()
@@ -256,13 +256,13 @@ def plot_unitwise_pvalues_across_models(
 
     # 3) Loop through variables, one figure each -----------------------
     for var in variables:
-        mdl_cols = _model_cols(df, var)
+        mdl_cols = _model_cols(df, var)            # {model → column}
         if not mdl_cols:
             print(f"[skip] no columns for variable '{var}'")
             continue
         models = sorted(mdl_cols)
 
-        # Panel grid axes
+        # Panel grid axes ---------------------------------------------
         zs  = z_scores  or sorted(df["z_score"].unique())
         tws = time_windows or sorted(df["time_window"].unique())
         n_r, n_c = len(zs), len(tws)
@@ -271,7 +271,7 @@ def plot_unitwise_pvalues_across_models(
             n_r, n_c, figsize=figsize, dpi=dpi,
             sharex=True, sharey=True, squeeze=False
         )
-        x_pos = range(len(models))  # categorical x coordinates
+        x_pos = range(len(models))  # categorical positions
 
         # 4) Draw each (z_score, time_window) panel --------------------
         for (ir, z_val), (ic, tw) in product(enumerate(zs), enumerate(tws)):
@@ -282,11 +282,32 @@ def plot_unitwise_pvalues_across_models(
                 continue
 
             grouped = panel_df.groupby(["session_id", "unit_index"])
+            n_units = 0
             for (_, _), grp in grouped:
-                y = [grp.iloc[0][mdl_cols[m]] for m in models]
-                ax.plot(x_pos, y, lw=lw, alpha=alpha)
+                row = grp.iloc[0]
+                # Build numeric y, coerce strings to floats; mark incompleteness
+                y: List[float] = []
+                incomplete = False
+                for m in models:
+                    raw_val = row[mdl_cols[m]]
+                    try:
+                        val = float(raw_val)
+                        if np.isnan(val):
+                            incomplete = True
+                            break
+                    except (TypeError, ValueError):
+                        # Non‑numeric like "unknown"
+                        incomplete = True
+                        break
+                    y.append(val)
 
-            n_units = grouped.ngroups
+                if skip_incomplete and incomplete:
+                    continue
+                if not incomplete:  # Only plot fully numeric vectors
+                    ax.plot(x_pos, y, lw=lw, alpha=alpha)
+                    n_units += 1
+
+            # Cosmetics ------------------------------------------------
             ax.set_xticks(x_pos, labels=models, rotation=45, ha="right")
             ax.set_yscale("log")
             ax.axhline(fdr_line, color="red", ls="--", lw=1)
@@ -299,5 +320,8 @@ def plot_unitwise_pvalues_across_models(
 
         plt.tight_layout()
         plt.show()
+
+
+
 
 
