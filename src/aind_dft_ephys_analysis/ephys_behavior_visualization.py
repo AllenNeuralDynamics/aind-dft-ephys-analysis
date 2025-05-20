@@ -321,6 +321,131 @@ def plot_unitwise_pvalues_across_models(
         plt.tight_layout()
         plt.show()
 
+        
+def plot_violin_pvalues_across_models(
+    data: Union[str, os.PathLike, pd.DataFrame],
+    variable: Optional[str] = None,
+    z_scores: Optional[List[bool]] = None,
+    time_windows: Optional[List[str]] = None,
+    alpha_level: float = 0.05,
+    skip_incomplete: bool = False,
+    figsize: Tuple[int, int] = (8, 5),
+    dpi: int = 120,
+    violin_kwargs: Optional[Dict] = None
+) -> None:
+    """Violin plot of *p‑value distributions* across correlation models.
+
+    Replaces the earlier bar‑chart fraction view with a richer depiction of the
+    entire p‑value distribution for each model.
+
+    Each panel (row × col) corresponds to a ``z_score × time_window`` pair, just
+    like :func:`plot_unitwise_pvalues_across_models`, enabling side‑by‑side
+    comparison.
+
+    Parameters
+    ----------
+    data : str | os.PathLike | pd.DataFrame
+        CSV path or pre‑loaded DataFrame holding p‑value columns.
+    variable : str | None
+        Behaviour variable to visualise (``None`` → all variables detected).
+    z_scores, time_windows : list | None
+        Subsets of ``z_score`` / ``time_window`` values to include (auto‑detect
+        if ``None``).
+    alpha_level : float, default 0.05
+        Reference line marking typical significance threshold.
+    skip_incomplete : bool, default False
+        Exclude units containing non‑numeric or NaN values for any model.
+    figsize, dpi : Size / resolution for *each* figure (one per variable).
+    violin_kwargs : dict | None
+        Extra kwargs forwarded to ``ax.violinplot`` (e.g. ``{'widths':0.9}``).
+    """
+    violin_kwargs = dict(violin_kwargs or {})
+
+    # 1) Load DataFrame -------------------------------------------------
+    df = smart_read_csv(data) if isinstance(data, (str, os.PathLike)) else data.copy()
+
+    # 2) Variable selection -------------------------------------------
+    variables = [variable] if variable else _all_variables(df)
+    if not variables:
+        raise ValueError("No '*_pval' columns found in supplied data.")
+
+    # 3) Iterate variables -------------------------------------------
+    for var in variables:
+        mdl_cols = _model_cols(df, var)
+        if not mdl_cols:
+            print(f"[skip] no columns for variable '{var}'")
+            continue
+        models = sorted(mdl_cols)
+
+        zs = z_scores or sorted(df["z_score"].unique())
+        tws = time_windows or sorted(df["time_window"].unique())
+        n_r, n_c = len(zs), len(tws)
+
+        fig, axes = plt.subplots(n_r, n_c, figsize=figsize, dpi=dpi,
+                                 sharex=True, sharey=True, squeeze=False)
+        x_pos = np.arange(1, len(models) + 1)  # violinplot expects 1‑based x
+
+        # 4) Gather & plot per panel ----------------------------------
+        for (ir, z_val), (ic, tw) in product(enumerate(zs), enumerate(tws)):
+            ax = axes[ir, ic]
+            panel_df = df[(df["z_score"] == z_val) & (df["time_window"] == tw)]
+            if panel_df.empty:
+                ax.set_visible(False)
+                continue
+
+            grouped = panel_df.groupby(["session_id", "unit_index"])
+            pvals_by_model: Dict[str, List[float]] = {m: [] for m in models}
+            total_units = 0
+
+            for (_, _), grp in grouped:
+                row = grp.iloc[0]
+                pvals_unit: List[float] = []
+                incomplete = False
+                for m in models:
+                    raw_val = row[mdl_cols[m]]
+                    try:
+                        val = float(raw_val)
+                        if np.isnan(val):
+                            incomplete = True
+                            break
+                    except (TypeError, ValueError):
+                        incomplete = True
+                        break
+                    pvals_unit.append(val)
+                if skip_incomplete and incomplete:
+                    continue
+                if incomplete:
+                    continue
+                total_units += 1
+                for m, v in zip(models, pvals_unit):
+                    pvals_by_model[m].append(v)
+
+            if total_units == 0:
+                ax.set_visible(False)
+                continue
+
+            data_for_violin = [pvals_by_model[m] for m in models]
+            parts = ax.violinplot(data_for_violin, positions=x_pos,
+                                  showmeans=False, showmedians=True,
+                                  showextrema=False, **violin_kwargs)
+            # Make median markers darker
+            for pc in parts['bodies']:
+                pc.set_alpha(0.6)
+            if 'cmedians' in parts:
+                parts['cmedians'].set_linewidth(1.2)
+
+            # Cosmetics ----------------------------------------------
+            ax.axhline(alpha_level, color='red', ls='--', lw=1)
+            ax.set_xticks(x_pos, labels=models, rotation=45, ha='right')
+            ax.set_ylim(0, 1)
+            ax.set_ylabel('p-value') if ic == 0 else None
+            ax.set_xlabel('model') if ir == n_r - 1 else None
+            ax.set_title(f"{var}\nwindow={tw}, z={z_val}  (n={total_units})")
+            ax.grid(True, axis='y', ls=':', alpha=0.4)
+
+        plt.tight_layout()
+        plt.show()
+
 
 
 
