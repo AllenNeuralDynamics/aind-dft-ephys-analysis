@@ -327,7 +327,12 @@ def plot_fraction_significant_lines_by_session(
     figsize: Tuple[int, int] = (10, 6),
     dpi: int = 120,
     lw: float = 2.0,
-    alpha: float = 0.8
+    alpha: float = 0.8,
+    session_color: str = 'C0',
+    avg_color: str = 'C1',
+    session_lw: float = 1.0,
+    avg_lw: float = 3.0,
+    session_alpha: float = 0.3
 ) -> None:
     """
     For each session, plot a line connecting the fraction of significant units
@@ -356,9 +361,19 @@ def plot_fraction_significant_lines_by_session(
     dpi : int
         Resolution.
     lw : float
-        Line width.
+        Line width for session lines.
     alpha : float
-        Line transparency.
+        Line transparency for session lines.
+    session_color : str
+        Matplotlib color for session lines.
+    avg_color : str
+        Matplotlib color for the average line.
+    session_lw : float
+        Line width for session lines.
+    avg_lw : float
+        Line width for the average line.
+    session_alpha : float
+        Transparency for session lines.
     """
     df = smart_read_csv(data) if isinstance(data, (str, os.PathLike)) else data.copy()
     variables = [variable] if variable else _all_variables(df)
@@ -376,7 +391,6 @@ def plot_fraction_significant_lines_by_session(
         zs = z_scores or sorted(df['z_score'].unique())
         tws = time_windows or sorted(df['time_window'].unique())
         n_rows, n_cols = len(zs), len(tws)
-
         fig, axes = plt.subplots(
             n_rows, n_cols,
             figsize=figsize, dpi=dpi,
@@ -393,10 +407,13 @@ def plot_fraction_significant_lines_by_session(
                     continue
 
                 sessions = sorted(panel['session_id'].unique())
+                all_fracs = []
+
                 for sess in sessions:
                     sess_df = panel[panel['session_id'] == sess]
                     total_units = 0
                     counts = np.zeros(len(models), dtype=int)
+
                     for _, grp in sess_df.groupby(['session_id', 'unit_index']):
                         raw_vals = [grp.iloc[0][mdl_cols[m]] for m in models]
                         try:
@@ -404,18 +421,40 @@ def plot_fraction_significant_lines_by_session(
                         except:
                             if skip_incomplete:
                                 continue
-                            pvals = [np.nan if not str(rv).replace('.', '', 1).isdigit() else float(rv)
-                                     for rv in raw_vals]
+                            pvals = [
+                                np.nan if not str(rv).replace('.', '', 1).isdigit()
+                                else float(rv)
+                                for rv in raw_vals
+                            ]
                         if skip_incomplete and any(np.isnan(p) for p in pvals):
                             continue
                         if any(np.isnan(p) for p in pvals):
                             continue
+
                         total_units += 1
                         counts += np.array(pvals) <= alpha_level
+
                     if total_units == 0:
                         continue
+
                     frac = counts / total_units
-                    ax.plot(x, frac, marker='o', lw=lw, alpha=alpha, label=sess)
+                    all_fracs.append(frac)
+                    ax.plot(
+                        x, frac,
+                        lw=session_lw,
+                        alpha=session_alpha,
+                        color=session_color
+                    )
+
+                if all_fracs:
+                    mean_frac = np.nanmean(np.vstack(all_fracs), axis=0)
+                    ax.plot(
+                        x, mean_frac,
+                        lw=avg_lw,
+                        alpha=1.0,
+                        color=avg_color,
+                        label='average'
+                    )
 
                 ax.set_xticks(x, labels=models, rotation=45, ha='right')
                 ax.set_ylim(0, 1)
@@ -426,8 +465,7 @@ def plot_fraction_significant_lines_by_session(
                     ax.set_xlabel('model')
                 ax.set_title(f"{var}\nwindow={tw}, z={z_val}")
                 ax.grid(axis='y', linestyle=':', alpha=0.4)
-                if len(sessions) > 1 and i_row == 0 and i_col == n_cols - 1:
-                    ax.legend(title='session', bbox_to_anchor=(1.05, 1), loc='upper left')
+                ax.legend(loc='upper right')
 
         plt.tight_layout()
         plt.show()
