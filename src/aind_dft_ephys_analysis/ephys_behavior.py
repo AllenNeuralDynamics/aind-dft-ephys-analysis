@@ -1,11 +1,14 @@
 import os
 import glob
+import json
 from pathlib import Path
+import xarray as xr
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Any, List, Optional, Union, Tuple, Dict
 import multiprocessing
+
 
 from behavior_utils import extract_event_timestamps 
 from general_utils import extract_session_name_core
@@ -441,31 +444,68 @@ def _multi_row_task(
             **model_kwargs
         )
 
-        res_clean = {
-            'aic':     getattr(res, 'aic', np.nan),
-            'bic':     getattr(res, 'bic', np.nan),
-            'llf':     getattr(res, 'llf', np.nan),
-            'params':  res.params.to_dict(),
-            'tvalues': res.tvalues.to_dict(),
-            'bse': res.bse.to_dict(),
-            'pvalues': res.pvalues.to_dict(),
-        }
-
+        res_clean = _stats_to_dict(res)
         return row_idx, model_name, res_clean            # ← success
     except Exception as e:
         return row_idx, model_name, {"ERROR": str(e)}  # ← failure
+
+
+def _stats_to_dict(res: Any) -> Dict[str, Any]:
+    """Serialize a *statsmodels* result object to a compact, JSON‑safe dict.
+
+    The helper is purposely generic – it tries to pull a wide set of common
+    attributes if they exist and falls back to *NaN* when not. Heavy arrays
+    (e.g. residuals) are omitted to keep file size under control.
+    """
+    return {
+        # Information criteria & log‑likelihood
+        "aic":       getattr(res, "aic", np.nan),
+        "bic":       getattr(res, "bic", np.nan),
+        "hqic":      getattr(res, "hqic", np.nan),
+        "llf":       getattr(res, "llf", np.nan),
+        # Model / sample size
+        "nobs":      getattr(res, "nobs", np.nan),
+        "df_model":  getattr(res, "df_model", np.nan),
+        "df_resid":  getattr(res, "df_resid", np.nan),
+        "sigma2":    getattr(res, "sigma2", np.nan),
+        # Goodness‑of‑fit (if available, e.g. ARDL)
+        "rsq":       getattr(res, "rsquared", np.nan),
+        "rsq_adj":   getattr(res, "rsquared_adj", np.nan),
+        # Coefficients & inference
+        "params":    getattr(res, "params", pd.Series(dtype=float)).to_dict(),
+        "bse":       getattr(res, "bse", pd.Series(dtype=float)).to_dict(),
+        "tvalues":   getattr(res, "tvalues", pd.Series(dtype=float)).to_dict(),
+        "pvalues":   getattr(res, "pvalues", pd.Series(dtype=float)).to_dict(),
+        # Confidence intervals if present (DataFrame → nested dict)
+        "conf_int": (
+            getattr(res, "conf_int", lambda: None)()
+            .to_dict(orient="index")
+            if callable(getattr(res, "conf_int", None)) else {}
+        ),
+    }
+
+
+def _df_to_xarray(df: pd.DataFrame) -> xr.Dataset:
+    """Return an *xarray.Dataset* with non‑primitive cells JSON‑encoded."""
+    enc = df.copy()
+    complex_mask = enc.applymap(lambda x: isinstance(x, (dict, list, tuple, type(None))))
+    complex_cols = complex_mask.any(axis=0).index[complex_mask.any(axis=0)].tolist()
+    for col in complex_cols:
+        enc[col] = enc[col].apply(json.dumps)
+    return xr.Dataset.from_dataframe(enc)
 
 
 def correlate_firing_latent_multiple_variable(
     df_firing: pd.DataFrame,
     df_behavior: pd.DataFrame,
     variables: List[str],
-    correlation_model: Union[str, List[str], Tuple[str, ...]] = "ARMA_model",
+    correlation_model: Union[str, List[str], Tuple[str, ...]] = "ARDL_model",
     model_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
     n_jobs: Optional[int] = None,
     save_folder: str = "/root/capsule/results",
     save_name: str = "correlations_multi.csv",
     save_result: bool = False,
+    save_format: str = "zarr",  # "csv" | "netcdf" | "zarr"
     exclude_columns: Optional[List[str]] = ['rates'],
 ) -> pd.DataFrame:
     """
@@ -504,6 +544,8 @@ def correlate_firing_latent_multiple_variable(
         ``None`` → use ``multiprocessing.cpu_count()``.
     save_folder / save_name / save_result
         If *save_result* is True, write the augmented DataFrame to disk.
+    save_format
+        default is zarr
     exclude_columns
         Optional list of columns to discard from the *result* DataFrame –
         useful to avoid serialising large arrays such as raw firing rate
@@ -573,13 +615,29 @@ def correlate_firing_latent_multiple_variable(
     # ──────────────────────────────────────────────────────────────────
     # 5) OPTIONAL SAVE-TO-DISK
     # ──────────────────────────────────────────────────────────────────
+    # Decide return / save type ------------------------------------------------
+    if save_format == "csv":
+        if save_result:
+            os.makedirs(save_folder, exist_ok=True)
+            csv_path = os.path.join(save_folder, f"{save_name}.csv")
+            result_out.to_csv(csv_path, index=False)
+            print(f"[multi-var] results saved to {csv_path}")
+        return result_out.copy()
+
+    # NetCDF or Zarr path: need Dataset ---------------------------------------
+    ds = _df_to_xarray(result_out)
+
     if save_result:
         os.makedirs(save_folder, exist_ok=True)
-        out_path = os.path.join(save_folder, save_name)
-        result.to_csv(out_path, index=False)
-        print(f"[multi-var] results saved to {out_path}")
+        base_path = os.path.join(save_folder, save_name)
+        if save_format == "netcdf":
+            ds.to_netcdf(f"{base_path}.nc")
+            print(f"[multi-var] results saved to {base_path}.nc (NetCDF)")
+        else:  # zarr
+            ds.to_zarr(f"{base_path}.zarr", mode="w")
+            print(f"[multi-var] results saved to {base_path}.zarr (Zarr)")
 
-    return result
+    return ds
 
 
 def correlate_firing_latent(
