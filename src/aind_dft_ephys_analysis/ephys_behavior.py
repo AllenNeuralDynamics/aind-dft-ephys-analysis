@@ -372,82 +372,71 @@ def _multi_row_task(
         pd.DataFrame,           # 2. beh_summary – behaviour table, indexed by session_id
         List[str],              # 3. variables – behaviour columns to include
         str,                    # 4. model_name – "ARMA_model", "ARDL_model", …
-        Dict[str, Any]          # 5. model_kwargs – extra kwargs forwarded to that model
+        Dict[str, Any],         # 5. model_kwargs – extra kwargs forwarded to that model
+        int                     # 6. group_idx   – sequential index of the var-group
     ]
-) -> Tuple[int, str, object]:
+) -> Tuple[int, str, int, object]:
     """
-    Pool-worker helper.  Returns a triple:
+    Pool-worker helper.  Returns a quadruple:
 
-        (row_idx, model_name, result_object)
+        (row_idx, model_name, group_idx, result_object)
 
     • *result_object*  –
         statsmodels results instance   … on success  
         None                           … if this row is skipped  
         {'ERROR': <msg>}               … if the fit raised an Exception
     """
-    # ──────────────────────────────────────────────────────────────────
-    # 0) UNPACK  – give expressive names to tuple elements
-    # ──────────────────────────────────────────────────────────────────
     (row_idx, firing_row, beh_summary,
-     variables, model_name, model_kwargs) = task
+     variables, model_name, model_kwargs, group_idx) = task
 
-    session_id: str      = firing_row["session_id"]
-    rates: np.ndarray    = np.asarray(firing_row["rates"], dtype=float)
-    n_trials: int        = len(rates)
+    session_id: str   = firing_row["session_id"]
+    rates: np.ndarray = np.asarray(firing_row["rates"], dtype=float)
+    n_trials: int     = len(rates)
 
     # ──────────────────────────────────────────────────────────────────
     # 1) QUICK EXITS  – no behaviour data, or all NaN
     # ──────────────────────────────────────────────────────────────────
     if session_id not in beh_summary.index:
-        return row_idx, model_name, None
+        return row_idx, model_name, group_idx, None
 
     beh_row = beh_summary.loc[session_id, variables]
 
-    if beh_row.isna().all():                       # every variable missing
-        return row_idx, model_name, None
+    if beh_row.isna().all():
+        return row_idx, model_name, group_idx, None
 
     # ──────────────────────────────────────────────────────────────────
     # 2) BUILD BEHAVIOUR DICT  +  GLOBAL VALID-TRIAL MASK
-    #    • mask_valid starts as all True and is AND-ed down.
-    #    • For each variable v:
-    #        (a) invalidate trials flagged by get_mask_trial_type(v)
-    #        (b) invalidate trials where v itself is NaN
     # ──────────────────────────────────────────────────────────────────
     beh_dict   = {v: beh_row[v] for v in variables}
-    mask_valid = np.ones(n_trials, dtype=bool)     # start: keep everything
+    mask_valid = np.ones(n_trials, dtype=bool)
 
     for v in variables:
-        # (a) variable-specific invalid-trial vector
         mask_col = get_mask_trial_type(v)
         if mask_col in beh_summary.columns:
-            invalid_vec = beh_summary.at[session_id, mask_col]
-            mask_valid[invalid_vec] = False
+            mask_valid[beh_summary.at[session_id, mask_col]] = False
+        # mask_valid &= ~pd.isna(beh_dict[v])   # keep if desired
 
-        # (b) trials where this variable is NaN
-        #mask_valid &= ~pd.isna(beh_dict[v])
+    if not mask_valid.any():
+        return row_idx, model_name, group_idx, None
 
-    if not mask_valid.any():                       # nothing survives
-        return row_idx, model_name, None
-
-    # Apply mask to firing rates and each behaviour array
     rates_clean = rates[mask_valid]
-
 
     # ──────────────────────────────────────────────────────────────────
     # 3) FIT THE REQUESTED MODEL
     # ──────────────────────────────────────────────────────────────────
     try:
-        model_fn = getattr(methods, model_name)    # dynamic lookup
+        model_fn = getattr(methods, model_name)
         res = model_fn(
             fr_ts=rates_clean,
             behavior_ts=beh_dict,
             **model_kwargs
         )
-
         res_clean = _stats_to_dict(res)
-        return row_idx, model_name, res_clean            # ← success
+        return row_idx, model_name, group_idx, res_clean
     except Exception as e:
-        return row_idx, model_name, {"ERROR": str(e)}  # ← failure
+        return row_idx, model_name, group_idx, {"ERROR": str(e)}
+
+
 
 
 def _stats_to_dict(res: Any) -> Dict[str, Any]:
@@ -495,22 +484,22 @@ def _df_to_xarray(df: pd.DataFrame) -> xr.Dataset:
     return xr.Dataset.from_dataframe(enc)
 
 
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ 2. MAIN FRONT-END ── now accepts nested *variable* groups               ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
 def correlate_firing_latent_multiple_variable(
     df_firing: pd.DataFrame,
     df_behavior: pd.DataFrame,
-    variables: List[str],
+    variables: Union[List[str], List[List[str]]],
     correlation_model: Union[str, List[str], Tuple[str, ...]] = "ARDL_model",
-    model_kwargs: Optional[Dict[str, Dict[str, Any]]] = {
-                "ARMA_model": {"ar_order": 2, "ma_order": 1},
-                "ARDL_model": {"y_lags": 3, "x_order": 0}
-            },
+    model_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
     n_jobs: Optional[int] = None,
     save_folder: str = "/root/capsule/results",
     save_name: str = "correlations_multi",
     save_result: bool = False,
-    save_format: str = "zarr",  # "csv" | "netcdf" | "zarr"
-    exclude_columns: Optional[List[str]] = ['rates'],
-) -> pd.DataFrame:
+    save_format: str = "zarr", 
+    exclude_columns: Optional[List[str]] = ["rates"],
+) -> pd.DataFrame | xr.Dataset:
     """
     Fit **one multivariate model per (session, unit)** for **each** requested
     model family, in parallel.
@@ -522,9 +511,7 @@ def correlate_firing_latent_multiple_variable(
 
         f"{model}-MULTI"
 
-      whose cells hold the full statsmodels results object (or an error dict).
-
-    Parameters
+      whose cells hold the full statsmodels results object (or an error dict).    Parameters
     ----------
     df_firing
         Table from ``get_the_mean_firing_rate_combined`` – must include
@@ -532,7 +519,10 @@ def correlate_firing_latent_multiple_variable(
     df_behavior
         Behaviour summary table – must include 'session_id' and *variables*.
     variables
-        Behaviour columns that will be used *jointly* in each regression.
+        • Flat *List[str]*  → one multivariate regression containing **all** vars.  
+        • Nested *List[List[str]]*  → one regression **per inner list** (variable group).
+          The results for each group are stored **in order** in a *list* inside the
+          “<model>-MULTI” column.
     correlation_model
         One model name **or** a list/tuple, e.g.
             "ARMA_model"
@@ -548,7 +538,7 @@ def correlate_firing_latent_multiple_variable(
     save_folder / save_name / save_result
         If *save_result* is True, write the augmented DataFrame to disk.
     save_format
-        default is zarr
+        Default is zarr.  # "csv" | "netcdf" | "zarr"
     exclude_columns
         Optional list of columns to discard from the *result* DataFrame –
         useful to avoid serialising large arrays such as raw firing rate
@@ -559,88 +549,88 @@ def correlate_firing_latent_multiple_variable(
         Copy of *df_firing* with one additional column per model.
     """
     # ──────────────────────────────────────────────────────────────────
-    # 0) NORMALISE + VALIDATE MODEL LIST
+    # 0) NORMALISE  – model list  &  variable-group list
     # ──────────────────────────────────────────────────────────────────
     models = [correlation_model] if isinstance(correlation_model, str) else list(correlation_model)
     unknown = [m for m in models if not hasattr(methods, m)]
     if unknown:
         raise ValueError(f"Unknown model helper(s) in `methods`: {unknown}")
 
+    # Accept both flat and nested lists
+    if not variables:
+        raise ValueError("`variables` must not be empty")
+
+    if isinstance(variables[0], (list, tuple)):
+        var_groups: List[List[str]] = [list(g) for g in variables]            # nested given
+    else:
+        var_groups = [list(variables)]                                        # single group
+
     model_kwargs = model_kwargs or {}
-    exclude_columns = exclude_columns or []
+    exclude_columns = list(exclude_columns or [])
+
     # ──────────────────────────────────────────────────────────────────
-    # 1) PREP  – behaviour table (indexed) and output DataFrame
+    # 1) PREP  – behaviour table & output DataFrame
     # ──────────────────────────────────────────────────────────────────
     beh_summary = df_behavior.set_index("session_id")
     result      = df_firing.copy().reset_index(drop=True)
 
+    # Pre-allocate list-typed columns (one list per row that we will append to)
     for m in models:
-        result[f"{m}-MULTI"] = None               # placeholder column
+        result[f"{m}-MULTI"] = [[] for _ in range(len(result))]
 
     # ──────────────────────────────────────────────────────────────────
-    # 2) BUILD TASK LIST  – one task PER (row, model) combination
+    # 2) BUILD TASK LIST  – one task PER (row, model, var_group)
     # ──────────────────────────────────────────────────────────────────
-    tasks: List[Tuple] = [
-        (
-            idx, row.to_dict(), beh_summary,
-            variables, m, model_kwargs[m]
-        )
-        for idx, row in result.iterrows()
-        for m in models
-    ]
-
+    tasks: List[Tuple] = []
+    for idx, row in result.iterrows():
+        row_dict = row.to_dict()
+        for m in models:
+            kwargs = model_kwargs.get(m, {})
+            for g_idx, group in enumerate(var_groups):
+                tasks.append((idx, row_dict, beh_summary, group, m, kwargs, g_idx))
 
     # ──────────────────────────────────────────────────────────────────
-    # 3) RUN MULTIPROCESSING POOL
+    # 3) MULTIPROCESS POOL
     # ──────────────────────────────────────────────────────────────────
     if n_jobs is None:
         n_jobs = multiprocessing.cpu_count()
 
-    total_tasks = len(tasks)
     with multiprocessing.Pool(processes=n_jobs) as pool:
-        for done, (row_idx, model_name, res_obj) in enumerate(
+        total = len(tasks)
+        for done, (row_idx, model_name, g_idx, res_obj) in enumerate(
             pool.imap_unordered(_multi_row_task, tasks), start=1
         ):
-            # progress banner every 100 fits (or at the very end)
-            if done % 100 == 0 or done == total_tasks:
-                print(f"[multi-var] progress: {done}/{total_tasks} fits completed")
-            result.at[row_idx, f"{model_name}-MULTI"] = res_obj
+            # Append result in the correct order
+            result.at[row_idx, f"{model_name}-MULTI"].append(res_obj)
 
-    # ------------------------------------------------------------------
-    # 4) DROP HEAVY COLUMNS *AFTER* FITTING + SAVE / RETURN
-    # ------------------------------------------------------------------
+            if done % 100 == 0 or done == total:
+                print(f"[multi-var] progress: {done}/{total} fits completed")
+
+    # ──────────────────────────────────────────────────────────────────
+    # 4) DROP LARGE COLUMNS & OPTIONAL SAVE
+    # ──────────────────────────────────────────────────────────────────
     result_out = (
-        result
-        .drop(columns=[c for c in exclude_columns if c in result.columns], errors="ignore")
-        .copy()
+        result.drop(columns=[c for c in exclude_columns if c in result.columns], errors="ignore")
     )
 
-    # ──────────────────────────────────────────────────────────────────
-    # 5) OPTIONAL SAVE-TO-DISK
-    # ──────────────────────────────────────────────────────────────────
-    # Decide return / save type ------------------------------------------------
-    if save_format == "csv":
-        if save_result:
-            os.makedirs(save_folder, exist_ok=True)
-            csv_path = os.path.join(save_folder, f"{save_name}.csv")
-            result_out.to_csv(csv_path, index=False)
-            print(f"[multi-var] results saved to {csv_path}")
-        return result_out.copy()
-
-    # NetCDF or Zarr path: need Dataset ---------------------------------------
-    ds = _df_to_xarray(result_out)
+    ds = _df_to_xarray(result_out)  # needed even if we eventually return DataFrame
 
     if save_result:
         os.makedirs(save_folder, exist_ok=True)
-        base_path = os.path.join(save_folder, save_name)
-        if save_format == "netcdf":
-            ds.to_netcdf(f"{base_path}.nc")
-            print(f"[multi-var] results saved to {base_path}.nc (NetCDF)")
-        else:  # zarr
-            ds.to_zarr(f"{base_path}.zarr", mode="w")
-            print(f"[multi-var] results saved to {base_path}.zarr (Zarr)")
+        base = os.path.join(save_folder, save_name)
 
-    return ds
+        if save_format == "csv":
+            result_out.to_csv(f"{base}.csv", index=False)
+            print(f"[multi-var] results saved to {base}.csv")
+        elif save_format == "netcdf":
+            ds.to_netcdf(f"{base}.nc")
+            print(f"[multi-var] results saved to {base}.nc (NetCDF)")
+        else:  # default "zarr"
+            ds.to_zarr(f"{base}.zarr", mode="w")
+            print(f"[multi-var] results saved to {base}.zarr (Zarr)")
+
+    # Return the same type as before for backward compatibility
+    return ds if save_format in ("netcdf", "zarr") else result_out
 
 
 def correlate_firing_latent(
