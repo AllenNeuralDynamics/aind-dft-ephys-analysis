@@ -1065,3 +1065,222 @@ def significance_and_direction_summary_combined(
     return combined
 
 
+def significance_and_direction_summary_multi(
+    corr_df_or_ds: Union[pd.DataFrame, xr.Dataset, str, Path],
+    meta_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Create a **tidy significance / direction table** from the nested
+    ``correlation_results`` column produced by
+    `correlate_firing_latent_multiple_variable`.
+
+    ACCEPTED INPUT TYPES
+    --------------------
+    ① *pd.DataFrame* – in-memory results  
+    ② *xr.Dataset*   – what you get from ``xr.open_zarr(...)``  
+    ③ path to a **.zarr** directory (str / Path)  
+    ④ legacy CSV from the single-variable pipeline (auto-detected → routed
+       to the old implementation, so both worlds can coexist).
+
+    OUTPUT COLUMN SCHEME
+    --------------------
+    For every     «model» × «behaviour variable (lag-stripped)» × «group#»
+    two columns are created:
+
+        <model>_<var>_g<idx>_pval     – minimum p-value across lags  
+        <model>_<var>_g<idx>_dir      – 'positive' · 'negative' · 'none' · 'unknown'
+
+    The *group index* (g0, g1, …) corresponds to the order in which you
+    supplied the variable groups to the correlate function.
+
+    QUICK EXAMPLE
+    -------------
+    >>> tbl = significance_and_direction_summary_multi(ds)
+    >>> tbl.filter(like='_pval').head()
+
+    """
+    # ────────────────────────────────────────────────────────────────
+    # 0)  Resolve input (DataFrame · Dataset · Zarr path · legacy CSV)
+    # ────────────────────────────────────────────────────────────────
+    if isinstance(corr_df_or_ds, (str, Path)) and str(corr_df_or_ds).endswith(".zarr"):
+        ds = xr.open_zarr(corr_df_or_ds, consolidated=False)
+        df_raw = ds.to_dataframe()
+        for col in df_raw.columns:
+            if df_raw[col].dtype == object:
+                try:
+                    df_raw[col] = df_raw[col].apply(json.loads)
+                except Exception:
+                    pass
+    elif isinstance(corr_df_or_ds, xr.Dataset):
+        df_raw = corr_df_or_ds.to_dataframe()
+        for col in df_raw.columns:
+            if df_raw[col].dtype == object:
+                try:
+                    df_raw[col] = df_raw[col].apply(json.loads)
+                except Exception:
+                    pass
+    elif isinstance(corr_df_or_ds, pd.DataFrame):
+        df_raw = corr_df_or_ds.copy()
+
+    # ────────────────────────────────────────────────────────────────
+    # 1)  Metadata scaffold
+    # ────────────────────────────────────────────────────────────────
+    if meta_cols is None:
+        meta_cols = ["session_id", "unit_index", "time_window", "z_score"]
+
+    summary = df_raw[meta_cols].copy()
+    created: set[str] = set()   # track newly-minted columns
+
+    # ────────────────────────────────────────────────────────────────
+    # 2)  Iterate row-wise through the nested dictionaries
+    # ────────────────────────────────────────────────────────────────
+    for idx, row in df_raw.iterrows():
+        cr: Dict[str, list] = row["correlation_results"]
+
+        for model, fit_list in cr.items():
+            for g_idx, fit in enumerate(fit_list):
+                if not fit or "params" not in fit:
+                    continue
+
+                params, pvals = fit["params"], fit["pvalues"]
+
+                # behaviour names without lag suffix ('.L1', '.L2', …)
+                base_vars = {k.split(".")[0] for k in params if k.split(".")[0] != "const"}
+
+                for v in base_vars:
+                    lag_keys = [k for k in params if k.startswith(v)]
+                    beta     = params[lag_keys[0]]
+                    p_min    = min(pvals.get(k, np.nan) for k in lag_keys)
+
+                    col_p    = f"{model}_{v}_g{g_idx}_pval"
+                    col_coef = f"{model}_{v}_g{g_idx}_coef"
+                    col_tval = f"{model}_{v}_g{g_idx}_tval"
+                    created.update([col_p, col_coef, col_tval])
+
+                    # coefficient  (= first non-lagged β)  &  t-statistic
+                    t_val = fit.get("tvalues", {}).get(lag_keys[0], np.nan)
+
+                    summary.at[idx, col_p]    = p_min
+                    summary.at[idx, col_coef] = beta
+                    summary.at[idx, col_tval] = t_val
+
+    # ensure every new column exists for all rows
+    for col in created:
+        if col.endswith("_dir"):
+            summary[col] = summary[col].fillna("unknown")
+        else:
+            summary[col] = summary[col].astype(float)
+
+    return summary
+
+
+def significance_and_direction_summary_combined_multi(
+    paths: Optional[List[Union[str, Path]]] = None,
+    search_folder: str = "/root/capsule/results",
+    pattern: str = "correlations_multi*.zarr",
+    save_folder: str = "/root/capsule/results",
+    save_name: str = "sig_dir_all_sessions.csv",
+    save_result: bool = False,
+    save_format: str = "zarr",
+    meta_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Batch version of ``significance_and_direction_summary_multi`` that accepts
+    **multiple correlation result folders (.zarr)** produced by
+    ``correlate_firing_latent_multiple_variable``,
+    converts each into a significance / direction table, and concatenates
+    the lot.
+
+    ─────────────────────────────────────────────────────────────────────
+    PARAMETERS
+    ─────────────────────────────────────────────────────────────────────
+    paths : list[str | pathlib.Path] | None
+        Explicit list of Zarr directories (or legacy CSVs) to process.
+        • If *None*, files are discovered with *pattern* inside *search_folder*.
+        • Mixed lists are allowed – every entry is auto-routed to the correct
+          parser (multi-var Zarr → new routine, legacy CSV → old routine).
+
+    search_folder : str
+        Directory that is searched when *paths* is **None**.
+
+    pattern : str
+        Glob pattern used for auto-discovery.  **Default**:
+            ``'correlations_multi*.zarr'``
+
+    save_folder, save_name, save_result
+        Control optional saving of the concatenated DataFrame.
+        • When *save_result* is True the table is written as CSV:
+            ``<save_folder>/<save_name>``
+    save_format
+        • *save_format*  may be **'csv'** (default) or **'zarr'**.  
+          When 'zarr' is chosen the combined table is written to  
+          ``<save_folder>/<save_name>.zarr`` in *consolidated* mode.
+    meta_cols : list[str] | None
+        Metadata columns to preserve verbatim.  If *None* the default set
+        ``['session_id', 'unit_index', 'time_window', 'z_score']`` is used.
+
+    ─────────────────────────────────────────────────────────────────────
+    RETURNS
+    ─────────────────────────────────────────────────────────────────────
+    pd.DataFrame
+        Combined significance / direction table from **all** supplied result
+        files / folders.  Rows are sorted by:
+
+            source_file  ·  session_id  ·  unit_index
+    """
+
+    # ........................................................................
+    # 1)  Resolve file list
+    # ........................................................................
+    if paths is None:
+        paths = sorted(Path(search_folder).expanduser().glob(pattern))
+    if not paths:
+        raise FileNotFoundError("No correlation result files discovered.")
+
+    print(f"Found {len(paths)} correlation result file(s)/folder(s):")
+    for p in paths:
+        print(f"  • {p}")
+
+    # ........................................................................
+    # 2)  Per-file conversion
+    # ........................................................................
+    frames = []
+    for idx, p in enumerate(paths, start=1):
+
+        print(f"\n[ {idx}/{len(paths)} ]  Processing {p} …")
+        
+        summ = significance_and_direction_summary_multi(p, meta_cols=meta_cols)
+        summ.insert(0, "source_file", p.name)
+        frames.append(summ)
+
+    combined = (
+        pd.concat(frames, ignore_index=True)
+          .sort_values(["source_file", "session_id", "unit_index"])
+          .reset_index(drop=True)
+    )
+
+    # ........................................................................
+    # 3)  Optional save
+    # ........................................................................
+    if save_result:
+       Path(save_folder).mkdir(parents=True, exist_ok=True)
+       if save_format == "csv":
+           out = Path(save_folder) / f"{save_name}.csv"
+           combined.to_csv(out, index=False)
+           print(f"[multi-var] combined summary written to {out}")
+
+       elif save_format == "zarr":
+           out = Path(save_folder) / f"{save_name}.zarr"
+           # JSON-encode any nested dict/list columns before xarray write
+           _enc = combined.copy()
+           for c in _enc.columns:
+               if _enc[c].apply(lambda x: isinstance(x, (dict, list, tuple))).any():
+                   _enc[c] = _enc[c].apply(json.dumps)
+           xr.Dataset.from_dataframe(_enc).to_zarr(out, mode="w", consolidated=True)
+           print(f"[multi-var] combined summary written to {out}")
+
+       else:
+           raise ValueError("save_format must be 'csv' or 'zarr'")
+
+    return combined
+
