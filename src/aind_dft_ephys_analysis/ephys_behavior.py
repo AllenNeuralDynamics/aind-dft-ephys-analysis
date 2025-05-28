@@ -503,7 +503,7 @@ def correlate_firing_latent_multiple_variable(
     model_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
     n_jobs: Optional[int] = None,
     save_folder: str = "/root/capsule/results",
-    save_name: str = "correlations_multi.csv",
+    save_name: str = "correlations_multi",
     save_result: bool = False,
     save_format: str = "zarr",  # "csv" | "netcdf" | "zarr"
     exclude_columns: Optional[List[str]] = ['rates'],
