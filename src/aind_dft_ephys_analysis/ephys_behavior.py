@@ -4,7 +4,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from typing import Any, List, Optional, Union, Tuple
+from typing import Any, List, Optional, Union, Tuple, Dict
+import multiprocessing
 
 from behavior_utils import extract_event_timestamps 
 from general_utils import extract_session_name_core
@@ -198,6 +199,166 @@ def get_the_mean_firing_rate_combined(
 
     return combined_df
 
+
+# Helper for parallel processing of each row
+def _process_row_task(
+    task: Tuple[
+        int,                    # Row index in df_firing
+        Dict[str, Any],         # One row of df_firing converted to dict
+        pd.DataFrame,           # Behavior summary dataframe (indexed by session_id)
+        List[str],              # List of correlation model names to run
+        List[str],              # List of behavior variable names to correlate
+        set,                    # Set of session_ids to skip (invalid or NaN)
+        int                     # Total number of rows/tasks – for progress logging
+    ]
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    Worker function executed in parallel to compute correlations for **one**
+    (session, unit) row of *df_firing* against the requested behavior variables.
+
+    Parameters
+    ----------
+    task : tuple
+        A 7-element tuple with:
+        0. **row_idx** (int) – Index of the current row in *df_firing*.
+        1. **firing_row** (dict) – Row data (already `to_dict()`-ed) containing
+           `session_id`, `unit_index`, and a trial-length list of firing **rates**.
+        2. **beh_summary** (*pd.DataFrame*) – Behavior dataframe indexed by
+           `session_id`; each column is a variable list per trial.
+        3. **model_names** (List[str]) – Correlation/regression model names
+           (e.g. `"simple_LR"`, `"ARMA_model"`).
+        4. **beh_variables** (List[str]) – Names of the behavior variables to
+           correlate with firing rates.
+        5. **invalid_sessions** (set[str]) – Sessions that should be skipped
+           because *all* requested variables are missing/NaN.
+        6. **total_tasks** (int) – Total number of rows, used only for
+           human-readable progress messages.
+
+    Returns
+    -------
+    Tuple[int, Dict[str, Any]]
+        *(row_idx, results_dict)* where **results_dict** maps
+        `"{model}-{variable}" → result-dictionary` (or is empty if the row was
+        skipped).
+    """
+    # ---------------------------------------------------------------------
+    #  Unpack the tuple into descriptive local names
+    # ---------------------------------------------------------------------
+    (
+        row_idx,
+        firing_row,
+        beh_summary,
+        model_names,
+        beh_variables,
+        invalid_sessions,
+        total_tasks,
+    ) = task
+
+    session_id: str = firing_row['session_id']
+    unit_idx: Any  = firing_row.get('unit_index', 'unknown')
+
+    # Prepare container for all model/variable results generated for this row
+    results: Dict[str, Any] = {}
+
+    # ---------------------------------------------------------------------
+    #  Skip rows whose session lacks usable behavior data
+    # ---------------------------------------------------------------------
+    if session_id in invalid_sessions or session_id not in beh_summary.index:
+        return row_idx, results  # Empty result – caller will leave columns as None
+
+    # ---------------------------------------------------------------------
+    #  Extract data needed for correlation
+    # ---------------------------------------------------------------------
+    rates: np.ndarray = np.asarray(firing_row['rates'], dtype=float)
+    n_trials: int     = len(rates)
+
+    # ---------------------------------------------------------------------
+    #  Iterate over every (model, variable) pair requested
+    # ---------------------------------------------------------------------
+    for model_name in model_names:
+        if not hasattr(methods, model_name):
+            # Gracefully ignore typos / unsupported models
+            continue
+        regression_fn = getattr(methods, model_name)
+
+        for beh_var in beh_variables:
+            column_name = f"{model_name}-{beh_var}"
+            print(f"Processing row {row_idx + 1}/{total_tasks}: "
+                  f"session {session_id}, unit {unit_idx} → "
+                  f"model '{model_name}', variable '{beh_var}'")
+
+            # Pull the behavior vector and its no-response mask
+            beh_series = beh_summary.at[session_id, beh_var]
+            mask_col   = get_mask_trial_type(beh_var)  # e.g. 'no_response_goCue'
+            mask_trials    = beh_summary.at[session_id, mask_col]
+
+            # Build boolean mask to exclude no-response trials
+            valid_mask      = np.ones(n_trials, dtype=bool)
+            valid_mask[mask_trials] = False
+            rates_clean     = rates[valid_mask]
+
+            # Sanity-check alignment between behavior and firing vectors
+            if (
+                beh_series is None
+                or (isinstance(beh_series, float) and np.isnan(beh_series))
+                or not isinstance(beh_series, (list, tuple))
+                or len(beh_series) != len(rates_clean)
+            ):
+                # Skip mis-aligned or missing data
+                continue
+
+            # -----------------------------------------------------------------
+            #  Dispatch to the selected model and store its outputs
+            # -----------------------------------------------------------------
+            if model_name == 'simple_LR':
+                res = regression_fn(rates_clean, beh_series, behavior_name=column_name)
+                results[column_name] = {
+                    'slope':     res.params.get(column_name, np.nan),
+                    'intercept': res.params.get('const', np.nan),
+                    'r_squared': getattr(res, 'rsquared_adj', np.nan),
+                    'p_value':   res.pvalues.get(column_name, np.nan)
+                }
+
+            elif model_name == 'ARMA_model':
+                res = regression_fn(rates_clean, beh_series,
+                                    behavior_name=column_name,
+                                    AR_p=3, MA_q=0)
+                results[column_name] = {
+                    'aic':     getattr(res, 'aic', np.nan),
+                    'bic':     getattr(res, 'bic', np.nan),
+                    'llf':     getattr(res, 'llf', np.nan),
+                    'params':  res.params.to_dict(),
+                    'pvalues': res.pvalues.to_dict(),
+                }
+
+            elif model_name == 'ARDL_model':
+                res = regression_fn(rates_clean, beh_series,
+                                    behavior_name=column_name,
+                                    y_lag=5, x_order=0)
+                results[column_name] = {
+                    'aic':     getattr(res, 'aic', np.nan),
+                    'bic':     getattr(res, 'bic', np.nan),
+                    'llf':     getattr(res, 'llf', np.nan),
+                    'params':  res.params.to_dict(),
+                    'pvalues': res.pvalues.to_dict(),
+                }
+
+            elif model_name in ('cyclic_shift', 'linear_shift'):
+                res = regression_fn(rates_clean, beh_series,
+                                    behavior_name=column_name,
+                                    ensemble_size=100, min_shift=3)
+                results[column_name] = res  # These models already return a dict
+
+            elif model_name == 'phase_randomization':
+                res = regression_fn(rates_clean, beh_series,
+                                    behavior_name=column_name,
+                                    ensemble_size=100)
+                results[column_name] = res
+
+    # Return the row index (so the caller knows where to write) and the dict
+    return row_idx, results
+
+
 def correlate_firing_latent(
     df_firing: pd.DataFrame,
     df_behavior: pd.DataFrame,
@@ -217,10 +378,10 @@ def correlate_firing_latent(
     ----------
     df_firing : pd.DataFrame
         Must contain ['session_id','unit_index','time_window','z_score','rates'].
-        'rates' is a list-like of floats (one per trial). Output from get_the_mean_firing_rate_combined. 
+        'rates' is a list-like of floats (one per trial). Output from get_the_mean_firing_rate_combined.
     df_behavior : pd.DataFrame
         Must contain 'session_id', each name in `variables` as list-like, and
-        variable-specific no-response trial lists. Output from generate_behavior_summary_combined. 
+        variable-specific no-response trial lists. Output from generate_behavior_summary_combined.
     variables : List[str]
         Names of the behavior columns to correlate.
     correlation_model : Union[str, List[str]]
@@ -245,7 +406,6 @@ def correlate_firing_latent(
         Copy of df_firing with additional dict-valued columns. Column names:
         `{model}_{variable}`.
     """
-
     # ---------------------------------------------------------------------
     # 1. Normalize arguments
     # ---------------------------------------------------------------------
@@ -264,109 +424,30 @@ def correlate_firing_latent(
     # 3. Prepare output frame
     # ---------------------------------------------------------------------
     result = df_firing.copy().reset_index(drop=True)
-    total_rows = len(result)
     for model in models:
         for var in variables:
-            result[f"{model}-{var}"] = None  # pre-allocate columns
+            result[f"{model}-{var}"] = None
 
     # ---------------------------------------------------------------------
-    # 4. Iterate over firing rows
+    # 4. Build tasks for parallel execution
     # ---------------------------------------------------------------------
+    tasks = []
+    total_tasks = len(result)
     for i, row in result.iterrows():
-        sess = row['session_id']
-        unit = row['unit_index']
-
-        # Skip if this session has no usable behavioral data at all
-        if sess in invalid_sessions:
-            print(f"Skipping session '{sess}' (all behavior variables invalid)")
-            continue
-
-        # Skip if behavior session entirely absent (should be rare)
-        if sess not in beh.index:
-            print(f"Skipping session '{sess}' (behavior data missing)")
-            continue
-
-        print(f"Processing session '{sess}', unit {unit} (row {i+1}/{total_rows})…")
-
-        rates = np.asarray(row['rates'], dtype=float)
-        n_trials = len(rates)
-
-        for model in models:
-            if not hasattr(methods, model):
-                print(f"  Model '{model}' not found in methods, skipping")
-                continue
-            reg_fn = getattr(methods, model)
-
-            for var in variables:
-                col = f"{model}-{var}"
-                raw = beh.at[sess, var]
-
-                # ----------------------------------------------------------
-                # Build mask for trials to exclude (e.g., no-response)
-                # ----------------------------------------------------------
-                mask_col = get_mask_trial_type(var)
-                no_resp = beh.at[sess, mask_col]
-                mask = np.ones(n_trials, dtype=bool)
-                mask[no_resp] = False
-                rates_clean = rates[mask]
-
-                # Validate raw behavior series
-                if (
-                    raw is None
-                    or (isinstance(raw, float) and np.isnan(raw))
-                    or not isinstance(raw, (list, tuple))
-                    or len(raw) != len(rates_clean)
-                ):
-                    # Leave cell as None to indicate unusable
-                    continue
-
-                # ----------------------------------------------------------
-                # Dispatch to the selected correlation / regression model
-                # ----------------------------------------------------------
-                if model == 'simple_LR':
-                    res = reg_fn(rates_clean, raw, behavior_name=col)
-                    result.at[i, col] = {
-                        'slope':     res.params.get(col, np.nan),
-                        'intercept': res.params.get('const', np.nan),
-                        'r_squared': getattr(res, 'rsquared_adj', np.nan),
-                        'p_value':   res.pvalues.get(col, np.nan)
-                    }
-
-                elif model == 'ARMA_model':
-                    res = reg_fn(rates_clean, raw, behavior_name=col, AR_p=3, MA_q=0)
-                    result.at[i, col] = {
-                        'aic':     getattr(res, 'aic', np.nan),
-                        'bic':     getattr(res, 'bic', np.nan),
-                        'llf':     getattr(res, 'llf', np.nan),
-                        'params':  res.params.to_dict(),
-                        'pvalues': res.pvalues.to_dict(),
-                    }
-
-                elif model == 'ARDL_model':
-                    res = reg_fn(rates_clean, raw, behavior_name=col, y_lag=5, x_order=0)
-                    result.at[i, col] = {
-                        'aic':     getattr(res, 'aic', np.nan),
-                        'bic':     getattr(res, 'bic', np.nan),
-                        'llf':     getattr(res, 'llf', np.nan),
-                        'params':  res.params.to_dict(),
-                        'pvalues': res.pvalues.to_dict(),
-                    }
-
-                elif model in ('cyclic_shift', 'linear_shift'):
-                    res = reg_fn(rates_clean, raw, behavior_name=col,
-                                 ensemble_size=100, min_shift=3)
-                    result.at[i, col] = res
-
-                elif model == 'phase_randomization':
-                    res = reg_fn(rates_clean, raw, behavior_name=col, ensemble_size=100)
-                    result.at[i, col] = res
-
-                else:
-                    # Unsupported model – already warned above
-                    continue
+        tasks.append((i, row.to_dict(), beh, models, variables, invalid_sessions, total_tasks))
 
     # ---------------------------------------------------------------------
-    # 5. Optionally save to disk
+    # 5. Execute in parallel with progress tracking
+    # ---------------------------------------------------------------------
+    n_jobs = multiprocessing.cpu_count()
+    with multiprocessing.Pool(processes=n_jobs) as pool:
+        for count, (i, row_results) in enumerate(pool.imap_unordered(_process_row_task, tasks), start=1):
+            print(f"Progress: {count}/{total_tasks} tasks completed")
+            for col, val in row_results.items():
+                result.at[i, col] = val
+
+    # ---------------------------------------------------------------------
+    # 6. Optional save to disk
     # ---------------------------------------------------------------------
     if save_result:
         os.makedirs(save_folder, exist_ok=True)
@@ -375,7 +456,6 @@ def correlate_firing_latent(
         print(f"Correlation results saved to {out_path}")
 
     return result
-
 
 
 def get_mask_trial_type(var: str) -> str:
