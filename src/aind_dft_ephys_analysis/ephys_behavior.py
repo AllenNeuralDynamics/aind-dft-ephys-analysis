@@ -421,16 +421,14 @@ def _multi_row_task(
             mask_valid[invalid_vec] = False
 
         # (b) trials where this variable is NaN
-        mask_valid &= ~pd.isna(beh_dict[v])
+        #mask_valid &= ~pd.isna(beh_dict[v])
 
     if not mask_valid.any():                       # nothing survives
         return row_idx, model_name, None
 
     # Apply mask to firing rates and each behaviour array
     rates_clean = rates[mask_valid]
-    beh_dict_clean = {
-        v: np.asarray(beh_dict[v])[mask_valid] for v in variables
-    }
+
 
     # ──────────────────────────────────────────────────────────────────
     # 3) FIT THE REQUESTED MODEL
@@ -438,9 +436,8 @@ def _multi_row_task(
     try:
         model_fn = getattr(methods, model_name)    # dynamic lookup
         res = model_fn(
-            rates_clean,
-            beh_dict_clean,
-            behavior_names=list(beh_dict_clean.keys()),
+            fr_ts=rates_clean,
+            behavior_ts=beh_dict,
             **model_kwargs
         )
         return row_idx, model_name, res            # ← success
@@ -486,8 +483,10 @@ def correlate_firing_latent_multiple_variable(
             "ARMA_model"
             ["ARMA_model", "ARDL_model"]
     model_kwargs
-        Optional dict mapping *model_name → extra kwargs*  
-        (missing keys default to empty dict).
+        model_kwargs={
+            "ARMA_model": {"ar_order": 2, "ma_order": 1},
+            "ARDL_model": {"y_lags": 3, "x_order": 2}
+        }
     n_jobs
         Worker count for ``multiprocessing.Pool``.  
         ``None`` → use ``multiprocessing.cpu_count()``.
@@ -521,17 +520,15 @@ def correlate_firing_latent_multiple_variable(
     # ──────────────────────────────────────────────────────────────────
     # 2) BUILD TASK LIST  – one task PER (row, model) combination
     # ──────────────────────────────────────────────────────────────────
-    tasks: List[Tuple] = []
-    for idx, row in result.iterrows():
-        for m in models:
-            tasks.append((
-                idx,
-                row.to_dict(),
-                beh_summary,
-                variables,
-                m,
-                model_kwargs.get(m, {})
-            ))
+    tasks: List[Tuple] = [
+        (
+            idx, row.to_dict(), beh_summary,
+            variables, m, model_kwargs[m]
+        )
+        for idx, row in result.iterrows()
+        for m in models
+    ]
+
 
     # ──────────────────────────────────────────────────────────────────
     # 3) RUN MULTIPROCESSING POOL
