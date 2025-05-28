@@ -426,54 +426,72 @@ def _multi_row_task(
     # ──────────────────────────────────────────────────────────────────
     try:
         model_fn = getattr(methods, model_name)
-        res = model_fn(
-            fr_ts=rates_clean,
-            behavior_ts=beh_dict,
-            **model_kwargs
-        )
-        res_clean = _stats_to_dict(res)
-        res_clean["fit_parameters"] = dict(model_kwargs)
+        if model_name == "simple_LR":
+            res = model_fn(
+                        fr_ts=rates_clean,
+                        behavior_ts=beh_dict,
+                    )
+            res_clean = _stats_to_dict(res)
+        else:
+            res = model_fn(
+                fr_ts=rates_clean,
+                behavior_ts=beh_dict,
+                **model_kwargs
+            )
+            res_clean = _stats_to_dict(res)
+            res_clean["fit_parameters"] = dict(model_kwargs)
+            
         res_clean["fit_variables"] = variables
         return row_idx, model_name, group_idx, res_clean
     except Exception as e:
         return row_idx, model_name, group_idx, {"ERROR": str(e)}
 
 
-
-
 def _stats_to_dict(res: Any) -> Dict[str, Any]:
-    """Serialize a *statsmodels* result object to a compact, JSON‑safe dict.
-
-    The helper is purposely generic – it tries to pull a wide set of common
-    attributes if they exist and falls back to *NaN* when not. Heavy arrays
-    (e.g. residuals) are omitted to keep file size under control.
     """
-    return {
-        # Information criteria & log‑likelihood
-        "aic":       getattr(res, "aic", np.nan),
-        "bic":       getattr(res, "bic", np.nan),
-        "hqic":      getattr(res, "hqic", np.nan),
-        "llf":       getattr(res, "llf", np.nan),
-        # Model / sample size
-        "nobs":      getattr(res, "nobs", np.nan),
-        "df_model":  getattr(res, "df_model", np.nan),
-        "df_resid":  getattr(res, "df_resid", np.nan),
-        "sigma2":    getattr(res, "sigma2", np.nan),
-        # Goodness‑of‑fit (if available, e.g. ARDL)
-        "rsq":       getattr(res, "rsquared", np.nan),
-        "rsq_adj":   getattr(res, "rsquared_adj", np.nan),
+    Convert a *statsmodels* results object – OLS, ARIMA/ARMA, ARDL, etc. –
+    into a compact JSON-serialisable dict.
+
+    • All attributes are queried with *getattr* and default to NaN if missing,
+      so the same helper works for every model class.
+    • For OLS / simple_LR, fields such as ``rsq``, ``rsq_adj``, ``f_stat``,
+      and ``f_pvalue`` will be populated, while ARMA/ARDL keep their AIC/BIC.
+    • Heavy arrays (residuals, fittedvalues, …) are intentionally omitted.
+    """
+    out = {
+        # Model diagnostics / information criteria
+        "aic":       getattr(res, "aic",       np.nan),
+        "bic":       getattr(res, "bic",       np.nan),
+        "hqic":      getattr(res, "hqic",      np.nan),
+        "llf":       getattr(res, "llf",       np.nan),
+
+        # Sample size & variance
+        "nobs":      getattr(res, "nobs",      np.nan),
+        "df_model":  getattr(res, "df_model",  np.nan),
+        "df_resid":  getattr(res, "df_resid",  np.nan),
+        "sigma2":    getattr(res, "sigma2",    np.nan),   # OLS only
+
+        # Goodness-of-fit (OLS / simple_LR)
+        "rsq":       getattr(res, "rsquared",       np.nan),
+        "rsq_adj":   getattr(res, "rsquared_adj",   np.nan),
+        "f_stat":    getattr(res, "fvalue",         np.nan),
+        "f_pvalue":  getattr(res, "f_pvalue",       np.nan),
+
         # Coefficients & inference
-        "params":    getattr(res, "params", pd.Series(dtype=float)).to_dict(),
-        "bse":       getattr(res, "bse", pd.Series(dtype=float)).to_dict(),
-        "tvalues":   getattr(res, "tvalues", pd.Series(dtype=float)).to_dict(),
-        "pvalues":   getattr(res, "pvalues", pd.Series(dtype=float)).to_dict(),
-        # Confidence intervals if present (DataFrame → nested dict)
+        "params":    getattr(res, "params",   pd.Series(dtype=float)).to_dict(),
+        "bse":       getattr(res, "bse",      pd.Series(dtype=float)).to_dict(),
+        "tvalues":   getattr(res, "tvalues",  pd.Series(dtype=float)).to_dict(),
+        "pvalues":   getattr(res, "pvalues",  pd.Series(dtype=float)).to_dict(),
+
+        # Confidence intervals (if available → DataFrame → nested dict)
         "conf_int": (
             getattr(res, "conf_int", lambda: None)()
             .to_dict(orient="index")
             if callable(getattr(res, "conf_int", None)) else {}
         ),
     }
+
+    return out
 
 
 def _df_to_xarray(df: pd.DataFrame) -> xr.Dataset:
@@ -527,8 +545,12 @@ def correlate_firing_latent_multiple_variable(
           “<model>-MULTI” column.
     correlation_model
         One model name **or** a list/tuple, e.g.
-            "ARMA_model"
-            ["ARMA_model", "ARDL_model"]
+            "ARDL_model"
+            ["ARMA_model", "ARDL_model", "simple_LR"]
+        Supported models:
+            - "ARMA_model"
+            - "ARDL_model"
+            - "simple_LR"
     model_kwargs
         model_kwargs={
             "ARMA_model": {"ar_order": 2, "ma_order": 1},
