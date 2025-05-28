@@ -466,6 +466,7 @@ def correlate_firing_latent_multiple_variable(
     save_folder: str = "/root/capsule/results",
     save_name: str = "correlations_multi.csv",
     save_result: bool = False,
+    exclude_columns: Optional[List[str]] = ['rates'],
 ) -> pd.DataFrame:
     """
     Fit **one multivariate model per (session, unit)** for **each** requested
@@ -503,7 +504,10 @@ def correlate_firing_latent_multiple_variable(
         ``None`` → use ``multiprocessing.cpu_count()``.
     save_folder / save_name / save_result
         If *save_result* is True, write the augmented DataFrame to disk.
-
+    exclude_columns
+        Optional list of columns to discard from the *result* DataFrame –
+        useful to avoid serialising large arrays such as raw firing rate
+        time‑series.
     Returns
     -------
     pd.DataFrame
@@ -518,7 +522,7 @@ def correlate_firing_latent_multiple_variable(
         raise ValueError(f"Unknown model helper(s) in `methods`: {unknown}")
 
     model_kwargs = model_kwargs or {}
-
+    exclude_columns = exclude_columns or []
     # ──────────────────────────────────────────────────────────────────
     # 1) PREP  – behaviour table (indexed) and output DataFrame
     # ──────────────────────────────────────────────────────────────────
@@ -557,8 +561,17 @@ def correlate_firing_latent_multiple_variable(
                 print(f"[multi-var] progress: {done}/{total_tasks} fits completed")
             result.at[row_idx, f"{model_name}-MULTI"] = res_obj
 
+    # ------------------------------------------------------------------
+    # 4) DROP HEAVY COLUMNS *AFTER* FITTING + SAVE / RETURN
+    # ------------------------------------------------------------------
+    result_out = (
+        result
+        .drop(columns=[c for c in exclude_columns if c in result.columns], errors="ignore")
+        .copy()
+    )
+
     # ──────────────────────────────────────────────────────────────────
-    # 4) OPTIONAL SAVE-TO-DISK
+    # 5) OPTIONAL SAVE-TO-DISK
     # ──────────────────────────────────────────────────────────────────
     if save_result:
         os.makedirs(save_folder, exist_ok=True)
