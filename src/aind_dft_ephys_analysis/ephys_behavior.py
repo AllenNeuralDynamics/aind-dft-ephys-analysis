@@ -426,21 +426,13 @@ def _multi_row_task(
     # ──────────────────────────────────────────────────────────────────
     try:
         model_fn = getattr(methods, model_name)
-        if model_name == "simple_LR":
-            res = model_fn(
-                        fr_ts=rates_clean,
-                        behavior_ts=beh_dict,
-                    )
-            res_clean = _stats_to_dict(res)
-        else:
-            res = model_fn(
-                fr_ts=rates_clean,
-                behavior_ts=beh_dict,
-                **model_kwargs
-            )
-            res_clean = _stats_to_dict(res)
-            res_clean["fit_parameters"] = dict(model_kwargs)
-
+        res = model_fn(
+            fr_ts=rates_clean,
+            behavior_ts=beh_dict,
+            **model_kwargs
+        )
+        res_clean = _stats_to_dict(res)
+        res_clean["fit_parameters"] = dict(model_kwargs)
         res_clean["fit_variables"] = variables
         return row_idx, model_name, group_idx, res_clean
     except Exception as e:
@@ -511,8 +503,12 @@ def correlate_firing_latent_multiple_variable(
     df_firing: pd.DataFrame,
     df_behavior: pd.DataFrame,
     variables: Union[List[str], List[List[str]]],
-    correlation_model: Union[str, List[str], Tuple[str, ...]] = "ARDL_model",
-    model_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+    correlation_model: Union[str, List[str], Tuple[str, ...]] = ["ARDL_model","simple_LR"],
+    model_kwargs: Optional[Dict[str, Dict[str, Any]]] = {
+            "simple_LR":          {"add_constant": True},
+            "ARMA_model":         {"ar_order": 3, "ma_order": 0},
+            "ARDL_model":         {"y_lags": 3, "x_order": 0},
+        },
     n_jobs: Optional[int] = None,
     save_folder: str = "/root/capsule/results",
     save_name: str = "correlations_multi",
