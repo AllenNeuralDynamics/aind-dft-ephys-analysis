@@ -500,7 +500,10 @@ def correlate_firing_latent_multiple_variable(
     df_behavior: pd.DataFrame,
     variables: List[str],
     correlation_model: Union[str, List[str], Tuple[str, ...]] = "ARDL_model",
-    model_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+    model_kwargs: Optional[Dict[str, Dict[str, Any]]] = {
+                "ARMA_model": {"ar_order": 2, "ma_order": 1},
+                "ARDL_model": {"y_lags": 3, "x_order": 0}
+            },
     n_jobs: Optional[int] = None,
     save_folder: str = "/root/capsule/results",
     save_name: str = "correlations_multi",
