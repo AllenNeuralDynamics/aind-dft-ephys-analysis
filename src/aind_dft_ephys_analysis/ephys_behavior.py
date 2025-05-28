@@ -440,7 +440,18 @@ def _multi_row_task(
             behavior_ts=beh_dict,
             **model_kwargs
         )
-        return row_idx, model_name, res            # ← success
+
+        res_clean = {
+            'aic':     getattr(res, 'aic', np.nan),
+            'bic':     getattr(res, 'bic', np.nan),
+            'llf':     getattr(res, 'llf', np.nan),
+            'params':  res.params.to_dict(),
+            'tvalues': res.tvalues.to_dict(),
+            'bse': res.bse.to_dict(),
+            'pvalues': res.pvalues.to_dict(),
+        }
+
+        return row_idx, model_name, res_clean            # ← success
     except Exception as e:
         return row_idx, model_name, {"ERROR": str(e)}  # ← failure
 
@@ -556,8 +567,6 @@ def correlate_firing_latent_multiple_variable(
         print(f"[multi-var] results saved to {out_path}")
 
     return result
-
-
 
 
 def correlate_firing_latent(
