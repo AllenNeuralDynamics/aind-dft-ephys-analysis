@@ -432,6 +432,8 @@ def _multi_row_task(
             **model_kwargs
         )
         res_clean = _stats_to_dict(res)
+        res_clean["fit_parameters"] = dict(model_kwargs)
+        res_clean["fit_variables"] = variables
         return row_idx, model_name, group_idx, res_clean
     except Exception as e:
         return row_idx, model_name, group_idx, {"ERROR": str(e)}
