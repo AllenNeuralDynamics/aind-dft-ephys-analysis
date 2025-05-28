@@ -359,6 +359,210 @@ def _process_row_task(
     return row_idx, results
 
 
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ 1. WORKER – fit ONE model on ONE (session, unit) firing-rate row        ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+def _multi_row_task(
+    task: Tuple[
+        int,                    # 0. row_idx  – index of this row in df_firing
+        Dict[str, Any],         # 1. firing_row – row.to_dict(); incl. session_id, rates …
+        pd.DataFrame,           # 2. beh_summary – behaviour table, indexed by session_id
+        List[str],              # 3. variables – behaviour columns to include
+        str,                    # 4. model_name – "ARMA_model", "ARDL_model", …
+        Dict[str, Any]          # 5. model_kwargs – extra kwargs forwarded to that model
+    ]
+) -> Tuple[int, str, object]:
+    """
+    Pool-worker helper.  Returns a triple:
+
+        (row_idx, model_name, result_object)
+
+    • *result_object*  –
+        statsmodels results instance   … on success  
+        None                           … if this row is skipped  
+        {'ERROR': <msg>}               … if the fit raised an Exception
+    """
+    # ──────────────────────────────────────────────────────────────────
+    # 0) UNPACK  – give expressive names to tuple elements
+    # ──────────────────────────────────────────────────────────────────
+    (row_idx, firing_row, beh_summary,
+     variables, model_name, model_kwargs) = task
+
+    session_id: str      = firing_row["session_id"]
+    rates: np.ndarray    = np.asarray(firing_row["rates"], dtype=float)
+    n_trials: int        = len(rates)
+
+    # ──────────────────────────────────────────────────────────────────
+    # 1) QUICK EXITS  – no behaviour data, or all NaN
+    # ──────────────────────────────────────────────────────────────────
+    if session_id not in beh_summary.index:
+        return row_idx, model_name, None
+
+    beh_row = beh_summary.loc[session_id, variables]
+
+    if beh_row.isna().all():                       # every variable missing
+        return row_idx, model_name, None
+
+    # ──────────────────────────────────────────────────────────────────
+    # 2) BUILD BEHAVIOUR DICT  +  GLOBAL VALID-TRIAL MASK
+    #    • mask_valid starts as all True and is AND-ed down.
+    #    • For each variable v:
+    #        (a) invalidate trials flagged by get_mask_trial_type(v)
+    #        (b) invalidate trials where v itself is NaN
+    # ──────────────────────────────────────────────────────────────────
+    beh_dict   = {v: beh_row[v] for v in variables}
+    mask_valid = np.ones(n_trials, dtype=bool)     # start: keep everything
+
+    for v in variables:
+        # (a) variable-specific invalid-trial vector
+        mask_col = get_mask_trial_type(v)
+        if mask_col in beh_summary.columns:
+            invalid_vec = beh_summary.at[session_id, mask_col]
+            mask_valid[invalid_vec] = False
+
+        # (b) trials where this variable is NaN
+        mask_valid &= ~pd.isna(beh_dict[v])
+
+    if not mask_valid.any():                       # nothing survives
+        return row_idx, model_name, None
+
+    # Apply mask to firing rates and each behaviour array
+    rates_clean = rates[mask_valid]
+    beh_dict_clean = {
+        v: np.asarray(beh_dict[v])[mask_valid] for v in variables
+    }
+
+    # ──────────────────────────────────────────────────────────────────
+    # 3) FIT THE REQUESTED MODEL
+    # ──────────────────────────────────────────────────────────────────
+    try:
+        model_fn = getattr(methods, model_name)    # dynamic lookup
+        res = model_fn(
+            rates_clean,
+            beh_dict_clean,
+            behavior_names=list(beh_dict_clean.keys()),
+            **model_kwargs
+        )
+        return row_idx, model_name, res            # ← success
+    except Exception as e:
+        return row_idx, model_name, {"ERROR": str(e)}  # ← failure
+
+
+def correlate_firing_latent_multiple_variable(
+    df_firing: pd.DataFrame,
+    df_behavior: pd.DataFrame,
+    variables: List[str],
+    correlation_model: Union[str, List[str], Tuple[str, ...]] = "ARMA_model",
+    model_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+    n_jobs: Optional[int] = None,
+    save_folder: str = "/root/capsule/results",
+    save_name: str = "correlations_multi.csv",
+    save_result: bool = False,
+) -> pd.DataFrame:
+    """
+    Fit **one multivariate model per (session, unit)** for **each** requested
+    model family, in parallel.
+
+    ▶ Trial exclusion is done *per variable* using  
+      ``mask_col = get_mask_trial_type(variable)``.
+
+    ▷ Adds one new column per model:
+
+        f"{model}-MULTI"
+
+      whose cells hold the full statsmodels results object (or an error dict).
+
+    Parameters
+    ----------
+    df_firing
+        Table from ``get_the_mean_firing_rate_combined`` – must include
+        'session_id' and list-like 'rates'.
+    df_behavior
+        Behaviour summary table – must include 'session_id' and *variables*.
+    variables
+        Behaviour columns that will be used *jointly* in each regression.
+    correlation_model
+        One model name **or** a list/tuple, e.g.
+            "ARMA_model"
+            ["ARMA_model", "ARDL_model"]
+    model_kwargs
+        Optional dict mapping *model_name → extra kwargs*  
+        (missing keys default to empty dict).
+    n_jobs
+        Worker count for ``multiprocessing.Pool``.  
+        ``None`` → use ``multiprocessing.cpu_count()``.
+    save_folder / save_name / save_result
+        If *save_result* is True, write the augmented DataFrame to disk.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of *df_firing* with one additional column per model.
+    """
+    # ──────────────────────────────────────────────────────────────────
+    # 0) NORMALISE + VALIDATE MODEL LIST
+    # ──────────────────────────────────────────────────────────────────
+    models = [correlation_model] if isinstance(correlation_model, str) else list(correlation_model)
+    unknown = [m for m in models if not hasattr(methods, m)]
+    if unknown:
+        raise ValueError(f"Unknown model helper(s) in `methods`: {unknown}")
+
+    model_kwargs = model_kwargs or {}
+
+    # ──────────────────────────────────────────────────────────────────
+    # 1) PREP  – behaviour table (indexed) and output DataFrame
+    # ──────────────────────────────────────────────────────────────────
+    beh_summary = df_behavior.set_index("session_id")
+    result      = df_firing.copy().reset_index(drop=True)
+
+    for m in models:
+        result[f"{m}-MULTI"] = None               # placeholder column
+
+    # ──────────────────────────────────────────────────────────────────
+    # 2) BUILD TASK LIST  – one task PER (row, model) combination
+    # ──────────────────────────────────────────────────────────────────
+    tasks: List[Tuple] = []
+    for idx, row in result.iterrows():
+        for m in models:
+            tasks.append((
+                idx,
+                row.to_dict(),
+                beh_summary,
+                variables,
+                m,
+                model_kwargs.get(m, {})
+            ))
+
+    # ──────────────────────────────────────────────────────────────────
+    # 3) RUN MULTIPROCESSING POOL
+    # ──────────────────────────────────────────────────────────────────
+    if n_jobs is None:
+        n_jobs = multiprocessing.cpu_count()
+
+    total_tasks = len(tasks)
+    with multiprocessing.Pool(processes=n_jobs) as pool:
+        for done, (row_idx, model_name, res_obj) in enumerate(
+            pool.imap_unordered(_multi_row_task, tasks), start=1
+        ):
+            # progress banner every 100 fits (or at the very end)
+            if done % 100 == 0 or done == total_tasks:
+                print(f"[multi-var] progress: {done}/{total_tasks} fits completed")
+            result.at[row_idx, f"{model_name}-MULTI"] = res_obj
+
+    # ──────────────────────────────────────────────────────────────────
+    # 4) OPTIONAL SAVE-TO-DISK
+    # ──────────────────────────────────────────────────────────────────
+    if save_result:
+        os.makedirs(save_folder, exist_ok=True)
+        out_path = os.path.join(save_folder, save_name)
+        result.to_csv(out_path, index=False)
+        print(f"[multi-var] results saved to {out_path}")
+
+    return result
+
+
+
+
 def correlate_firing_latent(
     df_firing: pd.DataFrame,
     df_behavior: pd.DataFrame,
