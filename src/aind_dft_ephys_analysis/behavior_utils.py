@@ -407,8 +407,8 @@ def extract_fitted_data(
           - 'QR'                       → Q for option 1 (all trials)
           - 'chosen_q'                 → Q of the chosen option on valid trials
           - 'unchosen_q'               → Q of the unchosen option on valid trials
-        Required if `fitted_latent` is None, **and** always needed to choose the output.
-
+          - 'reward_no_reward'         → Returns 1 for rewarded trials, 0 for unrewarded trials
+ 
     Returns
     -------
     np.ndarray or None
@@ -506,6 +506,16 @@ def extract_fitted_data(
 
         return np.where(resp == 0, q1, q0)
 
+    if latent_name == 'reward_no_reward':
+        trials = nwb_behavior_data.trials
+        rewardedL = trials['rewarded_historyL'][:]
+        rewardedR = trials['rewarded_historyR'][:]
+        responses = trials['animal_response'][:]
+
+        valid = responses != 2
+        rewarded = (rewardedL | rewardedR).astype(int)[valid]   # 1 = rewarded, 0 = no reward
+        return rewarded
+
     # Unsupported latent_name
     return None
 
@@ -602,6 +612,7 @@ def generate_behavior_summary(
             'unchosen_q',
             'QL',
             'QR',
+            'reward_no_reward',
         ]
 
     if trial_types is None:
