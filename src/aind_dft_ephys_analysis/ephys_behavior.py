@@ -568,11 +568,11 @@ def correlate_firing_latent_multiple_variable(
     pd.DataFrame
         Copy of *df_firing* with one additional column per model.
         ───────────────────────────────────────────────────────────────────────────────
-        STRUCTURE OF  result["multi_model_results"]  PER ROW
+        STRUCTURE OF  result["correlation_results"]  PER ROW
         ───────────────────────────────────────────────────────────────────────────────
         Level-0  (row) … one entry per (session × unit × time_window × z_score)
 
-            "multi_model_results" : dict
+            "correlation_results" : dict
                 ├── key = <model_name>  (e.g. "simple_LR", "ARDL_model", "ARMA_model")
                 │
                 │   value = list[dict | None]         (length == n_var_groups)
@@ -620,7 +620,7 @@ def correlate_firing_latent_multiple_variable(
 
         Quick access patterns
         ─────────────────────
-        row_dict        = df.loc[i, "multi_model_results"]
+        row_dict        = df.loc[i, "correlation_results"]
 
         # 1) All results for one model
         ardl_fits       = row_dict["ARDL_model"]          # list over variable-groups
@@ -665,7 +665,7 @@ def correlate_firing_latent_multiple_variable(
     result      = df_firing.copy().reset_index(drop=True)
 
     # Pre-allocate list-typed columns (one list per row that we will append to)
-    result["multi_model_results"] = [{} for _ in range(len(result))]
+    result["correlation_results"] = [{} for _ in range(len(result))]
 
     # ──────────────────────────────────────────────────────────────────
     # 2) BUILD TASK LIST  – one task PER (row, model, var_group)
@@ -689,7 +689,7 @@ def correlate_firing_latent_multiple_variable(
         for done, (row_idx, model_name, g_idx, res_obj) in enumerate(
             pool.imap_unordered(_multi_row_task, tasks), start=1
         ):
-            store: Dict[str, list] = result.at[row_idx, "multi_model_results"]
+            store: Dict[str, list] = result.at[row_idx, "correlation_results"]
 
             # initialise dict entry only once, with correct list length
             if model_name not in store:
