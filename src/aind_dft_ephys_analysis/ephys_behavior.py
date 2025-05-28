@@ -440,7 +440,7 @@ def _multi_row_task(
             )
             res_clean = _stats_to_dict(res)
             res_clean["fit_parameters"] = dict(model_kwargs)
-            
+
         res_clean["fit_variables"] = variables
         return row_idx, model_name, group_idx, res_clean
     except Exception as e:
@@ -571,6 +571,76 @@ def correlate_firing_latent_multiple_variable(
     -------
     pd.DataFrame
         Copy of *df_firing* with one additional column per model.
+        ───────────────────────────────────────────────────────────────────────────────
+        STRUCTURE OF  result["multi_model_results"]  PER ROW
+        ───────────────────────────────────────────────────────────────────────────────
+        Level-0  (row) … one entry per (session × unit × time_window × z_score)
+
+            "multi_model_results" : dict
+                ├── key = <model_name>  (e.g. "simple_LR", "ARDL_model", "ARMA_model")
+                │
+                │   value = list[dict | None]         (length == n_var_groups)
+                │             ▲
+                │             │   • index 0 → results for variable-group 0
+                │             │   • index 1 → results for variable-group 1
+                │             │   • …
+                │             │   • entry is *None* if the fit failed or was skipped
+                │
+                │
+                └─┬─────────────────────────────────────────────────────────────────
+                │  Each non-None element is the **serialised statsmodels result**:
+                │
+                │    {
+                │       "aic":       …        # ARMA / ARDL only
+                │       "bic":       …
+                │       "llf":       …
+                │       "sigma2":    …        # OLS / simple_LR only
+                │
+                │       "rsq":       …        # OLS
+                │       "rsq_adj":   …
+                │       "f_stat":    …
+                │       "f_pvalue":  …
+                │
+                │       "params":    {β0, β1, …}          # coefficients
+                │       "pvalues":   {β0, β1, …}
+                │       "tvalues":   {β0, β1, …}
+                │       "bse":       {β0, β1, …}
+                │       "conf_int":  {β0: [low, high], …}
+                │
+                │       "fit_parameters": {                # ← kwargs actually used
+                │           "y_lags": 3,
+                │           "x_order": 2,
+                │           …                               # empty for simple_LR
+                │       },
+                │
+                │       "fit_variables": [
+                │           "QLearning_L2F1_CK1_softmax-q_value_difference",
+                │           "QLearning_L2F1_CK1_softmax-total_value",
+                │           …
+                │       ]
+                │    }
+                │
+                └─────────────────────────────────────────────────────────────────
+
+        Quick access patterns
+        ─────────────────────
+        row_dict        = df.loc[i, "multi_model_results"]
+
+        # 1) All results for one model
+        ardl_fits       = row_dict["ARDL_model"]          # list over variable-groups
+
+        # 2) Result for model M & variable-group g
+        fit_g0          = row_dict["ARDL_model"][0]
+
+        # 3) Coefficient of “RPE” in that fit (if present)
+        beta_rpe        = fit_g0["params"].get("RPE", np.nan)
+
+        # 4) p-value of that coefficient
+        p_rpe           = fit_g0["pvalues"].get("RPE", np.nan)
+
+        # 5) AIC of the whole model (ARDL / ARMA)
+        aic_value       = fit_g0["aic"]
+
     """
     # ──────────────────────────────────────────────────────────────────
     # 0) NORMALISE  – model list  &  variable-group list
@@ -599,8 +669,7 @@ def correlate_firing_latent_multiple_variable(
     result      = df_firing.copy().reset_index(drop=True)
 
     # Pre-allocate list-typed columns (one list per row that we will append to)
-    for m in models:
-        result[f"{m}-MULTI"] = [[] for _ in range(len(result))]
+    result["multi_model_results"] = [{} for _ in range(len(result))]
 
     # ──────────────────────────────────────────────────────────────────
     # 2) BUILD TASK LIST  – one task PER (row, model, var_group)
@@ -624,8 +693,12 @@ def correlate_firing_latent_multiple_variable(
         for done, (row_idx, model_name, g_idx, res_obj) in enumerate(
             pool.imap_unordered(_multi_row_task, tasks), start=1
         ):
-            # Append result in the correct order
-            result.at[row_idx, f"{model_name}-MULTI"].append(res_obj)
+            store: Dict[str, list] = result.at[row_idx, "multi_model_results"]
+
+            # initialise dict entry only once, with correct list length
+            if model_name not in store:
+                store[model_name] = [None] * len(var_groups)
+            store[model_name][g_idx] = res_obj
 
             if done % 100 == 0 or done == total:
                 print(f"[multi-var] progress: {done}/{total} fits completed")
