@@ -1,7 +1,12 @@
+from __future__ import annotations
 import os, re
+import json
+import itertools
 from itertools import product
-from typing import List, Optional, Tuple, Union, Any, Dict
-
+from typing import List, Optional, Tuple, Union, Any, Dict, Sequence
+import math
+from pathlib import Path
+import xarray as xr
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -470,3 +475,239 @@ def plot_fraction_significant_lines_by_session(
         plt.tight_layout()
         plt.show()
 
+
+
+def _load_summary(source: Union[str, Path, pd.DataFrame, xr.Dataset]) -> pd.DataFrame:
+    """Return the summary as a *pandas.DataFrame* with JSON cells decoded."""
+
+    if isinstance(source, pd.DataFrame):
+        df = source.copy()
+    elif isinstance(source, xr.Dataset):
+        df = source.to_dataframe()
+    else:  # assume path → use the project's loader that understands CSV & Zarr
+        from general_utils import load_temporary_data  # local import avoids hard dep
+        df = load_temporary_data(source)
+
+    # Decode JSON columns that xarray stored as strings
+    for col in df.columns:
+        if df[col].dtype == object and df[col].apply(lambda x: isinstance(x, str) and x[:1] in "[{_").any():
+            try:
+                df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) else x)
+            except Exception:
+                pass
+    return df
+
+
+def scatter_summary_multi(
+    combined_zarr: Union[str, Path, xr.Dataset, pd.DataFrame],
+    compare_variables: Union[str, Sequence[str], Sequence[Sequence[str]]],
+    *,
+    time_window: Union[str, Sequence[str], None] = None,
+    z_score: Union[bool, Sequence[bool], None] = None,
+    figsize: Tuple[int, int] | None = None,
+    dpi: int = 120,
+    alpha: float = 0.7,
+    s: float = 2.0,
+    kw_refline: Dict[str, Any] | None = None,
+) -> None:
+    """Draw **scatter plots** for every pair in *compare_variables*.
+
+    A single figure is created for each unique `(time_window, z_score)`
+    combination (after optional filters). **All units** belonging to that
+    facet are plotted together.
+
+    Parameters
+    ----------
+    combined_zarr
+        • Path to `.zarr` or `.csv` (auto‑detected)
+        • *xarray.Dataset* (already opened)
+        • *pandas.DataFrame* (already in memory)
+    compare_variables
+        Column names you wish to correlate. Accepted forms:
+
+        • "col_A"                     → no scatter (single column)
+        • ["col_A", "col_B", ...]     → all pairwise combinations
+        • [["col_A", "col_B"], [...]] → each *inner* list forms its own pair‑pool.
+    time_window, z_score
+        Optional filters. *None* ⇒ include **all** values present.
+    figsize, dpi
+        Figure size / resolution. If *None* a square grid is chosen based on
+        the number of pairs.
+    alpha, s
+        Transparency and size for scatter points.
+    kw_refline
+        Extra kwargs for the y = x reference line. Default is grey dashed.
+    """
+
+    df = _load_summary(combined_zarr)
+
+    # Normalise compare_variables → List[List[str]]
+    if isinstance(compare_variables, str):
+        groups: List[List[str]] = [[compare_variables]]
+    elif compare_variables and isinstance(compare_variables[0], str):
+        groups = [list(compare_variables)]
+    else:
+        groups = [list(g) for g in compare_variables]
+
+    missing = [c for g in groups for c in g if c not in df.columns]
+    if missing:
+        raise KeyError(f"Column(s) not found in DataFrame: {missing}")
+
+    # Optional facet filters
+    def _to_set(v):
+        if v is None:
+            return None
+        return {v} if not isinstance(v, (list, tuple, set)) else set(v)
+
+    tw_filter = _to_set(time_window)
+    z_filter  = _to_set(z_score)
+
+    tw_values = sorted(df["time_window"].unique()) if tw_filter is None else sorted(tw_filter)
+    z_values  = sorted(df["z_score"].unique())    if z_filter is None else sorted(z_filter)
+
+    kw_refline = kw_refline or {"lw": 1, "color": "gray", "ls": "--"}
+
+    print(f"[scatter] Facets: {len(tw_values)} time_window × {len(z_values)} z_score → {len(tw_values)*len(z_values)} figures")
+
+    # Iterate over facets
+    for tw, zs in itertools.product(tw_values, z_values):
+        subset = df[(df["time_window"] == tw) & (df["z_score"] == zs)]
+        if subset.empty:
+            continue
+
+        for g_idx, g_cols in enumerate(groups):
+            pairs = list(itertools.combinations(g_cols, 2))
+            if not pairs:
+                continue
+
+            n_pairs = len(pairs)
+            n_cols  = math.ceil(math.sqrt(n_pairs))
+            n_rows  = math.ceil(n_pairs / n_cols)
+            fig_w, fig_h = figsize or (4 * n_cols, 4 * n_rows)
+
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h), dpi=dpi)
+            axes = np.ravel(axes)
+
+            for ax, (x_col, y_col) in zip(axes, pairs):
+                x = subset[x_col].astype(float).values
+                y = subset[y_col].astype(float).values
+                valid = ~(np.isnan(x) | np.isnan(y))
+                if not valid.any():
+                    ax.set_visible(False)
+                    continue
+                ax.scatter(x[valid], y[valid], alpha=alpha, s=s)
+                lim_lo = np.nanmin(np.concatenate([x[valid], y[valid]]))
+                lim_hi = np.nanmax(np.concatenate([x[valid], y[valid]]))
+                ax.plot([lim_lo, lim_hi], [lim_lo, lim_hi], **kw_refline)
+                # ─ Ensure identical limits on both axes ─
+                ax.set_xlim(lim_lo, lim_hi)
+                ax.set_ylim(lim_lo, lim_hi)
+                ax.set_aspect('equal', adjustable='box')
+                ax.set_xlabel(x_col, fontsize=8)
+                ax.set_ylabel(y_col, fontsize=8)
+
+            for ax in axes[n_pairs:]:
+                ax.set_visible(False)
+
+            fig.suptitle(
+                f"time_window={tw}   •   z_score={zs}   •   group {g_idx+1}   (units = {len(subset)})",
+                fontsize=11
+            )
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            plt.show()
+
+
+def fraction_significant_multi(
+    combined_zarr: Union[str, Path, xr.Dataset, pd.DataFrame],
+    compare_variables: Sequence[str],
+    *,
+    time_window: Union[str, Sequence[str], None] = None,
+    z_score: Union[bool, Sequence[bool], None] = None,
+    alpha_level: float = 0.05,
+    figsize: Tuple[int, int] | None = None,
+    dpi: int = 120,
+    session_lw: float = 1.0,
+    session_alpha: float = 0.3,
+    session_color: str = "C0",
+    avg_color: str = "C1",
+    avg_lw: float = 3.0,
+) -> None:
+    """Plot per‑session **fraction of significant units** across variables.
+
+    One figure is produced for each `(time_window, z_score)` combination. Each
+    line corresponds to a session; the thick line is the across‑session mean.
+
+    Parameters
+    ----------
+    compare_variables
+        List of column names that **must end with `_pval`**. Fractions are
+        computed as  (# units with p <= alpha_level) / (total units)  for each
+        session and variable.
+    """
+
+    if not compare_variables:
+        raise ValueError("`compare_variables` must contain at least one column name")
+
+    if any(not v.endswith("_pval") for v in compare_variables):
+        raise ValueError("All compare_variables must have the suffix '_pval'")
+
+    df = _load_summary(combined_zarr)
+
+    missing = [v for v in compare_variables if v not in df.columns]
+    if missing:
+        raise KeyError(f"Column(s) not in DataFrame: {missing}")
+
+    # Optional facet filters
+    def _to_set(v):
+        if v is None:
+            return None
+        return {v} if not isinstance(v, (list, tuple, set)) else set(v)
+
+    tw_filter = _to_set(time_window)
+    z_filter = _to_set(z_score)
+
+    tw_values = sorted(df["time_window"].unique()) if tw_filter is None else sorted(tw_filter)
+    z_values = sorted(df["z_score"].unique()) if z_filter is None else sorted(z_filter)
+
+    x = np.arange(len(compare_variables))
+
+    for tw, zs in itertools.product(tw_values, z_values):
+        subset = df[(df["time_window"] == tw) & (df["z_score"] == zs)]
+        if subset.empty:
+            continue
+
+        sessions = subset["session_id"].unique()
+        if figsize is None:
+            fig_w, fig_h = (6, 4)
+        else:
+            fig_w, fig_h = figsize
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+
+        all_fracs = []
+        for sess in sessions:
+            rows = subset[subset["session_id"] == sess]
+            total_units = len(rows)
+            if total_units == 0:
+                continue
+            fracs = []
+            for col in compare_variables:
+                vals = rows[col].astype(float).values
+                fracs.append(np.sum(vals <= alpha_level) / total_units)
+            all_fracs.append(fracs)
+            ax.plot(x, fracs, lw=session_lw, alpha=session_alpha, color=session_color)
+
+        if all_fracs:
+            mean_frac = np.nanmean(all_fracs, axis=0)
+            ax.plot(x, mean_frac, lw=avg_lw, color=avg_color, label="mean")
+
+        ax.axhline(alpha_level, color="red", ls="--", lw=1)
+        #ax.set_xticks(x, labels=compare_variables, rotation=45, ha="right")
+        ax.set_xticks(x)
+        ax.set_ylim(0, 1)
+        ax.set_ylabel("fraction significant")
+        ax.set_xlabel("variable (_pval)")
+        ax.set_title(f"Fraction significant(time_window={tw}, z_score={zs})")
+        ax.grid(axis="y", linestyle=":", alpha=0.4)
+        ax.legend(loc="upper right")
+        plt.tight_layout()
+        plt.show()
