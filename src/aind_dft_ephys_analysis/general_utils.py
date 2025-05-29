@@ -6,6 +6,8 @@ from datetime import datetime
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional,Any,Union
 import pandas as pd
+import xarray as xr
+
 
 def extract_session_name_core(session_name: str) -> str | None:
     """
@@ -278,3 +280,77 @@ def smart_read_csv(
                 pass
 
     return df
+
+
+def load_temporary_data(
+    path: Union[str, Path],
+    *,
+    decode_json: bool = True,
+) -> pd.DataFrame:
+    """
+    • Accepts both **CSV** and **Zarr** formats.  
+    • Automatically JSON-decodes cells that were string-encoded when saving
+      (``fit_metadata`` **and** any column whose values look like dicts / lists).
+
+    Parameters
+    ----------
+    path : str | pathlib.Path
+        Path to ``*.csv`` **or** ``*.zarr`` directory.
+    decode_json : bool, default **True**
+        When *True*, try to ``json.loads`` every object-dtype column whose first
+        non-null value starts with “{” or “[”.
+        Set to *False* if you prefer to keep those columns as raw strings.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A fully-decoded DataFrame identical to what was in memory before saving.
+
+    Examples
+    --------
+    Read back the table produced by
+    ``significance_and_direction_summary_combined_multi`` **or**
+    ``significance_and_direction_summary_multi``.
+
+    >>> df = load_temporary_data("/root/capsule/results/sig_dir_all_sessions.csv")
+    >>> df.filter(like="_pval").head()
+
+    >>> df = load_temporary_data("/root/capsule/results/sig_dir_all_sessions.zarr")
+    >>> df.loc[0, "fit_metadata"]["ARDL_model_g0"]
+    {'fit_parameters': {'y_lags': 3, 'x_order': 0},
+     'fit_variables': ['RPE', 'total_value']}
+    """
+    path = Path(path).expanduser()
+
+    # ──────────────────────────────────────────────────────────────────
+    # 1)  Dispatch by file extension
+    # ──────────────────────────────────────────────────────────────────
+    if path.suffix.lower() == ".csv":
+        df = pd.read_csv(path)
+
+    elif path.suffix.lower() == ".zarr":
+        # consolidated=False for full compatibility with non-consolidated stores
+        ds = xr.open_zarr(path, consolidated=False)
+        df = ds.to_dataframe()
+
+    else:
+        raise ValueError("`path` must point to a .csv file *or* a .zarr directory")
+
+    # ──────────────────────────────────────────────────────────────────
+    # 2)  Optional JSON decode
+    # ──────────────────────────────────────────────────────────────────
+    if decode_json:
+        for col in df.columns:
+            if df[col].dtype == object:
+                # peek at first non-null value
+                first = df[col].dropna().iloc[0] if not df[col].dropna().empty else ""
+                if isinstance(first, str) and first.strip()[:1] in ("{", "["):
+                    try:
+                        df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) else x)
+                    except Exception:
+                        # leave column untouched if decoding fails
+                        pass
+
+    return df
+
+
