@@ -401,15 +401,16 @@ def _process_row_task(
 # ╚══════════════════════════════════════════════════════════════════════════╝
 def _multi_row_task(
     task: Tuple[
-        int,                    # 0. row_idx  – index of this row in df_firing
-        Dict[str, Any],         # 1. firing_row – row.to_dict(); incl. session_id, rates …
-        pd.DataFrame,           # 2. beh_summary – behaviour table, indexed by session_id
-        List[str],              # 3. variables – behaviour columns to include
-        str,                    # 4. model_name – "ARMA_model", "ARDL_model", …
-        Dict[str, Any],         # 5. model_kwargs – extra kwargs forwarded to that model
-        int                     # 6. group_idx   – sequential index of the var-group
+        int,                    # 0. row index in df_firing
+        Dict[str, Any],         # 1. firing_row.to_dict()
+        pd.DataFrame,           # 2. beh_summary (indexed by session_id)
+        List[str],              # 3. variables (behaviour columns)
+        str,                    # 4. model_name
+        Dict[str, Any],         # 5. model_kwargs
+        int,                    # 6. trial_shift  (can be 0, ±1, ±2, …)
+        int                     # 7. group_idx  (variable-group index)
     ]
-) -> Tuple[int, str, int, object]:
+) -> Tuple[int, str, int, int, object]:
     """
     Pool-worker helper.  Returns a quadruple:
 
@@ -421,56 +422,66 @@ def _multi_row_task(
         {'ERROR': <msg>}               … if the fit raised an Exception
     """
     (row_idx, firing_row, beh_summary,
-     variables, model_name, model_kwargs, group_idx) = task
+     variables, model_name, model_kwargs,
+     shift, group_idx) = task
 
-    session_id: str   = firing_row["session_id"]
-    rates: np.ndarray = np.asarray(firing_row["rates"], dtype=float)
-    n_trials: int     = len(rates)
+    session_id: str     = firing_row["session_id"]
+    rates_all           = np.asarray(firing_row["rates"], dtype=float)
 
-    # ──────────────────────────────────────────────────────────────────
-    # 1) QUICK EXITS  – no behaviour data, or all NaN
-    # ──────────────────────────────────────────────────────────────────
+    # ─────────────  quick exit if behaviour missing  ─────────────
     if session_id not in beh_summary.index:
-        return row_idx, model_name, group_idx, None
+        return row_idx, model_name, group_idx, shift, None
 
     beh_row = beh_summary.loc[session_id, variables]
-
     if beh_row.isna().all():
-        return row_idx, model_name, group_idx, None
+        return row_idx, model_name, group_idx, shift, None
 
-    # ──────────────────────────────────────────────────────────────────
-    # 2) BUILD BEHAVIOUR DICT  +  GLOBAL VALID-TRIAL MASK
-    # ──────────────────────────────────────────────────────────────────
-    beh_dict   = {v: beh_row[v] for v in variables}
-    mask_valid = np.ones(n_trials, dtype=bool)
-
+    # ─────────────  build valid-trial mask (no-response)  ─────────
+    n_trials           = len(rates_all)
+    mask_valid         = np.ones(n_trials, dtype=bool)
     for v in variables:
         mask_col = get_mask_trial_type(v)
         if mask_col in beh_summary.columns:
             mask_valid[beh_summary.at[session_id, mask_col]] = False
-        # mask_valid &= ~pd.isna(beh_dict[v])   # keep if desired
 
     if not mask_valid.any():
-        return row_idx, model_name, group_idx, None
+        return row_idx, model_name, group_idx, shift, None
 
-    rates_clean = rates[mask_valid]
+    rates_valid = rates_all[mask_valid]
 
-    # ──────────────────────────────────────────────────────────────────
-    # 3) FIT THE REQUESTED MODEL
-    # ──────────────────────────────────────────────────────────────────
+    # ─────────────  per-variable shift & trimming  ────────────────
+    beh_vectors = {}
+    rates_trim  = None
+    for v in variables:
+        vec_full   = np.asarray(beh_row[v])
+        fr_trim, bv_trim = _pairwise_apply_shift(rates_valid, vec_full, shift)
+
+        if rates_trim is None:                  # first variable decides length
+            rates_trim = fr_trim
+        else:                                   # keep arrays equal length
+            min_len   = min(len(rates_trim), len(fr_trim))
+            rates_trim = rates_trim[:min_len]
+            bv_trim    = bv_trim[:min_len]
+        beh_vectors[v] = bv_trim
+
+    if rates_trim.size == 0:
+        return row_idx, model_name, group_idx, shift, None
+
+    # ─────────────  dispatch to the selected model  ───────────────
     try:
         model_fn = getattr(methods, model_name)
         res = model_fn(
-            fr_ts=rates_clean,
-            behavior_ts=beh_dict,
+            fr_ts=rates_trim,
+            behavior_ts=beh_vectors,
             **model_kwargs
         )
-        res_clean = _stats_to_dict(res)
-        res_clean["fit_parameters"] = dict(model_kwargs)
-        res_clean["fit_variables"] = variables
-        return row_idx, model_name, group_idx, res_clean
+        res_serial = _stats_to_dict(res)
+        res_serial["trial_shift"] = shift
+        res_serial["fit_parameters"] = dict(model_kwargs)
+        res_serial["fit_variables"]  = list(beh_vectors.keys())
+        return row_idx, model_name, group_idx, shift, res_serial
     except Exception as e:
-        return row_idx, model_name, group_idx, {"ERROR": str(e)}
+        return row_idx, model_name, group_idx, shift, {"ERROR": str(e)}
 
 
 def _stats_to_dict(res: Any) -> Dict[str, Any]:
@@ -530,6 +541,31 @@ def _df_to_xarray(df: pd.DataFrame) -> xr.Dataset:
     return xr.Dataset.from_dataframe(enc)
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0)  Utility – align two trial-length vectors with a given lag
+# ─────────────────────────────────────────────────────────────────────────────
+def _pairwise_apply_shift(firing: np.ndarray,
+                          behaviour: np.ndarray,
+                          shift: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Return (firing_trimmed, behaviour_trimmed) so that
+
+        firing[t]   ↔   behaviour[t + shift]
+
+    • Positive *shift*  →  look-ahead  (behaviour is *later* in time)
+    • Negative *shift*  →  look-back   (behaviour is *earlier* in time)
+    """
+    if shift == 0:
+        return firing, behaviour
+
+    if shift > 0:
+        # Drop last *shift* trials from firing, first *shift* from behaviour
+        return firing[:-shift], behaviour[shift:]
+    else:  # shift < 0
+        # Drop first |shift| trials from firing, last |shift| from behaviour
+        return firing[-shift:], behaviour[:shift]   # same as behaviour[:-|shift|]
+
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ 2. MAIN FRONT-END ── now accepts nested *variable* groups               ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
@@ -543,6 +579,7 @@ def correlate_firing_latent_multiple_variable(
             "ARMA_model":         {"ar_order": 3, "ma_order": 0},
             "ARDL_model":         {"y_lags": 3, "x_order": 0},
         },
+    trial_shifts: Union[int, List[int], Tuple[int, ...]] = [-2,-1,0,1],  
     n_jobs: Optional[int] = None,
     save_folder: str = "/root/capsule/results",
     save_name: str = "correlations_multi",
@@ -597,6 +634,12 @@ def correlate_firing_latent_multiple_variable(
         Optional list of columns to discard from the *result* DataFrame –
         useful to avoid serialising large arrays such as raw firing rate
         time‑series.
+    trial_shifts : int | list[int] | tuple[int, ...]
+        • 0     → align same trial (default, identical to old behaviour)  
+        • 1     → behaviour at *t + 1* vs. firing at *t* (look-ahead)  
+        • -2    → behaviour two trials **earlier** than firing  
+        • [-2,0,+2] → run all three lags and store them side-by-side.
+
     Returns
     -------
     pd.DataFrame
@@ -604,77 +647,81 @@ def correlate_firing_latent_multiple_variable(
         ───────────────────────────────────────────────────────────────────────────────
         STRUCTURE OF  result["correlation_results"]  PER ROW
         ───────────────────────────────────────────────────────────────────────────────
-        Level-0  (row) … one entry per (session × unit × time_window × z_score)
+        row  =  (session_id × unit_index × time_window × z_score)
 
-            "correlation_results" : dict
-                ├── key = <model_name>  (e.g. "simple_LR", "ARDL_model", "ARMA_model")
-                │
-                │   value = list[dict | None]         (length == n_var_groups)
-                │             ▲
-                │             │   • index 0 → results for variable-group 0
-                │             │   • index 1 → results for variable-group 1
-                │             │   • …
-                │             │   • entry is *None* if the fit failed or was skipped
-                │
-                │
-                └─┬─────────────────────────────────────────────────────────────────
-                │  Each non-None element is the **serialised statsmodels result**:
-                │
-                │    {
-                │       "aic":       …        # ARMA / ARDL only
-                │       "bic":       …
-                │       "llf":       …
-                │       "sigma2":    …        # OLS / simple_LR only
-                │
-                │       "rsq":       …        # OLS
-                │       "rsq_adj":   …
-                │       "f_stat":    …
-                │       "f_pvalue":  …
-                │
-                │       "params":    {β0, β1, …}          # coefficients
-                │       "pvalues":   {β0, β1, …}
-                │       "tvalues":   {β0, β1, …}
-                │       "bse":       {β0, β1, …}
-                │       "conf_int":  {β0: [low, high], …}
-                │
-                │       "fit_parameters": {                # ← kwargs actually used
-                │           "y_lags": 3,
-                │           "x_order": 2,
-                │           …                               # empty for simple_LR
-                │       },
-                │
-                │       "fit_variables": [
-                │           "QLearning_L2F1_CK1_softmax-q_value_difference",
-                │           "QLearning_L2F1_CK1_softmax-total_value",
-                │           …
-                │       ]
-                │    }
-                │
-                └─────────────────────────────────────────────────────────────────
+        "correlation_results" : dict
+            ├── key = <model_name>                 # "simple_LR", "ARDL_model", …
+            │
+            │   value = list[ list[ dict | None ] ]
+            │            ▲      ▲
+            │            │      │
+            │            │      └─ inner-index  s   → trial-shift **trial_shifts[s]**
+            │            │         • length   == len(trial_shifts)
+            │            │         • entry    = None  → fit skipped / failed
+            │            │
+            │            └─ outer-index  g   → variable-group **g**
+            │               • length   == n_var_groups                       (order preserved)
+            │
+            │               EXAMPLE     trial_shifts = [-2, -1, 0, +1]
+            │               ┌────────────────────────────────────────────┐
+            │               │  row_dict["ARDL_model"]                    │
+            │               │     ├─ g = 0  → list of 4 shifts           │
+            │               │     │             • idx 0  shift -2        │
+            │               │     │             • idx 1  shift -1        │
+            │               │     │             • idx 2  shift  0        │
+            │               │     │             • idx 3  shift +1        │
+            │               │     └─ g = 1  → list of 4 shifts           │
+            │               └────────────────────────────────────────────┘
+            │
+            └─ Each non-None element is a serialised *statsmodels* fit:
+                {
+                    "aic":          … ,          # ARMA / ARDL
+                    "bic":          … ,
+                    "hqic":         … ,
+                    "llf":          … ,
+                    "sigma2":       … ,          # OLS only
+                    "rsq":          … ,          # OLS only
+                    "rsq_adj":      … ,
+                    "f_stat":       … ,
+                    "f_pvalue":     … ,
 
-        Quick access patterns
+                    "params":       {β₀, β₁, …},
+                    "pvalues":      {β₀, β₁, …},
+                    "tvalues":      {β₀, β₁, …},
+                    "bse":          {β₀, β₁, …},
+                    "conf_int":     {β₀: [low, high], …},
+
+                    "fit_parameters": {kwargs actually used},
+                    "fit_variables":  [var₁, var₂, …],
+                    "trial_shift":    <int>,        #   NEW FIELD
+                }
+
+        Quick-access patterns
         ─────────────────────
-        row_dict        = df.loc[i, "correlation_results"]
+        row_dict = df.loc[i, "correlation_results"]
 
-        # 1) All results for one model
-        ardl_fits       = row_dict["ARDL_model"]          # list over variable-groups
+        # 1) all ARDL fits for **variable-group g = 1**
+        fits_g1 = row_dict["ARDL_model"][1]          # list over shifts
 
-        # 2) Result for model M & variable-group g
-        fit_g0          = row_dict["ARDL_model"][0]
+        # 2) fit at shift 0 for that group
+        fit = fits_g1[ trial_shifts.index(0) ]
 
-        # 3) Coefficient of “RPE” in that fit (if present)
-        beta_rpe        = fit_g0["params"].get("RPE", np.nan)
+        # 3) coefficient of “RPE”
+        beta_rpe = fit["params"].get("RPE", np.nan)
 
-        # 4) p-value of that coefficient
-        p_rpe           = fit_g0["pvalues"].get("RPE", np.nan)
-
-        # 5) AIC of the whole model (ARDL / ARMA)
-        aic_value       = fit_g0["aic"]
+        # 4) its p-value
+        p_rpe = fit["pvalues"].get("RPE", np.nan)
 
     """
     # ──────────────────────────────────────────────────────────────────
     # 0) NORMALISE  – model list  &  variable-group list
     # ──────────────────────────────────────────────────────────────────
+
+    if isinstance(trial_shifts, (int, np.integer)):
+        trial_shifts = [int(trial_shifts)]
+    else:
+        trial_shifts = [int(s) for s in trial_shifts]
+
     models = [correlation_model] if isinstance(correlation_model, str) else list(correlation_model)
     unknown = [m for m in models if not hasattr(methods, m)]
     if unknown:
@@ -710,7 +757,10 @@ def correlate_firing_latent_multiple_variable(
         for m in models:
             kwargs = model_kwargs.get(m, {})
             for g_idx, group in enumerate(var_groups):
-                tasks.append((idx, row_dict, beh_summary, group, m, kwargs, g_idx))
+                for shift in trial_shifts:
+                    tasks.append(
+                        (idx, row_dict, beh_summary, group, m, kwargs, shift, g_idx)
+                    )
 
     # ──────────────────────────────────────────────────────────────────
     # 3) MULTIPROCESS POOL
@@ -720,15 +770,20 @@ def correlate_firing_latent_multiple_variable(
 
     with multiprocessing.Pool(processes=n_jobs) as pool:
         total = len(tasks)
-        for done, (row_idx, model_name, g_idx, res_obj) in enumerate(
+        for done, (row_idx, model_name, g_idx, shift, res_obj) in enumerate(
             pool.imap_unordered(_multi_row_task, tasks), start=1
         ):
-            store: Dict[str, list] = result.at[row_idx, "correlation_results"]
+            store = result.at[row_idx, "correlation_results"]
 
-            # initialise dict entry only once, with correct list length
+            # first time we encounter this model → allocate list-of-lists
             if model_name not in store:
-                store[model_name] = [None] * len(var_groups)
-            store[model_name][g_idx] = res_obj
+                store[model_name] = [
+                    [None] * len(trial_shifts)       # one list per shift
+                    for _ in range(len(var_groups))  # one per variable-group
+                ]
+
+            shift_idx = trial_shifts.index(shift)
+            store[model_name][g_idx][shift_idx] = res_obj
 
             if done % 100 == 0 or done == total:
                 print(f"[multi-var] progress: {done}/{total} fits completed")
