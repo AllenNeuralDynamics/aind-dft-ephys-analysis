@@ -3,6 +3,7 @@ import os
 import glob
 import json
 from pathlib import Path
+from collections import defaultdict
 import xarray as xr
 import numpy as np
 import pandas as pd
@@ -1088,7 +1089,7 @@ def significance_and_direction_summary_multi(
     ① *pd.DataFrame*  – in-memory results  
     ② *xr.Dataset*    – what you get from ``xr.open_zarr(...)``  
     ③ *str / Path*    – path to a **.zarr** directory  
-    ④ legacy single-variable CSV (auto-detected → routed to the old routine).
+    ④ legacy single-variable CSV (raised as an error - use old helper).
 
     OUTPUT COLUMN SCHEME
     --------------------
@@ -1099,22 +1100,20 @@ def significance_and_direction_summary_multi(
         <model>_<var>_g<idx>_coef   – coefficient (β) of the *first* lag (L0)  
         <model>_<var>_g<idx>_tval   – t-statistic of that coefficient
 
-    A *fit_metadata* column is also added: a **dict per row** whose keys are  
-    ``"<model>_g<idx>"`` and whose values hold ``fit_parameters`` & ``fit_variables``
-    exactly as returned by the multivariate correlate function.
+    The **group index** (g0, g1, …) is assigned *per model* according to the
+    unique **variable set** that went into each fit – hence it is invariant
+    across rows, irrespective of the order in which fits were computed.
 
-    QUICK EXAMPLE
-    -------------
-    >>> tbl = significance_and_direction_summary_multi("/path/to/corr.zarr")
-    >>> tbl.filter(like="_pval").head()
+    A *fit_metadata* column is also added: a **dict per row** whose keys are
+    ``"<model>_g<idx>"`` and whose values contain the original
+    ``fit_parameters`` and ``fit_variables``.
     """
-    # ────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────
     # 0)  Resolve input  (DataFrame · Dataset · Zarr path)
-    # ────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────
     if isinstance(corr_df_or_ds, (str, Path)) and str(corr_df_or_ds).endswith(".zarr"):
         ds = xr.open_zarr(corr_df_or_ds, consolidated=False)
         df_raw = ds.to_dataframe()
-        # JSON-decode any columns that had been string-encoded when saving
         for c in df_raw.columns:
             if df_raw[c].dtype == object:
                 try:
@@ -1135,14 +1134,11 @@ def significance_and_direction_summary_multi(
         raise TypeError("Unsupported input type for `corr_df_or_ds`")
 
     if "correlation_results" not in df_raw.columns:
-        raise ValueError(
-            "Input does not contain a 'correlation_results' column. "
-            "Perhaps this is a single-variable result?"
-        )
+        raise ValueError("Input does not contain a 'correlation_results' column.")
 
-    # ────────────────────────────────────────────────────────────────────
-    # 1)  Metadata scaffold
-    # ────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────
+    # 1)  Prepare metadata scaffold & helpers
+    # ────────────────────────────────────────────────────────────────
     if meta_cols is None:
         meta_cols = ["session_id", "unit_index", "time_window", "z_score"]
 
@@ -1151,17 +1147,26 @@ def significance_and_direction_summary_multi(
 
     created_cols: set[str] = set()
 
-    # ────────────────────────────────────────────────────────────────────
+    # map:  model  ->  {tuple(vars) : idx}
+    group_index_map: Dict[str, Dict[Tuple[str, ...], int]] = defaultdict(dict)
+
+    # ────────────────────────────────────────────────────────────────
     # 2)  Row-wise extraction
-    # ────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────
     for idx, row in df_raw.iterrows():
         cr: Dict[str, List[Dict[str, Any]]] = row["correlation_results"]
         meta_row: Dict[str, Any] = {}
 
         for model, fit_list in cr.items():
-            for g_idx, fit in enumerate(fit_list):
+            for fit in fit_list:
                 if not fit or "params" not in fit:
                     continue
+
+                # Determine / register group index based on variable set
+                var_tuple: Tuple[str, ...] = tuple(fit.get("fit_variables", []))
+                if var_tuple not in group_index_map[model]:
+                    group_index_map[model][var_tuple] = len(group_index_map[model])
+                g_idx: int = group_index_map[model][var_tuple]
 
                 params  : Dict[str, float] = fit["params"]
                 pvalues : Dict[str, float] = fit["pvalues"]
@@ -1176,8 +1181,8 @@ def significance_and_direction_summary_multi(
                         continue
 
                     beta     = params[lag_keys[0]]
-                    p_min    = min(pvalues.get(k, np.nan) for k in lag_keys)
-                    t_val    = tvalues.get(lag_keys[0], np.nan)
+                    p_min    = min(pvalues.get(k, float("nan")) for k in lag_keys)
+                    t_val    = tvalues.get(lag_keys[0], float("nan"))
 
                     col_p    = f"{model}_{var}_g{g_idx}_pval"
                     col_coef = f"{model}_{var}_g{g_idx}_coef"
@@ -1188,24 +1193,24 @@ def significance_and_direction_summary_multi(
                     summary.at[idx, col_coef] = beta
                     summary.at[idx, col_tval] = t_val
 
-                # Preserve kwargs & variable list for this fit
+                # Store metadata for this fit
                 meta_row[f"{model}_g{g_idx}"] = {
                     "fit_parameters": fit.get("fit_parameters", {}),
-                    "fit_variables":  fit.get("fit_variables",  []),
+                    "fit_variables":  list(var_tuple),
                 }
 
         summary.at[idx, "fit_metadata"] = meta_row
 
-    # Ensure every freshly-created numeric column exists for all rows
+    # Ensure all numeric columns exist for every row
     for col in created_cols:
         summary[col] = pd.to_numeric(summary[col], errors="coerce")
 
     return summary
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# 2)  BATCH WRAPPER  ➜  CSV *or* Zarr  (with full metadata retained in Zarr)
-# ────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────
+# 2)  BATCH WRAPPER  →  CSV  *or*  Zarr
+# ──────────────────────────────────────────────────────────────────────────
 def significance_and_direction_summary_combined_multi(
     paths: Optional[List[Union[str, Path]]] = None,
     search_folder: str = "/root/capsule/results",
@@ -1262,11 +1267,10 @@ def significance_and_direction_summary_combined_multi(
     """
 
     # ........................................................................
-    # 1)  Resolve file list
+    # 1)  Discover / validate file list
     # ........................................................................
     if paths is None:
         paths = sorted(Path(search_folder).expanduser().glob(pattern))
-
     if not paths:
         raise FileNotFoundError("No correlation result files discovered.")
 
@@ -1304,18 +1308,16 @@ def significance_and_direction_summary_combined_multi(
         elif save_format == "zarr":
             out = Path(save_folder) / f"{save_name}.zarr"
 
-            # JSON-encode cells that are lists / dicts so xarray can serialise
+            # JSON-encode list / dict cells so xarray can serialise them
             enc = combined.copy()
             for col in enc.columns:
                 if enc[col].apply(lambda x: isinstance(x, (dict, list, tuple))).any():
                     enc[col] = enc[col].apply(json.dumps)
 
-            xr.Dataset.from_dataframe(enc).to_zarr(
-                out, mode="w", consolidated=True
-            )
+            xr.Dataset.from_dataframe(enc).to_zarr(out, mode="w", consolidated=True)
             print(f"[multi-var] combined summary written to {out}")
 
         else:
-            raise ValueError("`save_format` must be either 'csv' or 'zarr'")
+            raise ValueError("`save_format` must be 'csv' or 'zarr'")
 
     return combined
