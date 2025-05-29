@@ -307,3 +307,116 @@ def cluster_estimated_x(
 #wf_x = EphysBehaviorD.nwb_ephys_data.units['estimated_x'].data[:]
 #labels = cluster_estimated_x(wf_x, n_clusters=4, threshold=0.5, plot=True)
 #print("Final labels:", labels)
+
+def append_units_locations(nwb_data: Any):
+    """Add a *single* ``ccf_location`` column to ``nwb_data.units``.
+
+    This is a functional, side‑effect–friendly refactor of the former
+    ``EphysBehavior.append_units_locations`` *instance* method.  It no longer
+    depends on *self* and instead operates directly on the supplied NWBFile.
+
+    Parameters
+    ----------
+    nwb_data : pynwb.NWBFile
+        The electrophysiology NWB object whose ``units`` DynamicTable should be
+        augmented.  The function mutates this object **in‑place** and returns
+        it so that it can be chained if desired.
+
+    Returns
+    -------
+    pynwb.NWBFile
+        The same ``nwb_data`` object, with the extra column appended (or left
+        untouched if prerequisites are missing).
+    """
+
+    # ─── Sanity checks ────────────────────────────────────────────────────────
+    if nwb_data is None or not hasattr(nwb_data, "units"):
+        return nwb_data
+
+    units = nwb_data.units
+
+    # Avoid double‑insertion
+    if "ccf_location" in units.colnames:
+        return nwb_data
+
+    # Extract pre‑computed per‑unit features
+    wm = units["waveform_mean"].data[:]
+    ex = units["estimated_x"].data[:]
+
+    if wm.size == 0 or ex.size == 0:
+        return nwb_data
+
+    # ─── 1. Best electrode per unit (trough‑to‑peak) ─────────────────────────
+    best_ch = find_best_electrode(wm, unit_index=None)  # (n_units,)
+
+    # ─── 2. Assign shank IDs by clustering ML‑estimated X coordinates ────────
+    shank_ids = cluster_estimated_x(ex, n_clusters=4, threshold=0.5, plot=False)
+
+    device_names = units["device_name"][:]  # e.g. ['ProbeA', 'ProbeA', …]
+    n_units = best_ch.shape[0]
+
+    # ─── 3. Cache CCF look‑ups per *probe, shank* pair ───────────────────────
+    session_name = getattr(nwb_data, "session_id", getattr(nwb_data, "session_description", ""))
+    unique_keys = set(zip(device_names, shank_ids))
+    ccf_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for probe, shank in unique_keys:
+        ccf_cache[(probe, int(shank))] = load_ccf_channel_locations(
+            session_name, probe, int(shank) + 1
+        )
+
+    # ─── 4. Gather arrays for vectorised fill‑in ─────────────────────────────
+    x_arr = np.full(n_units, np.nan)
+    y_arr = np.full(n_units, np.nan)
+    z_arr = np.full(n_units, np.nan)
+    axial_arr = np.full(n_units, np.nan)
+    lateral_arr = np.full(n_units, np.nan)
+    region_id = np.full(n_units, np.nan)
+    region_name = np.array([""] * n_units, dtype=object)
+
+    for i in range(n_units):
+        probe = device_names[i]
+        shank = int(shank_ids[i])
+        ccf = ccf_cache.get((probe, shank), {})
+        chan = extract_channel_info(ccf, int(best_ch[i]))
+        if chan:
+            x_arr[i] = chan.get("x", np.nan)
+            y_arr[i] = chan.get("y", np.nan)
+            z_arr[i] = chan.get("z", np.nan)
+            axial_arr[i] = chan.get("axial", np.nan)
+            lateral_arr[i] = chan.get("lateral", np.nan)
+            region_id[i] = chan.get("brain_region_id", np.nan)
+            region_name[i] = chan.get("brain_region", "")
+
+    # ─── 5. Pack everything into a dict per unit and append as one column ────
+    ccf_location_col = []
+    for i in range(n_units):
+        entry = {
+            "best_electrode": int(best_ch[i]),
+            "shank": int(shank_ids[i]),
+            "probe": str(device_names[i]),
+        }
+        # Add CCF‑derived fields only if valid
+        if np.isfinite(x_arr[i]):
+            entry.update(
+                {
+                    "x": float(x_arr[i]),
+                    "y": float(y_arr[i]),
+                    "z": float(z_arr[i]),
+                    "axial": float(axial_arr[i]),
+                    "lateral": float(lateral_arr[i]),
+                    "brain_region_id": int(region_id[i]),
+                    "brain_region": region_name[i],
+                }
+            )
+        ccf_location_col.append(entry)
+
+    units.add_column(
+        name="ccf_location",
+        description=(
+            "Per‑unit dict with keys: best_electrode, shank, x, y, z, axial, "
+            "lateral, brain_region_id, brain_region"
+        ),
+        data=ccf_location_col,
+    )
+
+    return nwb_data
