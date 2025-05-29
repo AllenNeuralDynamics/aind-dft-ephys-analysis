@@ -18,6 +18,7 @@ from nwb_utils import NWBUtils
 from general_utils import smart_read_csv
 from aind_spurious_correlation import methods
 
+from ephys_utils import append_units_locations
 
 def get_units_passed_default_qc(nwb_data: Any) -> np.ndarray:
     """
@@ -96,7 +97,11 @@ def get_the_mean_firing_rate(
           - time_window: string label of the form "start_end"
           - rates: list of mean firing rates (spikes/sec) per trial
     """
+    # appen units locations to nwb_data
     session_id = extract_session_name_core(getattr(nwb_data, 'session_id', None))
+    nwb_data=append_units_locations(nwb_data,session_id)
+
+    
     all_times = np.array(extract_event_timestamps(nwb_data, align_to_event))
     n_trials = len(all_times)
 
@@ -113,6 +118,9 @@ def get_the_mean_firing_rate(
     rows = []
     for u in units_to_process:
         spikes = np.array(nwb_data.units['spike_times'][u])
+        loc    = nwb_data.units["ccf_location"][u] or {}
+        region = loc.get("brain_region", "")
+
         for start_offset, end_offset in time_windows:
             duration = end_offset - start_offset
             rates = []
@@ -129,12 +137,27 @@ def get_the_mean_firing_rate(
                 rows.append({
                     'session_id': session_id,
                     'unit_index': u,
+                    "align_to_event": align_to_event,
                     'time_window': f"{start_offset}_{end_offset}",
                     'z_score': flag,
+                    "brain_region": region,
+                    "ccf_location": loc,
                     'rates': rates_to_store.tolist()
                 })
 
-    firing_rate_df = pd.DataFrame(rows, columns=['session_id', 'unit_index', 'time_window','z_score', 'rates'])
+    firing_rate_df = pd.DataFrame(
+        rows,
+        columns=[
+            "session_id",
+            "unit_index",
+            "align_to_event",
+            "time_window",
+            "z_score",
+            "brain_region",
+            "ccf_location",
+            "rates",
+        ],
+    )
     return firing_rate_df
 
 def get_the_mean_firing_rate_combined(
@@ -192,7 +215,16 @@ def get_the_mean_firing_rate_combined(
         all_dfs.append(df)
 
     if not all_dfs:
-        combined_df = pd.DataFrame(columns=['session_id', 'unit_index', 'time_window', 'z_score', 'rates'])
+        combined_df = pd.DataFrame(columns=[
+            "session_id",
+            "unit_index",
+            "align_to_event",
+            "time_window",
+            "z_score",
+            "brain_region",
+            "ccf_location",
+            "rates",
+        ])
     else:
         combined_df = pd.concat(all_dfs, ignore_index=True)
 

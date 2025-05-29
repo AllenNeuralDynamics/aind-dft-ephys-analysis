@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 
+from general_utils import format_session_name
 
 def save_ccf_locations_to_json(
     units_table: Any,
@@ -308,7 +309,9 @@ def cluster_estimated_x(
 #labels = cluster_estimated_x(wf_x, n_clusters=4, threshold=0.5, plot=True)
 #print("Final labels:", labels)
 
-def append_units_locations(nwb_data: Any):
+def append_units_locations(nwb_data: Any,
+                        session_name: str
+                        ):
     """Add a *single* ``ccf_location`` column to ``nwb_data.units``.
 
     This is a functional, side‑effect–friendly refactor of the former
@@ -321,7 +324,8 @@ def append_units_locations(nwb_data: Any):
         The electrophysiology NWB object whose ``units`` DynamicTable should be
         augmented.  The function mutates this object **in‑place** and returns
         it so that it can be chained if desired.
-
+    session_name : str
+        e.g. '753126_2024-10-15_12-20-35'
     Returns
     -------
     pynwb.NWBFile
@@ -356,7 +360,6 @@ def append_units_locations(nwb_data: Any):
     n_units = best_ch.shape[0]
 
     # ─── 3. Cache CCF look‑ups per *probe, shank* pair ───────────────────────
-    session_name = getattr(nwb_data, "session_id", getattr(nwb_data, "session_description", ""))
     unique_keys = set(zip(device_names, shank_ids))
     ccf_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for probe, shank in unique_keys:
