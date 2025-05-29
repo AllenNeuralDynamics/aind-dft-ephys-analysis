@@ -1162,7 +1162,7 @@ def significance_and_direction_summary_combined(
 # ────────────────────────────────────────────────────────────────────────────
 # 1)  PER-RESULT-FILE  ➜  Tidy table with *_pval, *_coef, *_tval  (+metadata)
 # ────────────────────────────────────────────────────────────────────────────
-def significance_and_direction_summary_multi(
+def correlation_results_summary(
     corr_df_or_ds: Union[pd.DataFrame, xr.Dataset, str, Path],
     meta_cols: Optional[List[str]] = None,
 ) -> pd.DataFrame:
@@ -1298,7 +1298,7 @@ def significance_and_direction_summary_multi(
 # ──────────────────────────────────────────────────────────────────────────
 # 2)  BATCH WRAPPER  →  CSV  *or*  Zarr
 # ──────────────────────────────────────────────────────────────────────────
-def significance_and_direction_summary_combined_multi(
+def correlation_results_summary_combined(
     paths: Optional[List[Union[str, Path]]] = None,
     search_folder: str = "/root/capsule/results",
     pattern: str = "correlations_multi*.zarr",
@@ -1309,7 +1309,7 @@ def significance_and_direction_summary_combined_multi(
     meta_cols: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
-    Batch version of ``significance_and_direction_summary_multi`` that accepts
+    Batch version of ``correlation_results_summary`` that accepts
     **multiple correlation result folders (.zarr)** produced by
     ``correlate_firing_latent_multiple_variable``,
     converts each into a significance / direction table, and concatenates
@@ -1371,7 +1371,7 @@ def significance_and_direction_summary_combined_multi(
     frames = []
     for i, p in enumerate(paths, start=1):
         print(f"\n[ {i}/{len(paths)} ]  Processing {p} …")
-        tbl = significance_and_direction_summary_multi(p, meta_cols=meta_cols)
+        tbl = correlation_results_summary(p, meta_cols=meta_cols)
         tbl.insert(0, "source_file", Path(p).name)
         frames.append(tbl)
 
