@@ -1158,46 +1158,39 @@ def significance_and_direction_summary_combined(
 # ║  SIGNIFICANCE / COEFFICIENT / T-STAT SUMMARY --  MULTI-VARIATE PIPELINE  ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-
-# ────────────────────────────────────────────────────────────────────────────
-# 1)  PER-RESULT-FILE  ➜  Tidy table with *_pval, *_coef, *_tval  (+metadata)
-# ────────────────────────────────────────────────────────────────────────────
 def correlation_results_summary(
     corr_df_or_ds: Union[pd.DataFrame, xr.Dataset, str, Path],
     meta_cols: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
-    Create a **tidy significance / coefficient / t-stat table** from the nested
-    ``correlation_results`` column produced by
-    `correlate_firing_latent_multiple_variable`.
+    Summarise the nested ``correlation_results`` column created by
+    ``correlate_firing_latent_multiple_variable``.
 
-    ACCEPTED INPUT TYPES
-    --------------------
-    ① *pd.DataFrame*  – in-memory results  
-    ② *xr.Dataset*    – what you get from ``xr.open_zarr(...)``  
-    ③ *str / Path*    – path to a **.zarr** directory  
-    ④ legacy single-variable CSV (raised as an error - use old helper).
+    NEW BEHAVIOUR  ───────────────────────────────────────────────────────────
+    • The *group index* **g#** is now defined by
+          (fit_variables, trial_shift)
+      so a model fitted with the same variable set at different shifts
+      receives different group numbers.
+      This makes it trivial to plot coefficients across shifts without
+      accidentally conflating them.
 
-    OUTPUT COLUMN SCHEME
-    --------------------
-    For every  «model» × «behaviour variable (lag-stripped)» × «group#»  
-    *three* numeric columns are created:
+    COLUMN NAMING SCHEME  (hyphens everywhere)
+    ──────────────────────────────────────────────────────────────────────────
+        <model>-<var>-g<i>-s<k>-pval   (minimum p across lags)
+        <model>-<var>-g<i>-s<k>-coef   (β coefficient, first lag)
+        <model>-<var>-g<i>-s<k>-tval   (t-statistic)
 
-        <model>_<var>_g<idx>_pval   – minimum p-value across lags  
-        <model>_<var>_g<idx>_coef   – coefficient (β) of the *first* lag (L0)  
-        <model>_<var>_g<idx>_tval   – t-statistic of that coefficient
+        <model>-g<i>-s<k>-aic          (global metrics per fit)
+        <model>-g<i>-s<k>-bic
+        <model>-g<i>-s<k>-rsq
+        …
 
-    The **group index** (g0, g1, …) is assigned *per model* according to the
-    unique **variable set** that went into each fit – hence it is invariant
-    across rows, irrespective of the order in which fits were computed.
-
-    A *fit_metadata* column is also added: a **dict per row** whose keys are
-    ``"<model>_g<idx>"`` and whose values contain the original
-    ``fit_parameters`` and ``fit_variables``.
+        fit_metadata  – dict keyed by "<model>-g<i>-s<k>" containing
+            • fit_parameters   • fit_variables   • trial_shift
     """
-    # ────────────────────────────────────────────────────────────────
-    # 0)  Resolve input  (DataFrame · Dataset · Zarr path)
-    # ────────────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────
+    # 0) Load input → df_raw  (exact code you asked for)
+    # ───────────────────────────────────────────────────────────────
     if isinstance(corr_df_or_ds, (str, Path)) and str(corr_df_or_ds).endswith(".zarr"):
         ds = xr.open_zarr(corr_df_or_ds, consolidated=False)
         df_raw = ds.to_dataframe()
@@ -1221,78 +1214,83 @@ def correlation_results_summary(
         raise TypeError("Unsupported input type for `corr_df_or_ds`")
 
     if "correlation_results" not in df_raw.columns:
-        raise ValueError("Input does not contain a 'correlation_results' column.")
+        raise ValueError("Input missing 'correlation_results' column")
 
-    # ────────────────────────────────────────────────────────────────
-    # 1)  Prepare metadata scaffold & helpers
-    # ────────────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────
+    # 1) Metadata scaffold
+    # ───────────────────────────────────────────────────────────────
     if meta_cols is None:
         meta_cols = ["session_id", "unit_index", "time_window", "z_score"]
 
-    summary = df_raw[meta_cols].copy()
-    summary["fit_metadata"] = [{} for _ in range(len(summary))]
+    meta_df = df_raw[meta_cols].copy()
+    meta_df["fit_metadata"] = [{} for _ in range(len(meta_df))]
 
-    created_cols: set[str] = set()
+    # ───────────────────────────────────────────────────────────────
+    # 2) Collect new columns row-by-row in dicts (no fragmentation)
+    # ───────────────────────────────────────────────────────────────
+    new_rows: List[Dict[str, Any]] = [{} for _ in range(len(meta_df))]
+    group_index_map: Dict[str, Dict[Tuple[Any, ...], int]] = defaultdict(dict)
 
-    # map:  model  ->  {tuple(vars) : idx}
-    group_index_map: Dict[str, Dict[Tuple[str, ...], int]] = defaultdict(dict)
+    for row_idx, row in df_raw.iterrows():
+        corr_dict: Dict[str, List[List[Dict[str, Any]]]] = row["correlation_results"]
+        meta_blob: Dict[str, Any] = {}
+        values   = new_rows[row_idx]
 
-    # ────────────────────────────────────────────────────────────────
-    # 2)  Row-wise extraction
-    # ────────────────────────────────────────────────────────────────
-    for idx, row in df_raw.iterrows():
-        cr: Dict[str, List[Dict[str, Any]]] = row["correlation_results"]
-        meta_row: Dict[str, Any] = {}
-
-        for model, fit_list in cr.items():
-            for fit in fit_list:
-                if not fit or "params" not in fit:
-                    continue
-
-                # Determine / register group index based on variable set
-                var_tuple: Tuple[str, ...] = tuple(fit.get("fit_variables", []))
-                if var_tuple not in group_index_map[model]:
-                    group_index_map[model][var_tuple] = len(group_index_map[model])
-                g_idx: int = group_index_map[model][var_tuple]
-
-                params  : Dict[str, float] = fit["params"]
-                pvalues : Dict[str, float] = fit["pvalues"]
-                tvalues : Dict[str, float] = fit.get("tvalues", {})
-
-                # Behaviour variable base names (strip ".L1", ".L2", …)
-                base_vars = {k.split(".")[0] for k in params if k.split(".")[0] != "const"}
-
-                for var in base_vars:
-                    lag_keys = [k for k in params if k.startswith(var)]
-                    if not lag_keys:
+        for model, group_list in corr_dict.items():
+            for shift_list in (group_list or []):
+                for fit in (shift_list or []):
+                    if not fit or "params" not in fit:
                         continue
 
-                    beta     = params[lag_keys[0]]
-                    p_min    = min(pvalues.get(k, float("nan")) for k in lag_keys)
-                    t_val    = tvalues.get(lag_keys[0], float("nan"))
+                    shift_val = int(fit.get("trial_shift", 0))
+                    shift_tag = f"s{shift_val:+d}".replace("+", "")
+                    var_tuple = tuple(fit.get("fit_variables", []))
+                    group_key = var_tuple      # shift included
+                    if group_key not in group_index_map[model]:
+                        group_index_map[model][group_key] = len(group_index_map[model])
+                    g_idx = group_index_map[model][group_key]
 
-                    col_p    = f"{model}_{var}_g{g_idx}_pval"
-                    col_coef = f"{model}_{var}_g{g_idx}_coef"
-                    col_tval = f"{model}_{var}_g{g_idx}_tval"
-                    created_cols.update([col_p, col_coef, col_tval])
+                    params  : Dict[str, float] = fit["params"]
+                    pvalues : Dict[str, float] = fit["pvalues"]
+                    tvalues : Dict[str, float] = fit.get("tvalues", {})
 
-                    summary.at[idx, col_p]    = p_min
-                    summary.at[idx, col_coef] = beta
-                    summary.at[idx, col_tval] = t_val
+                    # ── behaviour-specific metrics ─────────────────
+                    base_vars = {k.split(".")[0] for k in params if k.split(".")[0] != "const"}
+                    for var in base_vars:
+                        lag_keys = [k for k in params if k.startswith(var)]
+                        if not lag_keys:
+                            continue
+                        beta  = params[lag_keys[0]]
+                        p_min = min(pvalues.get(k, np.nan) for k in lag_keys)
+                        t_val = tvalues.get(lag_keys[0], np.nan)
 
-                # Store metadata for this fit
-                meta_row[f"{model}_g{g_idx}"] = {
-                    "fit_parameters": fit.get("fit_parameters", {}),
-                    "fit_variables":  list(var_tuple),
-                }
+                        values[f"{model}-{var}-g{g_idx}-{shift_tag}-pval"] = p_min
+                        values[f"{model}-{var}-g{g_idx}-{shift_tag}-coef"] = beta
+                        values[f"{model}-{var}-g{g_idx}-{shift_tag}-tval"] = t_val
 
-        summary.at[idx, "fit_metadata"] = meta_row
+                    # ── global fit metrics ─────────────────────────
+                    for metric in ("rsq", "rsq_adj", "aic", "bic", "hqic",
+                                   "llf", "sigma2", "f_stat", "f_pvalue"):
+                        values[f"{model}-g{g_idx}-{shift_tag}-{metric}"] = fit.get(metric, np.nan)
 
-    # Ensure all numeric columns exist for every row
-    for col in created_cols:
-        summary[col] = pd.to_numeric(summary[col], errors="coerce")
+                    # ── metadata per fit ───────────────────────────
+                    meta_key = f"{model}-g{g_idx}-{shift_tag}"
+                    meta_blob[meta_key] = {
+                        "fit_parameters": fit.get("fit_parameters", {}),
+                        "fit_variables":  list(var_tuple),
+                        "trial_shift":    shift_val,
+                    }
 
-    return summary
+        meta_df.at[row_idx, "fit_metadata"] = meta_blob
+
+    # ───────────────────────────────────────────────────────────────
+    # 3) One big concat → no fragmentation
+    # ───────────────────────────────────────────────────────────────
+    wide_df = pd.DataFrame(new_rows, index=meta_df.index, dtype=float)
+    result  = pd.concat([meta_df, wide_df], axis=1)
+
+    return result
+
 
 
 # ──────────────────────────────────────────────────────────────────────────
