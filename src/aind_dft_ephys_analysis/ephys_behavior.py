@@ -579,7 +579,7 @@ def correlate_firing_latent_multiple_variable(
             "ARMA_model":         {"ar_order": 3, "ma_order": 0},
             "ARDL_model":         {"y_lags": 3, "x_order": 0},
         },
-    trial_shifts: Union[int, List[int], Tuple[int, ...]] = [-2,-1,0,1],  
+    trial_shifts: Union[int, List[int], Tuple[int, ...]] = [-1,0,1],  
     n_jobs: Optional[int] = None,
     save_folder: str = "/root/capsule/results",
     save_name: str = "correlations_multi",
