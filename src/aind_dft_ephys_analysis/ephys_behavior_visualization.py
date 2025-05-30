@@ -711,3 +711,137 @@ def fraction_significant_multi(
         ax.legend(loc="upper right")
         plt.tight_layout()
         plt.show()
+
+
+def fit_and_plot_by_session(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    session_col: str = "session_id",
+    x_label: str | None = None,
+    y_label: str | None = None
+) -> dict[str, tuple[float, float]]:
+    """
+    For each row in `df`, fit a simple linear regression y = slope*x + intercept
+    using the list-like values in columns `x_col` and `y_col`, then plot the
+    scatter and fitted line in its own figure.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain columns `x_col` and `y_col` with list-like numeric data per row,
+        and a `session_col` identifying each row.
+    x_col : str
+        Column name for the predictor (x) values.
+    y_col : str
+        Column name for the response (y) values.
+    session_col : str
+        Column name for the session identifier.
+    x_label : str or None
+        Label for the x-axis (defaults to x_col if None).
+    y_label : str or None
+        Label for the y-axis (defaults to y_col if None).
+
+    Returns
+    -------
+    dict
+        Mapping from session identifier to (slope, intercept).
+    """
+    results: dict[str, tuple[float, float]] = {}
+    for _, row in df.iterrows():
+        session = row[session_col]
+        x = np.array(row[x_col], dtype=float)
+        y = np.array(row[y_col], dtype=float)
+        # filter out NaNs
+        mask = ~np.isnan(x) & ~np.isnan(y)
+        x_clean = x[mask]
+        y_clean = y[mask]
+        if len(x_clean) < 2:
+            # skip if insufficient data
+            continue
+
+        # fit line
+        slope, intercept = np.polyfit(x_clean, y_clean, 1)
+        results[session] = (slope, intercept)
+
+        # plot
+        plt.figure()
+        plt.scatter(x_clean, y_clean)
+        x_line = np.linspace(x_clean.min(), x_clean.max(), 100)
+        y_line = slope * x_line + intercept
+        plt.plot(x_line, y_line)
+        plt.xlabel(x_label or x_col)
+        plt.ylabel(y_label or y_col)
+        plt.title(f"{session}: y = {slope:.3f} x + {intercept:.3f}")
+        plt.show()
+    return results
+
+
+def fit_and_plot_all_sessions(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    session_col: str = "session_id",
+    plot_dots: bool = True,
+    x_label: Optional[str] = None,
+    y_label: Optional[str] = None
+) -> Dict[str, Tuple[float, float]]:
+    """
+    Fit and plot regression lines for all sessions on a single figure.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing session identifiers and two list-like columns.
+    x_col : str
+        Column name for the predictor values (list per row).
+    y_col : str
+        Column name for the response values (list per row).
+    session_col : str, default "session_id"
+        Column name for the session identifier.
+    plot_dots : bool, default True
+        Whether to scatter plot individual data points.
+    x_label : str, optional
+        Label for the x-axis (defaults to x_col if None).
+    y_label : str, optional
+        Label for the y-axis (defaults to y_col if None).
+
+    Returns
+    -------
+    Dict[str, Tuple[float, float]]
+        Mapping from session identifier to (slope, intercept).
+    """
+    fit_results: Dict[str, Tuple[float, float]] = {}
+
+    plt.figure()
+    for _, row in df.iterrows():
+        session = row[session_col]
+        x = np.array(row[x_col], dtype=float)
+        y = np.array(row[y_col], dtype=float)
+        mask = ~np.isnan(x) & ~np.isnan(y)
+        x_clean = x[mask]
+        y_clean = y[mask]
+        if len(x_clean) < 2:
+            continue
+
+        # Fit line
+        slope, intercept = np.polyfit(x_clean, y_clean, 1)
+        fit_results[session] = (slope, intercept)
+
+        # Scatter points if requested
+        if plot_dots:
+            plt.scatter(x_clean, y_clean, s=10, alpha=0.5)
+
+        # Regression line
+        x_vals = np.array([x_clean.min(), x_clean.max()])
+        y_vals = slope * x_vals + intercept
+        plt.plot(x_vals, y_vals, linewidth=2)
+
+    num_sessions = len(fit_results)
+    plt.title(f"Regression lines for {num_sessions} sessions")
+    plt.xlabel(x_label or x_col)
+    plt.ylabel(y_label or y_col)
+    plt.tight_layout()
+    plt.show()
+
+    return fit_results

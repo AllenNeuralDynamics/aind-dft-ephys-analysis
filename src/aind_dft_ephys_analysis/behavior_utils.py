@@ -2,14 +2,19 @@ import os
 import json   
 import requests   
 from typing import Optional, List, Any, Dict ,Union
+from pathlib import Path
 
 import numpy as np   
 import pandas as pd
 
 from general_utils import format_session_name
-from general_utils import extract_session_name_core
+from general_utils import extract_session_name_core, smart_read_csv
 from nwb_utils import NWBUtils
 from model_fitting import fit_q_learning_model
+
+
+
+
 
 def extract_event_timestamps(
     nwb_behavior_data: Any,
@@ -744,3 +749,57 @@ def generate_behavior_summary_combined(
         print(f"Combined summary saved to {save_path}")
 
     return combined_df
+
+
+def load_and_combine_csvs(
+    folder: Union[str, Path],
+    pattern: str = "behavior_summary-*.csv"
+) -> pd.DataFrame:
+    """
+    Load all CSV files in `folder` matching `pattern` and concatenate them into one DataFrame.
+    Empty files are skipped gracefully.
+
+    Parameters
+    ----------
+    folder : str or Path
+        Directory in which to look for CSV files.
+    pattern : str, optional
+        Glob pattern to match filenames (default "behavior_summary-*.csv").
+
+    Returns
+    -------
+    pd.DataFrame
+        The concatenated DataFrame containing all rows from all matched files.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no files matching the pattern are found in `folder`.
+    ValueError
+        If none of the matched files could be loaded (all empty or invalid).
+    """
+    folder = Path(folder)
+    files = sorted(folder.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"No files matching pattern {pattern!r} in folder {folder}")
+
+    dfs = []
+    for file in files:
+        try:
+            df = smart_read_csv(str(file))
+            dfs.append(df)
+        except pd.errors.EmptyDataError:
+            print(f"Skipping empty file: {file}")
+        except Exception as e:
+            print(f"Warning: failed to read {file}: {e}")
+
+    if not dfs:
+        raise ValueError(f"Found {len(files)} files matching pattern, but none could be loaded.")
+
+    combined = pd.concat(dfs, ignore_index=True)
+    return combined
+
+# Example usage:
+# combined_df = load_and_combine_csvs("/root/capsule/results", "behavior_summary-*.csv")
+# print(combined_df.shape)
+
