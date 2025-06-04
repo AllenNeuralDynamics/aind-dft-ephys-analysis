@@ -402,12 +402,12 @@ def extract_fitted_data(
 
     latent_name : str, optional
         Which derived series to return. One of:
-          - 'q_value_difference' (drop first trial)
-          - 'q_value_difference-1' (drop last trial)
-          - 'q_value_difference+1' (drop first two trials)
-          - 'total_value' (drop first trial)
-          - 'total_value-1' (drop last trial)
-          - 'total_value+1' (drop first two trials)
+          - 'deltaQ' (drop first trial)
+          - 'deltaQ-1' (drop last trial)
+          - 'deltaQ+1' (drop first two trials)
+          - 'sumQ' (drop first trial)
+          - 'sumQ-1' (drop last trial)
+          - 'sumQ+1' (drop first two trials)
           - 'right_choice_probability' (no trimming)
           - 'right_choice_probability-1' (drop last trial)
           - 'right_choice_probability+1' (drop first two trials)
@@ -429,9 +429,9 @@ def extract_fitted_data(
           - 'unchosen_q'               → Q of the unchosen option (drop first trial)
           - 'unchosen_q-1'             → Q of the unchosen option (drop last valid trial)
           - 'unchosen_q+1'             → Q of the unchosen option (drop first two valid trials)
-          - 'reward_no_reward'         → Returns 1 for rewarded trials, 0 for unrewarded trials (no trimming)
-          - 'reward_no_reward-1'       → As above, but drop last valid trial
-          - 'reward_no_reward+1'       → As above, but drop first two valid trials
+          - 'reward'         → Returns 1 for rewarded trials, 0 for unrewarded trials (no trimming)
+          - 'reward-1'       → As above, but drop last valid trial
+          - 'reward+1'       → As above, but drop first two valid trials
 
         Notes on RPE and related series:
           - We compute RPE only on valid trials (responses != 2).
@@ -494,19 +494,19 @@ def extract_fitted_data(
         suffix = '-' + suffix if latent_name.endswith('-1') else '+' + suffix
 
     # 3) Compute requested series
-    # ----- q_value_difference -----
-    if base_name == 'q_value_difference':
+    # ----- deltaQ -----
+    if base_name == 'deltaQ':
         if q0_full is None or q1_full is None:
             return None
         diff = q1_full - q0_full
-        return _trim_series(diff, 'q_value_difference', suffix)
+        return _trim_series(diff, 'deltaQ', suffix)
 
-    # ----- total_value -----
-    if base_name == 'total_value':
+    # ----- sumQ -----
+    if base_name == 'sumQ':
         if q0_full is None or q1_full is None:
             return None
         total = q1_full + q0_full
-        return _trim_series(total, 'total_value', suffix)
+        return _trim_series(total, 'sumQ', suffix)
 
     # ----- choice probabilities -----
     if base_name in ('right_choice_probability', 'left_choice_probability'):
@@ -569,8 +569,8 @@ def extract_fitted_data(
         else:
             return None
 
-    # ----- reward_no_reward -----
-    if base_name == 'reward_no_reward':
+    # ----- reward -----
+    if base_name == 'reward':
         trials = nwb_behavior_data.trials
         rewardedL = trials['rewarded_historyL'][:]
         rewardedR = trials['rewarded_historyR'][:]
@@ -676,15 +676,15 @@ def generate_behavior_summary(
 
     if latent_names is None:
         latent_names = [
-            'q_value_difference',
-            'total_value',
+            'deltaQ',
+            'sumQ',
             'right_choice_probability',
             'RPE',
             'chosen_q',
             'unchosen_q',
             'QL',
             'QR',
-            'reward_no_reward',
+            'reward',
         ]
 
     if trial_types is None:
