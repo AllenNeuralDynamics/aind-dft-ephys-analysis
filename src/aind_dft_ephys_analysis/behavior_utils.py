@@ -401,48 +401,42 @@ def extract_fitted_data(
         Required if `fitted_latent` is None.
 
     latent_name : str, optional
-        Which derived series to return. One of:
-          - 'deltaQ' (drop first trial)
-          - 'deltaQ-1' (drop last trial)
-          - 'deltaQ+1' (drop first two trials)
-          - 'sumQ' (drop first trial)
-          - 'sumQ-1' (drop last trial)
-          - 'sumQ+1' (drop first two trials)
-          - 'right_choice_probability' (no trimming)
-          - 'right_choice_probability-1' (drop last trial)
-          - 'right_choice_probability+1' (drop first two trials)
-          - 'left_choice_probability' (no trimming)
-          - 'left_choice_probability-1' (drop last trial)
-          - 'left_choice_probability+1' (drop first two trials)
-          - 'RPE'                      → reward_prediction_error (see notes)
-          - 'RPE-1'                    → RPE but drop last valid trial
-          - 'RPE+1'                    → RPE but drop first two valid trials
-          - 'QL'                       → Q for option 0 (drop first trial)
-          - 'QL-1'                     → Q for option 0 (drop last trial)
-          - 'QL+1'                     → Q for option 0 (drop first two trials)
-          - 'QR'                       → Q for option 1 (drop first trial)
-          - 'QR-1'                     → Q for option 1 (drop last trial)
-          - 'QR+1'                     → Q for option 1 (drop first two trials)
-          - 'chosen_q'                 → Q of the chosen option (drop first trial)
-          - 'chosen_q-1'               → Q of the chosen option (drop last valid trial)
-          - 'chosen_q+1'               → Q of the chosen option (drop first two valid trials)
-          - 'unchosen_q'               → Q of the unchosen option (drop first trial)
-          - 'unchosen_q-1'             → Q of the unchosen option (drop last valid trial)
-          - 'unchosen_q+1'             → Q of the unchosen option (drop first two valid trials)
-          - 'reward'         → Returns 1 for rewarded trials, 0 for unrewarded trials (no trimming)
-          - 'reward-1'       → As above, but drop last valid trial
-          - 'reward+1'       → As above, but drop first two valid trials
-
-        Notes on RPE and related series:
-          - We compute RPE only on valid trials (responses != 2).
-          - RPE (no suffix) drops the last trial from q₀ and q₁ before computing.
-          - RPE-1 will drop last valid RPE.
-          - RPE+1 will drop first two valid RPEs.
+       Which derived series to return. One of:
+          - 'deltaQ'                    → ΔQ (Q₁ − Q₀) after update
+          - 'deltaQ-1'                  → ΔQ (after update) with last trial dropped and first-trial value replaced by 0
+          - 'deltaQ+1'                  → ΔQ (after update) with first trial dropped and last-trial value replaced by 0
+          - 'sumQ'                      → ΣQ (Q₁ + Q₀) after update
+          - 'sumQ-1'                    → ΣQ (after update) with last trial dropped and first-trial value replaced by 0
+          - 'sumQ+1'                    → ΣQ (after update) with first trial dropped and last-trial value replaced by 0
+          - 'right_choice_probability'  → choice_prob[1] after update
+          - 'right_choice_probability-1'→ choice_prob[1] with last entry dropped and first entry replaced by 0
+          - 'right_choice_probability+1'→ choice_prob[1] with first entry dropped and last entry replaced by 0
+          - 'left_choice_probability'   → choice_prob[0] after update
+          - 'left_choice_probability-1' → choice_prob[0] with last entry dropped and first entry replaced by 0
+          - 'left_choice_probability+1' → choice_prob[0] with first entry dropped and last entry replaced by 0
+          - 'RPE'                       → reward_prediction_error 
+          - 'RPE-1'                     → RPE with last valid entry dropped and first valid entry replaced by 0
+          - 'RPE+1'                     → RPE with first valid entry dropped and last valid entry replaced by 0
+          - 'QL'                        → Q for option 0 after update
+          - 'QL-1'                      → Q₀ (after update) with last trial dropped and first-trial value replaced by 0
+          - 'QL+1'                      → Q₀ (after update) with first trial dropped and last-trial value replaced by 0
+          - 'QR'                        → Q for option 1 after update
+          - 'QR-1'                      → Q₁ (after update) with last trial dropped and first-trial value replaced by 0
+          - 'QR+1'                      → Q₁ (after update) with first trial dropped and last-trial value replaced by 0
+          - 'chosen_q'                  → Q of the chosen option (after update)
+          - 'chosen_q-1'                → Chosen-Q (after update) with last valid entry dropped and first valid entry replaced by 0
+          - 'chosen_q+1'                → Chosen-Q (after update) with first valid entry dropped and last valid entry replaced by 0
+          - 'unchosen_q'                → Q of the unchosen option (after update)
+          - 'unchosen_q-1'              → Unchosen-Q (after update) with last valid entry dropped and first valid entry replaced by 0
+          - 'unchosen_q+1'              → Unchosen-Q (after update) with first valid entry dropped and last valid entry replaced by 0
+          - 'reward'                    → Returns 1 for rewarded trials, 0 for unrewarded trials (no trimming)
+          - 'reward-1'                  → Reward series with last valid entry dropped and first valid entry replaced by 0
+          - 'reward+1'                  → Reward series with first valid entry dropped and last valid entry replaced by 0
 
     Returns
     -------
     np.ndarray or None
-        A 1-D float array for the requested latent series, or None if unsupported.
+        A 1-D float array for the requested latent series, or None if unsupported. All returned arrays (except None) have the same length as the number of trials.
     """
     # 1) Validate inputs and fetch if needed
     if fitted_latent is None:
@@ -480,9 +474,12 @@ def extract_fitted_data(
         if suffix == '':
             return arr[1:]
         elif suffix == '-1':
+            # drop last valid trial, the first trial is already initianized with zero
             return arr[:-1]
         elif suffix == '+1':
-            return arr[2:]
+            # drop the first trial, and append the last trial with 0
+            trimmed = arr[2:]
+            return np.concatenate(trimmed,[np.array([0], dtype=trimmed.dtype)])
         else:
             raise ValueError(f"Unknown suffix '{suffix}' for {base}")
 
@@ -532,11 +529,16 @@ def extract_fitted_data(
         if suffix == '':
             return rpe_full
         elif suffix == '-1':
-            return rpe_full[:-1]
+            # drop last valid trial, then append a 0 to the begining to keep length consistent
+            trimmed = rpe_full[:-1]
+            return np.concatenate([np.array([0], dtype=trimmed.dtype)],trimmed)
         elif suffix == '+1':
-            return rpe_full[1:]
+            # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
+            trimmed = rpe_full[1:]
+            return np.concatenate(trimmed,[np.array([0], dtype=trimmed.dtype)])
         else:
             return None
+
 
     # ----- QL and QR -----
     if base_name in ('QL', 'QR'):
@@ -563,11 +565,16 @@ def extract_fitted_data(
         if suffix == '':
             return series_full
         elif suffix == '-1':
-            return series_full[:-1]
+            # drop last valid trial, then append a 0 to the begining to keep length consistent
+            trimmed = series_full[:-1]
+            return np.concatenate([np.array([0], dtype=trimmed.dtype)],trimmed)
         elif suffix == '+1':
-            return series_full[1:]
+            # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
+            trimmed = series_full[1:]
+            return np.concatenate(trimmed,[np.array([0], dtype=trimmed.dtype)])
         else:
             return None
+
 
     # ----- reward -----
     if base_name == 'reward':
@@ -582,9 +589,13 @@ def extract_fitted_data(
         if suffix == '':
             return rewarded
         elif suffix == '-1':
-            return rewarded[:-1]
+            # drop last valid trial, then append a 0 to the begining to keep length consistent
+            trimmed = rewarded[:-1]
+            return np.concatenate([np.array([0], dtype=trimmed.dtype)],trimmed)
         elif suffix == '+1':
-            return rewarded[1:]
+            # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
+            trimmed = rewarded[1:]
+            return np.concatenate(trimmed, [np.array([0], dtype=trimmed.dtype) ])
         else:
             return None
 
