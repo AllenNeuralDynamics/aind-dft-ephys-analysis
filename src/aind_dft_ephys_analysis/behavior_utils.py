@@ -555,8 +555,8 @@ def extract_fitted_data(
         # Drop first trial from Q arrays
         q0 = q0_full[1:]
         q1 = q1_full[1:]
-        valid_mask = (responses[1:] != 2)
-        resp_valid = responses[1:][valid_mask]
+        valid_mask = (responses!= 2)
+        resp_valid = responses[valid_mask]
 
         chosen = np.where(resp_valid == 0, q0, q1)
         unchosen = np.where(resp_valid == 0, q1, q0)
