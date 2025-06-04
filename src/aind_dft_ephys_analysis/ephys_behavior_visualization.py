@@ -350,7 +350,7 @@ def plot_fraction_significant_lines_by_session(
     data : str | os.PathLike | pd.DataFrame
         CSV path or DataFrame with:
         - 'session_id', 'unit_index', 'z_score', 'time_window'
-        - one or more '<model>-<variable>_pval' columns.
+        - one or more '<model>-<variable>-pval' columns.
     variable : str | None
         Behaviour variable suffix. None → all detected.
     z_scores : list[bool] | None
@@ -497,7 +497,6 @@ def _load_summary(source: Union[str, Path, pd.DataFrame, xr.Dataset]) -> pd.Data
                 pass
     return df
 
-
 def scatter_summary_multi(
     combined_zarr: Union[str, Path, xr.Dataset, pd.DataFrame],
     compare_variables: Union[str, Sequence[str], Sequence[Sequence[str]]],
@@ -509,6 +508,10 @@ def scatter_summary_multi(
     alpha: float = 0.7,
     s: float = 2.0,
     kw_refline: Dict[str, Any] | None = None,
+    x_label: str | None = None,
+    y_label: str | None = None,
+    x_limit: Tuple[float, float] | None = None,
+    y_limit: Tuple[float, float] | None = None,
 ) -> None:
     """Draw **scatter plots** for every pair in *compare_variables*.
 
@@ -537,11 +540,14 @@ def scatter_summary_multi(
         Transparency and size for scatter points.
     kw_refline
         Extra kwargs for the y = x reference line. Default is grey dashed.
+    x_label, y_label
+        Optional labels for x and y axes. If None, column names are used.
+    x_limit, y_limit
+        Optional axis limits as tuples. If None, limits are automatically determined.
     """
 
     df = _load_summary(combined_zarr)
 
-    # Normalise compare_variables → List[List[str]]
     if isinstance(compare_variables, str):
         groups: List[List[str]] = [[compare_variables]]
     elif compare_variables and isinstance(compare_variables[0], str):
@@ -553,23 +559,19 @@ def scatter_summary_multi(
     if missing:
         raise KeyError(f"Column(s) not found in DataFrame: {missing}")
 
-    # Optional facet filters
     def _to_set(v):
         if v is None:
             return None
         return {v} if not isinstance(v, (list, tuple, set)) else set(v)
 
     tw_filter = _to_set(time_window)
-    z_filter  = _to_set(z_score)
+    z_filter = _to_set(z_score)
 
     tw_values = sorted(df["time_window"].unique()) if tw_filter is None else sorted(tw_filter)
-    z_values  = sorted(df["z_score"].unique())    if z_filter is None else sorted(z_filter)
+    z_values = sorted(df["z_score"].unique()) if z_filter is None else sorted(z_filter)
 
     kw_refline = kw_refline or {"lw": 1, "color": "gray", "ls": "--"}
 
-    print(f"[scatter] Facets: {len(tw_values)} time_window × {len(z_values)} z_score → {len(tw_values)*len(z_values)} figures")
-
-    # Iterate over facets
     for tw, zs in itertools.product(tw_values, z_values):
         subset = df[(df["time_window"] == tw) & (df["z_score"] == zs)]
         if subset.empty:
@@ -581,8 +583,8 @@ def scatter_summary_multi(
                 continue
 
             n_pairs = len(pairs)
-            n_cols  = math.ceil(math.sqrt(n_pairs))
-            n_rows  = math.ceil(n_pairs / n_cols)
+            n_cols = math.ceil(math.sqrt(n_pairs))
+            n_rows = math.ceil(n_pairs / n_cols)
             fig_w, fig_h = figsize or (4 * n_cols, 4 * n_rows)
 
             fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h), dpi=dpi)
@@ -599,18 +601,26 @@ def scatter_summary_multi(
                 lim_lo = np.nanmin(np.concatenate([x[valid], y[valid]]))
                 lim_hi = np.nanmax(np.concatenate([x[valid], y[valid]]))
                 ax.plot([lim_lo, lim_hi], [lim_lo, lim_hi], **kw_refline)
-                # ─ Ensure identical limits on both axes ─
-                ax.set_xlim(lim_lo, lim_hi)
-                ax.set_ylim(lim_lo, lim_hi)
+
+                if x_limit:
+                    ax.set_xlim(*x_limit)
+                else:
+                    ax.set_xlim(lim_lo, lim_hi)
+
+                if y_limit:
+                    ax.set_ylim(*y_limit)
+                else:
+                    ax.set_ylim(lim_lo, lim_hi)
+
                 ax.set_aspect('equal', adjustable='box')
-                ax.set_xlabel(x_col, fontsize=8)
-                ax.set_ylabel(y_col, fontsize=8)
+                ax.set_xlabel(x_label or x_col, fontsize=8)
+                ax.set_ylabel(y_label or y_col, fontsize=8)
 
             for ax in axes[n_pairs:]:
                 ax.set_visible(False)
 
             fig.suptitle(
-                f"time_window={tw}   •   z_score={zs}   •   group {g_idx+1}   (units = {len(subset)})",
+                f"time_window={tw} • z_score={zs} • group {g_idx+1} (units={len(subset)})",
                 fontsize=11
             )
             plt.tight_layout(rect=[0, 0, 1, 0.95])
@@ -621,6 +631,7 @@ def fraction_significant_multi(
     combined_zarr: Union[str, Path, xr.Dataset, pd.DataFrame],
     compare_variables: Sequence[str],
     *,
+    variable_labels: Sequence[str] | None = None,
     time_window: Union[str, Sequence[str], None] = None,
     z_score: Union[bool, Sequence[bool], None] = None,
     alpha_level: float = 0.05,
@@ -632,24 +643,29 @@ def fraction_significant_multi(
     avg_color: str = "C1",
     avg_lw: float = 3.0,
 ) -> None:
-    """Plot per‑session **fraction of significant units** across variables.
+    """Plot per-session **fraction of significant units** across variables.
 
     One figure is produced for each `(time_window, z_score)` combination. Each
-    line corresponds to a session; the thick line is the across‑session mean.
+    line corresponds to a session; the thick line is the across-session mean.
 
     Parameters
     ----------
     compare_variables
-        List of column names that **must end with `_pval`**. Fractions are
-        computed as  (# units with p <= alpha_level) / (total units)  for each
+        List of column names that **must end with `-pval`**. Fractions are
+        computed as  (# units with p <= alpha_level) / (total units) for each
         session and variable.
+    variable_labels
+        Optional custom labels for the x-axis. Must match length of compare_variables.
     """
 
     if not compare_variables:
         raise ValueError("`compare_variables` must contain at least one column name")
 
-    if any(not v.endswith("_pval") for v in compare_variables):
-        raise ValueError("All compare_variables must have the suffix '_pval'")
+    if any(not v.endswith("-pval") for v in compare_variables):
+        raise ValueError("All compare_variables must have the suffix '-pval'")
+
+    if variable_labels and len(variable_labels) != len(compare_variables):
+        raise ValueError("`variable_labels` must have the same length as `compare_variables`")
 
     df = _load_summary(combined_zarr)
 
@@ -657,7 +673,6 @@ def fraction_significant_multi(
     if missing:
         raise KeyError(f"Column(s) not in DataFrame: {missing}")
 
-    # Optional facet filters
     def _to_set(v):
         if v is None:
             return None
@@ -677,10 +692,7 @@ def fraction_significant_multi(
             continue
 
         sessions = subset["session_id"].unique()
-        if figsize is None:
-            fig_w, fig_h = (6, 4)
-        else:
-            fig_w, fig_h = figsize
+        fig_w, fig_h = figsize if figsize else (6, 4)
         fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
 
         all_fracs = []
@@ -689,10 +701,7 @@ def fraction_significant_multi(
             total_units = len(rows)
             if total_units == 0:
                 continue
-            fracs = []
-            for col in compare_variables:
-                vals = rows[col].astype(float).values
-                fracs.append(np.sum(vals <= alpha_level) / total_units)
+            fracs = [np.sum(rows[col].astype(float) <= alpha_level) / total_units for col in compare_variables]
             all_fracs.append(fracs)
             ax.plot(x, fracs, lw=session_lw, alpha=session_alpha, color=session_color)
 
@@ -701,16 +710,17 @@ def fraction_significant_multi(
             ax.plot(x, mean_frac, lw=avg_lw, color=avg_color, label="mean")
 
         ax.axhline(alpha_level, color="red", ls="--", lw=1)
-        #ax.set_xticks(x, labels=compare_variables, rotation=45, ha="right")
-        ax.set_xticks(x)
+        labels = variable_labels if variable_labels else compare_variables
+        ax.set_xticks(x, labels=labels, rotation=45, ha="right")
         ax.set_ylim(0, 1)
         ax.set_ylabel("fraction significant")
-        ax.set_xlabel("variable (_pval)")
-        ax.set_title(f"Fraction significant(time_window={tw}, z_score={zs})")
+        ax.set_xlabel("variable")
+        ax.set_title(f"Fraction significant (time_window={tw}, z_score={zs})")
         ax.grid(axis="y", linestyle=":", alpha=0.4)
         ax.legend(loc="upper right")
         plt.tight_layout()
         plt.show()
+
 
 
 def fit_and_plot_by_session(
