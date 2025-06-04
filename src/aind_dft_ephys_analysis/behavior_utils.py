@@ -512,6 +512,7 @@ def extract_fitted_data(
     if base_name in ('right_choice_probability', 'left_choice_probability'):
         cp = np.array(FL['choice_prob'][1]) if base_name == 'right_choice_probability' else np.array(FL['choice_prob'][0])
         return _trim_series(cp, 'right_choice_probability or left_choice_probability', suffix)
+    
     # ----- Reward Prediction Error (RPE) -----
     if base_name == 'RPE':
         trials = nwb_behavior_data.trials
@@ -533,7 +534,7 @@ def extract_fitted_data(
         elif suffix == '-1':
             return rpe_full[:-1]
         elif suffix == '+1':
-            return rpe_full[2:]
+            return rpe_full[1:]
         else:
             return None
 
@@ -549,14 +550,24 @@ def extract_fitted_data(
         rewardedR = trials['rewarded_historyR'][:]
         responses = trials['animal_response'][:]
 
+        # Drop first trial from Q arrays
+        q0 = q0_full[1:]
+        q1 = q1_full[1:]
         valid_mask = (responses[1:] != 2)
         resp_valid = responses[1:][valid_mask]
 
-        chosen = np.where(resp_valid == 0, q0_full, q1_full)
-        unchosen = np.where(resp_valid == 0, q1_full, q0_full)
+        chosen = np.where(resp_valid == 0, q0, q1)
+        unchosen = np.where(resp_valid == 0, q1, q0)
         series_full = chosen if base_name == 'chosen_q' else unchosen
 
-        return _trim_series(series_full, base_name, suffix)
+        if suffix == '':
+            return series_full
+        elif suffix == '-1':
+            return series_full[:-1]
+        elif suffix == '+1':
+            return series_full[1:]
+        else:
+            return None
 
     # ----- reward_no_reward -----
     if base_name == 'reward_no_reward':
@@ -568,7 +579,14 @@ def extract_fitted_data(
         valid_mask = (responses != 2)
         rewarded = (rewardedL | rewardedR).astype(int)[valid_mask]
 
-        return _trim_series(rewarded, base_name, suffix)
+        if suffix == '':
+            return rewarded
+        elif suffix == '-1':
+            return rewarded[:-1]
+        elif suffix == '+1':
+            return rewarded[1:]
+        else:
+            return None
 
     # Unsupported latent_name
     return None
