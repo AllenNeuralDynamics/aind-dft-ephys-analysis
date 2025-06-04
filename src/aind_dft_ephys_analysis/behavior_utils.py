@@ -479,7 +479,7 @@ def extract_fitted_data(
         elif suffix == '+1':
             # drop the first trial, and append the last trial with 0
             trimmed = arr[2:]
-            return np.concatenate(trimmed,[np.array([0], dtype=trimmed.dtype)])
+            return trimmed + [0]
         else:
             raise ValueError(f"Unknown suffix '{suffix}' for {base}")
 
@@ -531,11 +531,11 @@ def extract_fitted_data(
         elif suffix == '-1':
             # drop last valid trial, then append a 0 to the begining to keep length consistent
             trimmed = rpe_full[:-1]
-            return np.concatenate([np.array([0], dtype=trimmed.dtype)],trimmed)
+            return [0] + trimmed
         elif suffix == '+1':
             # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
             trimmed = rpe_full[1:]
-            return np.concatenate(trimmed,[np.array([0], dtype=trimmed.dtype)])
+            return trimmed + [0]
         else:
             return None
 
@@ -567,11 +567,11 @@ def extract_fitted_data(
         elif suffix == '-1':
             # drop last valid trial, then append a 0 to the begining to keep length consistent
             trimmed = series_full[:-1]
-            return np.concatenate([np.array([0], dtype=trimmed.dtype)],trimmed)
+            return [0] + trimmed
         elif suffix == '+1':
             # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
             trimmed = series_full[1:]
-            return np.concatenate(trimmed,[np.array([0], dtype=trimmed.dtype)])
+            return trimmed + [0]
         else:
             return None
 
@@ -591,11 +591,11 @@ def extract_fitted_data(
         elif suffix == '-1':
             # drop last valid trial, then append a 0 to the begining to keep length consistent
             trimmed = rewarded[:-1]
-            return np.concatenate([np.array([0], dtype=trimmed.dtype)],trimmed)
+            return [0] + trimmed
         elif suffix == '+1':
             # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
             trimmed = rewarded[1:]
-            return np.concatenate(trimmed, [np.array([0], dtype=trimmed.dtype) ])
+            return trimmed + [0]
         else:
             return None
 
