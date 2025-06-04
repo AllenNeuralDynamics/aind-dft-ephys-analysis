@@ -460,9 +460,9 @@ def extract_fitted_data(
         rewardedR = trials['rewarded_historyR'][:]
         responses = trials['animal_response'][:]
 
-        # drop initial trial
-        q0 = q0[1:]
-        q1 = q1[1:]
+        # drop the last trial
+        q0 = q0[:-1]
+        q1 = q1[:-1]
 
         valid = responses != 2
         rewarded = (rewardedL | rewardedR).astype(int)[valid]
