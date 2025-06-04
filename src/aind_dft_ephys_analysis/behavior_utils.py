@@ -382,10 +382,9 @@ def extract_fitted_data(
     Parameters
     ----------
     nwb_behavior_data : Any
-        An open NWB object (from NWBHDF5IO.read() or NWBZarrIO.read()).
-        Must contain `.trials` with columns:
+        An open NWB object (from NWBHDF5IO.read() or NWBZarrIO.read()). Must contain `.trials` with columns:
           - 'rewarded_historyL', 'rewarded_historyR', 'animal_response'
-        (needed only for latent_name='RPE', 'chosen_q', 'unchosen_q').
+        (needed for RPE and related series).
 
     fitted_latent : dict, optional
         If provided, this dict should have come from:
@@ -403,17 +402,43 @@ def extract_fitted_data(
 
     latent_name : str, optional
         Which derived series to return. One of:
-          - 'q_value_difference'       → Q₁ − Q₀, skipping trial 0
-          - 'total_value'              → Q₁ + Q₀, skipping trial 0
-          - 'right_choice_probability' → choice_prob[1] (all trials)
-          - 'left_choice_probability'  → choice_prob[0] (all trials)
-          - 'RPE'                      → reward_prediction_error on valid trials
-          - 'QL'                       → Q for option 0 (all trials)
-          - 'QR'                       → Q for option 1 (all trials)
-          - 'chosen_q'                 → Q of the chosen option on valid trials
-          - 'unchosen_q'               → Q of the unchosen option on valid trials
-          - 'reward_no_reward'         → Returns 1 for rewarded trials, 0 for unrewarded trials
- 
+          - 'q_value_difference' (drop first trial)
+          - 'q_value_difference-1' (drop last trial)
+          - 'q_value_difference+1' (drop first two trials)
+          - 'total_value' (drop first trial)
+          - 'total_value-1' (drop last trial)
+          - 'total_value+1' (drop first two trials)
+          - 'right_choice_probability' (no trimming)
+          - 'right_choice_probability-1' (drop last trial)
+          - 'right_choice_probability+1' (drop first two trials)
+          - 'left_choice_probability' (no trimming)
+          - 'left_choice_probability-1' (drop last trial)
+          - 'left_choice_probability+1' (drop first two trials)
+          - 'RPE'                      → reward_prediction_error (see notes)
+          - 'RPE-1'                    → RPE but drop last valid trial
+          - 'RPE+1'                    → RPE but drop first two valid trials
+          - 'QL'                       → Q for option 0 (drop first trial)
+          - 'QL-1'                     → Q for option 0 (drop last trial)
+          - 'QL+1'                     → Q for option 0 (drop first two trials)
+          - 'QR'                       → Q for option 1 (drop first trial)
+          - 'QR-1'                     → Q for option 1 (drop last trial)
+          - 'QR+1'                     → Q for option 1 (drop first two trials)
+          - 'chosen_q'                 → Q of the chosen option (drop first trial)
+          - 'chosen_q-1'               → Q of the chosen option (drop last valid trial)
+          - 'chosen_q+1'               → Q of the chosen option (drop first two valid trials)
+          - 'unchosen_q'               → Q of the unchosen option (drop first trial)
+          - 'unchosen_q-1'             → Q of the unchosen option (drop last valid trial)
+          - 'unchosen_q+1'             → Q of the unchosen option (drop first two valid trials)
+          - 'reward_no_reward'         → Returns 1 for rewarded trials, 0 for unrewarded trials (no trimming)
+          - 'reward_no_reward-1'       → As above, but drop last valid trial
+          - 'reward_no_reward+1'       → As above, but drop first two valid trials
+
+        Notes on RPE and related series:
+          - We compute RPE only on valid trials (responses != 2).
+          - RPE (no suffix) drops the last trial from q₀ and q₁ before computing.
+          - RPE-1 will drop last valid RPE.
+          - RPE+1 will drop first two valid RPEs.
+
     Returns
     -------
     np.ndarray or None
@@ -437,89 +462,113 @@ def extract_fitted_data(
 
     FL = fit['fitted_latent_variables']
 
+    # Extract Q-values arrays if available
     if 'q_value' in FL:
-        q0 = np.array(FL['q_value'][0])
-        q1 = np.array(FL['q_value'][1])
+        q0_full = np.array(FL['q_value'][0])
+        q1_full = np.array(FL['q_value'][1])
+    else:
+        q0_full = q1_full = None
+
+    # Helper: apply trimming based on suffix
+    def _trim_series(arr: np.ndarray, base: str, suffix: str) -> np.ndarray:
+        """
+        Trim `arr` according to suffix:
+          - ''   : drop first element (base behavior for QL/QR, etc.)
+          - '-1' : drop last element
+          - '+1' : drop first two elements
+        """
+        if suffix == '':
+            return arr[1:]
+        elif suffix == '-1':
+            return arr[:-1]
+        elif suffix == '+1':
+            return arr[2:]
+        else:
+            raise ValueError(f"Unknown suffix '{suffix}' for {base}")
+
+    # Parse suffix if present
+    base_name = latent_name
+    suffix = ''
+    if latent_name is not None and (latent_name.endswith('-1') or latent_name.endswith('+1')):
+        base_name, suffix = latent_name.rsplit('-', 1) if latent_name.endswith('-1') else latent_name.rsplit('+', 1)
+        suffix = '-' + suffix if latent_name.endswith('-1') else '+' + suffix
 
     # 3) Compute requested series
-    if latent_name == 'q_value_difference':
-        return (q1 - q0)[1:]
+    # ----- q_value_difference -----
+    if base_name == 'q_value_difference':
+        if q0_full is None or q1_full is None:
+            return None
+        diff = q1_full - q0_full
+        return _trim_series(diff, 'q_value_difference', suffix)
 
-    if latent_name == 'total_value':
-        return (q1 + q0)[1:]
+    # ----- total_value -----
+    if base_name == 'total_value':
+        if q0_full is None or q1_full is None:
+            return None
+        total = q1_full + q0_full
+        return _trim_series(total, 'total_value', suffix)
 
-    if latent_name == 'right_choice_probability':
-        return np.array(FL['choice_prob'][1])
-
-    if latent_name == 'left_choice_probability':
-        return np.array(FL['choice_prob'][0])
-
-    if latent_name == 'RPE':
+    # ----- choice probabilities -----
+    if base_name in ('right_choice_probability', 'left_choice_probability'):
+        cp = np.array(FL['choice_prob'][1]) if base_name == 'right_choice_probability' else np.array(FL['choice_prob'][0])
+        return _trim_series(cp, 'right_choice_probability or left_choice_probability', suffix)
+    # ----- Reward Prediction Error (RPE) -----
+    if base_name == 'RPE':
         trials = nwb_behavior_data.trials
         rewardedL = trials['rewarded_historyL'][:]
         rewardedR = trials['rewarded_historyR'][:]
         responses = trials['animal_response'][:]
 
-        # drop the last trial
-        q0 = q0[:-1]
-        q1 = q1[:-1]
-
+        # Drop last trial from Q arrays before computing
+        q0 = q0_full[:-1]
+        q1 = q1_full[:-1]
         valid = responses != 2
         rewarded = (rewardedL | rewardedR).astype(int)[valid]
-        resp     = responses[valid]
+        resp_valid     = responses[valid]
 
-        # reward prediction error = reward − Q(choice)
-        return np.where(resp == 0, rewarded - q0, rewarded - q1)
+        rpe_full = np.where(resp_valid == 0, rewarded - q0, rewarded - q1)
 
-    if latent_name == 'QL':
-        # drop initial trial
-        return q0[1:]
+        if suffix == '':
+            return rpe_full
+        elif suffix == '-1':
+            return rpe_full[:-1]
+        elif suffix == '+1':
+            return rpe_full[2:]
+        else:
+            return None
 
-    if latent_name == 'QR':
-        # drop initial trial
-        return q1[1:]
+    # ----- QL and QR -----
+    if base_name in ('QL', 'QR'):
+        arr_full = q0_full if base_name == 'QL' else q1_full
+        return _trim_series(arr_full, base_name, suffix)
 
-    if latent_name == 'chosen_q':
+    # ----- chosen_q and unchosen_q -----
+    if base_name in ('chosen_q', 'unchosen_q'):
         trials = nwb_behavior_data.trials
         rewardedL = trials['rewarded_historyL'][:]
         rewardedR = trials['rewarded_historyR'][:]
         responses = trials['animal_response'][:]
 
-        # drop initial trial
-        q0 = q0[1:]
-        q1 = q1[1:]
+        valid_mask = (responses[1:] != 2)
+        resp_valid = responses[1:][valid_mask]
 
-        valid = responses != 2
-        rewarded = (rewardedL | rewardedR).astype(int)[valid]
-        resp     = responses[valid]
+        chosen = np.where(resp_valid == 0, q0_full, q1_full)
+        unchosen = np.where(resp_valid == 0, q1_full, q0_full)
+        series_full = chosen if base_name == 'chosen_q' else unchosen
 
-        return np.where(resp == 0, q0, q1)
+        return _trim_series(series_full, base_name, suffix)
 
-    if latent_name == 'unchosen_q':
+    # ----- reward_no_reward -----
+    if base_name == 'reward_no_reward':
         trials = nwb_behavior_data.trials
         rewardedL = trials['rewarded_historyL'][:]
         rewardedR = trials['rewarded_historyR'][:]
         responses = trials['animal_response'][:]
 
-        # drop initial trial
-        q0 = q0[1:]
-        q1 = q1[1:]
+        valid_mask = (responses != 2)
+        rewarded = (rewardedL | rewardedR).astype(int)[valid_mask]
 
-        valid = responses != 2
-        rewarded = (rewardedL | rewardedR).astype(int)[valid]
-        resp     = responses[valid]
-
-        return np.where(resp == 0, q1, q0)
-
-    if latent_name == 'reward_no_reward':
-        trials = nwb_behavior_data.trials
-        rewardedL = trials['rewarded_historyL'][:]
-        rewardedR = trials['rewarded_historyR'][:]
-        responses = trials['animal_response'][:]
-
-        valid = responses != 2
-        rewarded = (rewardedL | rewardedR).astype(int)[valid]   # 1 = rewarded, 0 = no reward
-        return rewarded
+        return _trim_series(rewarded, base_name, suffix)
 
     # Unsupported latent_name
     return None
