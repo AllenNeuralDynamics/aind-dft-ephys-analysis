@@ -688,15 +688,37 @@ def generate_behavior_summary(
     if latent_names is None:
         latent_names = [
             'deltaQ',
+            'deltaQ-1',
+            'deltaQ+1',
             'sumQ',
+            'sumQ-1',
+            'sumQ+1',
             'right_choice_probability',
+            'right_choice_probability-1',
+            'right_choice_probability+1',
+            'left_choice_probability',
+            'left_choice_probability-1',
+            'left_choice_probability+1',
             'RPE',
-            'chosen_q',
-            'unchosen_q',
+            'RPE-1',
+            'RPE+1',
             'QL',
+            'QL-1',
+            'QL+1',
             'QR',
+            'QR-1',
+            'QR+1',
+            'chosen_q',
+            'chosen_q-1',
+            'chosen_q+1',
+            'unchosen_q',
+            'unchosen_q-1',
+            'unchosen_q+1',
             'reward',
+            'reward-1',
+            'reward+1',
         ]
+
 
     if trial_types is None:
         trial_types = [
