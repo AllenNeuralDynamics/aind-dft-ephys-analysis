@@ -1220,7 +1220,7 @@ def correlation_results_summary(
     # 1) Metadata scaffold
     # ───────────────────────────────────────────────────────────────
     if meta_cols is None:
-        meta_cols = ["session_id", "unit_index", "time_window", "z_score"]
+        meta_cols = ["session_id", "unit_index", "time_window", "z_score","ccf_location","brain_region"]
 
     meta_df = df_raw[meta_cols].copy()
     meta_df["fit_metadata"] = [{} for _ in range(len(meta_df))]
@@ -1339,7 +1339,7 @@ def correlation_results_summary_combined(
           ``<save_folder>/<save_name>.zarr`` in *consolidated* mode.
     meta_cols : list[str] | None
         Metadata columns to preserve verbatim.  If *None* the default set
-        ``['session_id', 'unit_index', 'time_window', 'z_score']`` is used.
+        ``['session_id', 'unit_index', 'time_window', 'z_score','ccf_location','brain_region']`` is used.
 
     ─────────────────────────────────────────────────────────────────────
     RETURNS
