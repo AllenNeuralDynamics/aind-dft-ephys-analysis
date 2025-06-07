@@ -423,12 +423,12 @@ def extract_fitted_data(
           - 'QR'                        → Q for option 1 after update
           - 'QR-1'                      → Q₁ (after update) with last trial dropped and first-trial value replaced by 0
           - 'QR+1'                      → Q₁ (after update) with first trial dropped and last-trial value replaced by 0
-          - 'chosen_q'                  → Q of the chosen option (after choice)
-          - 'chosen_q-1'                → Chosen-Q with last valid entry dropped and first valid entry replaced by 0
-          - 'chosen_q+1'                → Chosen-Q with first valid entry dropped and last valid entry replaced by 0
-          - 'unchosen_q'                → Q of the unchosen option (after update)
-          - 'unchosen_q-1'              → Unchosen-Q (after update) with last valid entry dropped and first valid entry replaced by 0
-          - 'unchosen_q+1'              → Unchosen-Q (after update) with first valid entry dropped and last valid entry replaced by 0
+          - 'chosenQ'                  → Q of the chosen option (after choice)
+          - 'chosenQ-1'                → Chosen-Q with last valid entry dropped and first valid entry replaced by 0
+          - 'chosenQ+1'                → Chosen-Q with first valid entry dropped and last valid entry replaced by 0
+          - 'unchosenQ'                → Q of the unchosen option (after update)
+          - 'unchosenQ-1'              → Unchosen-Q (after update) with last valid entry dropped and first valid entry replaced by 0
+          - 'unchosenQ+1'              → Unchosen-Q (after update) with first valid entry dropped and last valid entry replaced by 0
           - 'reward'                    → Returns 1 for rewarded trials, 0 for unrewarded trials (no trimming)
           - 'reward-1'                  → Reward series with last valid entry dropped and first valid entry replaced by 0
           - 'reward+1'                  → Reward series with first valid entry dropped and last valid entry replaced by 0
@@ -545,8 +545,8 @@ def extract_fitted_data(
         arr_full = q0_full if base_name == 'QL' else q1_full
         return _trim_series(arr_full, base_name, suffix)
 
-    # ----- chosen_q and unchosen_q -----
-    if base_name in ('chosen_q', 'unchosen_q'):
+    # ----- chosenQ and unchosenQ -----
+    if base_name in ('chosenQ', 'unchosenQ'):
         trials = nwb_behavior_data.trials
         rewardedL = trials['rewarded_historyL'][:]
         rewardedR = trials['rewarded_historyR'][:]
@@ -560,7 +560,7 @@ def extract_fitted_data(
 
         chosen = np.where(resp_valid == 0, q0, q1)
         unchosen = np.where(resp_valid == 0, q1, q0)
-        series_full = chosen if base_name == 'chosen_q' else unchosen
+        series_full = chosen if base_name == 'chosenQ' else unchosen
 
         if suffix == '':
             return series_full
@@ -708,12 +708,12 @@ def generate_behavior_summary(
             'QR',
             'QR-1',
             'QR+1',
-            'chosen_q',
-            'chosen_q-1',
-            'chosen_q+1',
-            'unchosen_q',
-            'unchosen_q-1',
-            'unchosen_q+1',
+            'chosenQ',
+            'chosenQ-1',
+            'chosenQ+1',
+            'unchosenQ',
+            'unchosenQ-1',
+            'unchosenQ+1',
             'reward',
             'reward-1',
             'reward+1',
