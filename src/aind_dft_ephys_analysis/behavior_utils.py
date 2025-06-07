@@ -432,7 +432,9 @@ def extract_fitted_data(
           - 'reward'                    → Returns 1 for rewarded trials, 0 for unrewarded trials (no trimming)
           - 'reward-1'                  → Reward series with last valid entry dropped and first valid entry replaced by 0
           - 'reward+1'                  → Reward series with first valid entry dropped and last valid entry replaced by 0
-
+          - 'choice'                   → Animal's choice per trial (0=left, 1=right) with no trimming, excludes no-response trials
+          - 'choice-1'                 → Choice series with last valid entry dropped and first entry replaced by 0 (keep length constant)
+          - 'choice+1'                 → Choice series with first valid entry dropped and last entry replaced by 0 (keep length constant)   
     Returns
     -------
     np.ndarray or None
@@ -599,6 +601,30 @@ def extract_fitted_data(
         else:
             return None
 
+    # ----- choice -----
+    if base_name == 'choice':
+        # pull the raw choice vector (0=left, 1=right, 2=no‐response)
+        all_resp = nwb_behavior_data.trials['animal_response'][:]
+
+        # exclude no‐response trials
+        valid_mask = all_resp != 2
+        resp = all_resp[valid_mask]
+
+        # now apply suffix‐based trimming
+        if suffix == '':
+            return resp
+        elif suffix == '-1':
+            # drop last valid trial, prepend a 0 to keep length consistent
+            trimmed = resp[:-1]
+            return np.insert(trimmed, 0, 0)
+        elif suffix == '+1':
+            # drop first valid trial, append a 0
+            trimmed = resp[1:]
+            return np.append(trimmed, 0)
+        else:
+            return None
+
+
     # Unsupported latent_name
     return None
 
@@ -717,6 +743,9 @@ def generate_behavior_summary(
             'reward',
             'reward-1',
             'reward+1',
+            'choice',
+            'choice-1',
+            'choice+1',
         ]
 
 
