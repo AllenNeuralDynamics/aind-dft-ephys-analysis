@@ -423,9 +423,9 @@ def extract_fitted_data(
           - 'QR'                        → Q for option 1 after update
           - 'QR-1'                      → Q₁ (after update) with last trial dropped and first-trial value replaced by 0
           - 'QR+1'                      → Q₁ (after update) with first trial dropped and last-trial value replaced by 0
-          - 'chosen_q'                  → Q of the chosen option (after update)
-          - 'chosen_q-1'                → Chosen-Q (after update) with last valid entry dropped and first valid entry replaced by 0
-          - 'chosen_q+1'                → Chosen-Q (after update) with first valid entry dropped and last valid entry replaced by 0
+          - 'chosen_q'                  → Q of the chosen option (after choice)
+          - 'chosen_q-1'                → Chosen-Q with last valid entry dropped and first valid entry replaced by 0
+          - 'chosen_q+1'                → Chosen-Q with first valid entry dropped and last valid entry replaced by 0
           - 'unchosen_q'                → Q of the unchosen option (after update)
           - 'unchosen_q-1'              → Unchosen-Q (after update) with last valid entry dropped and first valid entry replaced by 0
           - 'unchosen_q+1'              → Unchosen-Q (after update) with first valid entry dropped and last valid entry replaced by 0
@@ -553,8 +553,8 @@ def extract_fitted_data(
         responses = trials['animal_response'][:]
 
         # Drop first trial from Q arrays
-        q0 = q0_full[1:]
-        q1 = q1_full[1:]
+        q0 = q0_full[:-1]
+        q1 = q1_full[:-1]
         valid_mask = (responses!= 2)
         resp_valid = responses[valid_mask]
 
