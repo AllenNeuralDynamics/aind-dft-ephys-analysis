@@ -410,224 +410,227 @@ def extract_fitted_data(
     np.ndarray or None
         A 1-D float array for the requested latent series, or None if unsupported. All returned arrays (except None) have the same length as the number of trials.
     """
-    # 1) Validate inputs and fetch if needed
-    if fitted_latent is None:
-        if session_name is None or model_alias is None or latent_name is None:
-            raise ValueError(
-                "If fitted_latent is not provided, session_name, model_alias, and latent_name are required"
-            )
-        fit = get_fitted_latent(session_name, model_alias)
-    else:
-        if latent_name is None:
-            raise ValueError("latent_name must be provided when using fitted_latent directly")
-        fit = fitted_latent
+    try:
+        # 1) Validate inputs and fetch if needed
+        if fitted_latent is None:
+            if session_name is None or model_alias is None or latent_name is None:
+                raise ValueError(
+                    "If fitted_latent is not provided, session_name, model_alias, and latent_name are required"
+                )
+            fit = get_fitted_latent(session_name, model_alias)
+        else:
+            if latent_name is None:
+                raise ValueError("latent_name must be provided when using fitted_latent directly")
+            fit = fitted_latent
 
-    # 2) Ensure fetched fit is valid
-    if not fit or 'fitted_latent_variables' not in fit:
+        # 2) Ensure fetched fit is valid
+        if not fit or 'fitted_latent_variables' not in fit:
+            return None
+
+        FL = fit['fitted_latent_variables']
+
+        # Extract Q-values arrays if available
+        if 'q_value' in FL:
+            q0_full = np.array(FL['q_value'][0])
+            q1_full = np.array(FL['q_value'][1])
+        else:
+            q0_full = q1_full = None
+
+        # Helper: apply trimming based on suffix
+        def _trim_series(arr: np.ndarray, base: str, suffix: str) -> np.ndarray:
+            """
+            Trim `arr` according to suffix:
+            - ''   : drop first element (base behavior for QL/QR, etc.)
+            - '-1' : drop last element
+            - '+1' : drop first two elements
+            """
+            if suffix == '':
+                return arr[1:]
+            elif suffix == '-1':
+                # drop last valid trial, the first trial is already initianized with zero or other value
+                return arr[:-1]
+            elif suffix == '+1':
+                # drop the first trial, and append the last trial with 0
+                trimmed = arr[2:]
+                return np.append(trimmed, 0)
+            else:
+                raise ValueError(f"Unknown suffix '{suffix}' for {base}")
+
+        # Parse suffix if present
+        base_name = latent_name
+        suffix = ''
+        if latent_name is not None and (latent_name.endswith('-1') or latent_name.endswith('+1')):
+            base_name, suffix = latent_name.rsplit('-', 1) if latent_name.endswith('-1') else latent_name.rsplit('+', 1)
+            suffix = '-' + suffix if latent_name.endswith('-1') else '+' + suffix
+
+        # 3) Compute requested series
+        # ----- value for ForagingCompareThreshold -----
+        if base_name == 'value' and model_alias=='ForagingCompareThreshold':
+            value=FL['value']
+            return _trim_series(value, 'value', suffix)
+        # ----- deltaQ -----
+        if base_name == 'deltaQ':
+            if q0_full is None or q1_full is None:
+                return None
+            diff = q1_full - q0_full
+            return _trim_series(diff, 'deltaQ', suffix)
+
+        # ----- sumQ -----
+        if base_name == 'sumQ':
+            if q0_full is None or q1_full is None:
+                return None
+            total = q1_full + q0_full
+            return _trim_series(total, 'sumQ', suffix)
+
+        # ----- choice probabilities -----
+        if base_name in ('right_choice_probability', 'left_choice_probability'):
+            cp = np.array(FL['choice_prob'][1]) if base_name == 'right_choice_probability' else np.array(FL['choice_prob'][0])
+            return _trim_series(cp, 'right_choice_probability or left_choice_probability', suffix)
+        
+        # ----- Reward Prediction Error (RPE) -----
+        if base_name == 'RPE' and model_alias=='ForagingCompareThreshold':
+            trials = nwb_behavior_data.trials
+            rewardedL = trials['rewarded_historyL'][:]
+            rewardedR = trials['rewarded_historyR'][:]
+            responses = trials['animal_response'][:]
+
+            # Drop last trial from Q arrays before computing
+            value = FL['value'][:-1]
+            valid = responses != 2
+            rewarded = (rewardedL | rewardedR).astype(int)[valid]
+
+            rpe_full=rewarded-value
+
+            if suffix == '':
+                return rpe_full
+            elif suffix == '-1':
+                # drop last valid trial, then append a 0 to the begining to keep length consistent
+                trimmed = rpe_full[:-1]
+                return np.insert(trimmed, 0, 0)
+            elif suffix == '+1':
+                # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
+                trimmed = rpe_full[1:]
+                return np.append(trimmed, 0)
+            else:
+                return None
+
+        if base_name == 'RPE' and model_alias!='ForagingCompareThreshold':
+            trials = nwb_behavior_data.trials
+            rewardedL = trials['rewarded_historyL'][:]
+            rewardedR = trials['rewarded_historyR'][:]
+            responses = trials['animal_response'][:]
+
+            # Drop last trial from Q arrays before computing
+            q0 = q0_full[:-1]
+            q1 = q1_full[:-1]
+            valid = responses != 2
+            rewarded = (rewardedL | rewardedR).astype(int)[valid]
+            resp_valid     = responses[valid]
+
+            rpe_full = np.where(resp_valid == 0, rewarded - q0, rewarded - q1)
+
+            if suffix == '':
+                return rpe_full
+            elif suffix == '-1':
+                # drop last valid trial, then append a 0 to the begining to keep length consistent
+                trimmed = rpe_full[:-1]
+                return np.insert(trimmed, 0, 0)
+            elif suffix == '+1':
+                # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
+                trimmed = rpe_full[1:]
+                return np.append(trimmed, 0)
+            else:
+                return None
+
+
+        # ----- QL and QR -----
+        if base_name in ('QL', 'QR'):
+            arr_full = q0_full if base_name == 'QL' else q1_full
+            return _trim_series(arr_full, base_name, suffix)
+
+        # ----- chosenQ and unchosenQ -----
+        if base_name in ('chosenQ', 'unchosenQ'):
+            trials = nwb_behavior_data.trials
+            rewardedL = trials['rewarded_historyL'][:]
+            rewardedR = trials['rewarded_historyR'][:]
+            responses = trials['animal_response'][:]
+
+            # Drop first trial from Q arrays
+            q0 = q0_full[:-1]
+            q1 = q1_full[:-1]
+            valid_mask = (responses!= 2)
+            resp_valid = responses[valid_mask]
+
+            chosen = np.where(resp_valid == 0, q0, q1)
+            unchosen = np.where(resp_valid == 0, q1, q0)
+            series_full = chosen if base_name == 'chosenQ' else unchosen
+
+            if suffix == '':
+                return series_full
+            elif suffix == '-1':
+                # drop last valid trial, then append a 0 to the begining to keep length consistent
+                trimmed = series_full[:-1]
+                return np.insert(trimmed, 0, 0)
+            elif suffix == '+1':
+                # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
+                trimmed = series_full[1:]
+                return np.append(trimmed, 0)
+            else:
+                return None
+
+
+        # ----- reward -----
+        if base_name == 'reward':
+            trials = nwb_behavior_data.trials
+            rewardedL = trials['rewarded_historyL'][:]
+            rewardedR = trials['rewarded_historyR'][:]
+            responses = trials['animal_response'][:]
+
+            valid_mask = (responses != 2)
+            rewarded = (rewardedL | rewardedR).astype(int)[valid_mask]
+
+            if suffix == '':
+                return rewarded
+            elif suffix == '-1':
+                # drop last valid trial, then append a 0 to the begining to keep length consistent
+                trimmed = rewarded[:-1]
+                return np.insert(trimmed, 0, 0)
+            elif suffix == '+1':
+                # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
+                trimmed = rewarded[1:]
+                return np.append(trimmed, 0)
+            else:
+                return None
+
+        # ----- choice -----
+        if base_name == 'choice':
+            # pull the raw choice vector (0=left, 1=right, 2=no‐response)
+            all_resp = nwb_behavior_data.trials['animal_response'][:]
+
+            # exclude no‐response trials
+            valid_mask = all_resp != 2
+            resp = all_resp[valid_mask]
+
+            # now apply suffix‐based trimming
+            if suffix == '':
+                return resp
+            elif suffix == '-1':
+                # drop last valid trial, prepend a 0 to keep length consistent
+                trimmed = resp[:-1]
+                return np.insert(trimmed, 0, 0)
+            elif suffix == '+1':
+                # drop first valid trial, append a 0
+                trimmed = resp[1:]
+                return np.append(trimmed, 0)
+            else:
+                return None
+
+
+        # Unsupported latent_name
         return None
-
-    FL = fit['fitted_latent_variables']
-
-    # Extract Q-values arrays if available
-    if 'q_value' in FL:
-        q0_full = np.array(FL['q_value'][0])
-        q1_full = np.array(FL['q_value'][1])
-    else:
-        q0_full = q1_full = None
-
-    # Helper: apply trimming based on suffix
-    def _trim_series(arr: np.ndarray, base: str, suffix: str) -> np.ndarray:
-        """
-        Trim `arr` according to suffix:
-          - ''   : drop first element (base behavior for QL/QR, etc.)
-          - '-1' : drop last element
-          - '+1' : drop first two elements
-        """
-        if suffix == '':
-            return arr[1:]
-        elif suffix == '-1':
-            # drop last valid trial, the first trial is already initianized with zero or other value
-            return arr[:-1]
-        elif suffix == '+1':
-            # drop the first trial, and append the last trial with 0
-            trimmed = arr[2:]
-            return np.append(trimmed, 0)
-        else:
-            raise ValueError(f"Unknown suffix '{suffix}' for {base}")
-
-    # Parse suffix if present
-    base_name = latent_name
-    suffix = ''
-    if latent_name is not None and (latent_name.endswith('-1') or latent_name.endswith('+1')):
-        base_name, suffix = latent_name.rsplit('-', 1) if latent_name.endswith('-1') else latent_name.rsplit('+', 1)
-        suffix = '-' + suffix if latent_name.endswith('-1') else '+' + suffix
-
-    # 3) Compute requested series
-    # ----- value for ForagingCompareThreshold -----
-    if base_name == 'value' and model_alias=='ForagingCompareThreshold':
-        value=FL['value']
-        return _trim_series(value, 'value', suffix)
-    # ----- deltaQ -----
-    if base_name == 'deltaQ':
-        if q0_full is None or q1_full is None:
-            return None
-        diff = q1_full - q0_full
-        return _trim_series(diff, 'deltaQ', suffix)
-
-    # ----- sumQ -----
-    if base_name == 'sumQ':
-        if q0_full is None or q1_full is None:
-            return None
-        total = q1_full + q0_full
-        return _trim_series(total, 'sumQ', suffix)
-
-    # ----- choice probabilities -----
-    if base_name in ('right_choice_probability', 'left_choice_probability'):
-        cp = np.array(FL['choice_prob'][1]) if base_name == 'right_choice_probability' else np.array(FL['choice_prob'][0])
-        return _trim_series(cp, 'right_choice_probability or left_choice_probability', suffix)
-    
-    # ----- Reward Prediction Error (RPE) -----
-    if base_name == 'RPE' and model_alias=='ForagingCompareThreshold':
-        trials = nwb_behavior_data.trials
-        rewardedL = trials['rewarded_historyL'][:]
-        rewardedR = trials['rewarded_historyR'][:]
-        responses = trials['animal_response'][:]
-
-        # Drop last trial from Q arrays before computing
-        value = FL['value'][:-1]
-        valid = responses != 2
-        rewarded = (rewardedL | rewardedR).astype(int)[valid]
-
-        rpe_full=rewarded-value
-
-        if suffix == '':
-            return rpe_full
-        elif suffix == '-1':
-            # drop last valid trial, then append a 0 to the begining to keep length consistent
-            trimmed = rpe_full[:-1]
-            return np.insert(trimmed, 0, 0)
-        elif suffix == '+1':
-            # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
-            trimmed = rpe_full[1:]
-            return np.append(trimmed, 0)
-        else:
-            return None
-
-    if base_name == 'RPE' and model_alias!='ForagingCompareThreshold':
-        trials = nwb_behavior_data.trials
-        rewardedL = trials['rewarded_historyL'][:]
-        rewardedR = trials['rewarded_historyR'][:]
-        responses = trials['animal_response'][:]
-
-        # Drop last trial from Q arrays before computing
-        q0 = q0_full[:-1]
-        q1 = q1_full[:-1]
-        valid = responses != 2
-        rewarded = (rewardedL | rewardedR).astype(int)[valid]
-        resp_valid     = responses[valid]
-
-        rpe_full = np.where(resp_valid == 0, rewarded - q0, rewarded - q1)
-
-        if suffix == '':
-            return rpe_full
-        elif suffix == '-1':
-            # drop last valid trial, then append a 0 to the begining to keep length consistent
-            trimmed = rpe_full[:-1]
-            return np.insert(trimmed, 0, 0)
-        elif suffix == '+1':
-            # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
-            trimmed = rpe_full[1:]
-            return np.append(trimmed, 0)
-        else:
-            return None
-
-
-    # ----- QL and QR -----
-    if base_name in ('QL', 'QR'):
-        arr_full = q0_full if base_name == 'QL' else q1_full
-        return _trim_series(arr_full, base_name, suffix)
-
-    # ----- chosenQ and unchosenQ -----
-    if base_name in ('chosenQ', 'unchosenQ'):
-        trials = nwb_behavior_data.trials
-        rewardedL = trials['rewarded_historyL'][:]
-        rewardedR = trials['rewarded_historyR'][:]
-        responses = trials['animal_response'][:]
-
-        # Drop first trial from Q arrays
-        q0 = q0_full[:-1]
-        q1 = q1_full[:-1]
-        valid_mask = (responses!= 2)
-        resp_valid = responses[valid_mask]
-
-        chosen = np.where(resp_valid == 0, q0, q1)
-        unchosen = np.where(resp_valid == 0, q1, q0)
-        series_full = chosen if base_name == 'chosenQ' else unchosen
-
-        if suffix == '':
-            return series_full
-        elif suffix == '-1':
-            # drop last valid trial, then append a 0 to the begining to keep length consistent
-            trimmed = series_full[:-1]
-            return np.insert(trimmed, 0, 0)
-        elif suffix == '+1':
-            # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
-            trimmed = series_full[1:]
-            return np.append(trimmed, 0)
-        else:
-            return None
-
-
-    # ----- reward -----
-    if base_name == 'reward':
-        trials = nwb_behavior_data.trials
-        rewardedL = trials['rewarded_historyL'][:]
-        rewardedR = trials['rewarded_historyR'][:]
-        responses = trials['animal_response'][:]
-
-        valid_mask = (responses != 2)
-        rewarded = (rewardedL | rewardedR).astype(int)[valid_mask]
-
-        if suffix == '':
-            return rewarded
-        elif suffix == '-1':
-            # drop last valid trial, then append a 0 to the begining to keep length consistent
-            trimmed = rewarded[:-1]
-            return np.insert(trimmed, 0, 0)
-        elif suffix == '+1':
-            # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
-            trimmed = rewarded[1:]
-            return np.append(trimmed, 0)
-        else:
-            return None
-
-    # ----- choice -----
-    if base_name == 'choice':
-        # pull the raw choice vector (0=left, 1=right, 2=no‐response)
-        all_resp = nwb_behavior_data.trials['animal_response'][:]
-
-        # exclude no‐response trials
-        valid_mask = all_resp != 2
-        resp = all_resp[valid_mask]
-
-        # now apply suffix‐based trimming
-        if suffix == '':
-            return resp
-        elif suffix == '-1':
-            # drop last valid trial, prepend a 0 to keep length consistent
-            trimmed = resp[:-1]
-            return np.insert(trimmed, 0, 0)
-        elif suffix == '+1':
-            # drop first valid trial, append a 0
-            trimmed = resp[1:]
-            return np.append(trimmed, 0)
-        else:
-            return None
-
-
-    # Unsupported latent_name
-    return None
-
+    except Exception:
+        print(f"Can't extract {latent_name} from {model_alias}")
+        return None
 
 def find_trials(
     nwb_behavior_data: Any,
