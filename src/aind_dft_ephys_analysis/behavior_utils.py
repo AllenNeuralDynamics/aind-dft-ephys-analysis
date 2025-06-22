@@ -402,6 +402,9 @@ def extract_fitted_data(
           - 'choice'                   → Animal's choice per trial (0=left, 1=right) with no trimming, excludes no-response trials
           - 'choice-1'                 → Choice series with last valid entry dropped and first entry replaced by 0 (keep length constant)
           - 'choice+1'                 → Choice series with first valid entry dropped and last entry replaced by 0 (keep length constant)   
+          - 'value'                    → For model ForagingCompareThreshold.
+          - 'value-1'                  → For model ForagingCompareThreshold (with last trial dropped and first-trial value replaced by 0).
+          - 'value+1'                  → For model ForagingCompareThreshold (with first trial dropped and last-trial value replaced by 0).
     Returns
     -------
     np.ndarray or None
@@ -443,7 +446,7 @@ def extract_fitted_data(
         if suffix == '':
             return arr[1:]
         elif suffix == '-1':
-            # drop last valid trial, the first trial is already initianized with zero
+            # drop last valid trial, the first trial is already initianized with zero or other value
             return arr[:-1]
         elif suffix == '+1':
             # drop the first trial, and append the last trial with 0
@@ -460,6 +463,10 @@ def extract_fitted_data(
         suffix = '-' + suffix if latent_name.endswith('-1') else '+' + suffix
 
     # 3) Compute requested series
+    # ----- value for ForagingCompareThreshold -----
+    if base_name == 'value' and model_alias=='ForagingCompareThreshold':
+        value=FL['value']
+        return _trim_series(value, 'value', suffix)
     # ----- deltaQ -----
     if base_name == 'deltaQ':
         if q0_full is None or q1_full is None:
@@ -480,7 +487,33 @@ def extract_fitted_data(
         return _trim_series(cp, 'right_choice_probability or left_choice_probability', suffix)
     
     # ----- Reward Prediction Error (RPE) -----
-    if base_name == 'RPE':
+    if base_name == 'RPE' and model_alias=='ForagingCompareThreshold':
+        trials = nwb_behavior_data.trials
+        rewardedL = trials['rewarded_historyL'][:]
+        rewardedR = trials['rewarded_historyR'][:]
+        responses = trials['animal_response'][:]
+
+        # Drop last trial from Q arrays before computing
+        value = FL['value'][:-1]
+        valid = responses != 2
+        rewarded = (rewardedL | rewardedR).astype(int)[valid]
+
+        rpe_full=rewarded-value
+
+        if suffix == '':
+            return rpe_full
+        elif suffix == '-1':
+            # drop last valid trial, then append a 0 to the begining to keep length consistent
+            trimmed = rpe_full[:-1]
+            return np.insert(trimmed, 0, 0)
+        elif suffix == '+1':
+            # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
+            trimmed = rpe_full[1:]
+            return np.append(trimmed, 0)
+        else:
+            return None
+
+    if base_name == 'RPE' and model_alias!='ForagingCompareThreshold':
         trials = nwb_behavior_data.trials
         rewardedL = trials['rewarded_historyL'][:]
         rewardedR = trials['rewarded_historyR'][:]
