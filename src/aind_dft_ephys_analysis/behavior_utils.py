@@ -8,10 +8,10 @@ import numpy as np
 import pandas as pd
 
 from general_utils import format_session_name
-from general_utils import extract_session_name_core, smart_read_csv
+from general_utils import extract_session_name_core, smart_read_csv, extract_ID_Date
 from nwb_utils import NWBUtils
 from model_fitting import fit_q_learning_model
-
+from aind_analysis_arch_result_access.han_pipeline import get_mle_model_fitting
 
 
 
@@ -210,160 +210,127 @@ def extract_event_timestamps(
 
 
 def get_fitted_model_names(
-    session_name: str,
-    url: str = "https://api.allenneuraldynamics-test.org/v1/behavior_analysis/mle_fitting"
+    session_name: str
 ) -> List[str]:
     """
-    Retrieves fitted model(s) from the specified URL for a given session name.
+    Retrieve all available fitted model aliases for a given NWB session,
+    using the local `get_mle_model_fitting(...)` helper.
 
-    If the provided session name does not end with ".nwb", the function will
-    automatically append ".nwb" to it.
+    Parameters
+    ----------
+    session_name : str
+        The NWB session name, e.g. "744329_2024-11-25_12-13-37.nwb".
 
-    Args:
-        session_name (str):
-            The NWB session name. If the provided session name does not end with
-            ".nwb", ".nwb" will be appended to it.
-        url (str):
-            The endpoint to request model fitting results from.
-            Defaults to "https://api.allenneuraldynamics-test.org/v1/behavior_analysis/mle_fitting".
+    Returns
+    -------
+    List[str]
+        A list of unique model_alias strings found in the fit results.
 
-    Returns:
-        List[str]:
-            A list of fitted model aliases found in the response JSON.
-
-    Raises:
-        ValueError:
-            If `session_name` is an empty string.
-        requests.exceptions.RequestException:
-            If the HTTP request fails due to network, timeout, or other errors.
+    Raises
+    ------
+    ValueError
+        If `session_name` is empty, cannot be parsed, or no fit results exist.
     """
-    # Validate the session_name parameter
     if not session_name:
         raise ValueError("The 'session_name' parameter cannot be empty.")
 
-    session_name = format_session_name(session_name)
+    # Normalize & parse
+    subject_id, session_date = extract_ID_Date(session_name) or (None, None)
+    if subject_id is None or session_date is None:
+        raise ValueError(f"Could not parse subject ID & date from '{session_name}'")
 
-    # Construct the query parameters
-    filter_payload = {"nwb_name": session_name}
-    projection_payload = {
-        "analysis_results.fit_settings.agent_alias": 1,
-        "_id": 0,
-    }
+    # Fetch all fits for this session
+    df = get_mle_model_fitting(subject_id=subject_id, session_date=session_date)
+    if df is None or df.empty:
+        print(f"No model-fitting results for subject {subject_id} on {session_date}")
+        return None
 
-    try:
-        # Make the GET request
-        response = requests.get(
-            url,
-            params={
-                "filter": json.dumps(filter_payload),
-                "projection": json.dumps(projection_payload),
-            },
-            timeout=10  # seconds
-        )
-        # Raise an HTTPError if the response was unsuccessful
-        response.raise_for_status()
+    # Determine which column holds the alias
+    if "agent_alias" in df.columns:
+        alias_col = "agent_alias"
+    elif "analysis_results.fit_settings.agent_alias" in df.columns:
+        alias_col = "analysis_results.fit_settings.agent_alias"
+    else:
+        raise ValueError("Could not find alias column in fit-results DataFrame")
 
-        # Parse the JSON data
-        data = response.json()
-
-        # Extract the model aliases
-        fitted_models = [
-            item["analysis_results"]["fit_settings"]["agent_alias"]
-            for item in data
-        ]
-        return fitted_models
-
-    except requests.exceptions.RequestException as e:
-        # Handle potential network or HTTP errors
-        print(f"Error during the request: {e}")
-        return
+    # Return unique aliases
+    return df[alias_col].dropna().unique().tolist()
 
 def get_fitted_latent(
     session_name: str,
-    model_alias: str,
-    url: str = "https://api.allenneuraldynamics-test.org/v1/behavior_analysis/mle_fitting",
-    timeout: Optional[int] = 10
-) -> Dict[str, Any]:
+    model_alias: Optional[str] = None
+) -> Union[pd.DataFrame, Dict[str, Any]]:
     """
-    Retrieve the fitted latent variables (and parameters) for a specific model
-    in a given NWB session.
+    Retrieve fitted latent variables (and parameters) for a specific model
+    in a given NWB session, or—if model_alias is None—return the full fit-results DataFrame.
 
-    Args:
-        session_name (str): 
-            The NWB session name. For example, "744329_2024-11-25_12-13-37.nwb".
-        model_alias (str): 
-            The alias of the model for which to retrieve the fitted latent variables.
-            For example, "QLearning_L1F1_CK1_softmax".
-        url (str): 
-            The endpoint to request data from.
-            Defaults to "https://api.allenneuraldynamics-test.org/v1/behavior_analysis/mle_fitting".
-        timeout (int, optional):
-            The request timeout in seconds. Defaults to 10.
+    Parameters
+    ----------
+    session_name : str
+        The NWB session name, e.g. "744329_2024-11-25_12-13-37.nwb".
+    model_alias : str, optional
+        If provided, filters to this model alias and returns a dict:
+          { "params": ..., "fitted_latent_variables": ... }.
+        If None, returns the entire fit-results DataFrame.
 
-    Returns:
-        Dict[str, Any]:
-            A dictionary containing at least:
-            - "params": model-fitted parameters
-            - "fitted_latent_variables": time series or other latent variables
+    Returns
+    -------
+    pandas.DataFrame
+        If model_alias is None, the full DataFrame from get_mle_model_fitting().
+    dict
+        If model_alias is provided, a dict with keys:
+          - "params": model-fitted parameters (dict)
+          - "fitted_latent_variables": latent variables (dict of arrays/lists)
 
-    Raises:
-        ValueError:
-            If the JSON response is empty or does not have the expected structure.
-        requests.exceptions.RequestException:
-            If the HTTP request fails due to a network error, timeout, or other issues.
+    Raises
+    ------
+    ValueError
+        If session_name is empty, parse fails, no fit-results exist, or
+        if the specified alias isn’t found (when model_alias is not None).
     """
-    # Validate the session_name parameter
     if not session_name:
         raise ValueError("The 'session_name' parameter cannot be empty.")
 
-    session_name = format_session_name(session_name)
+    # parse subject ID and date from the session name
+    subject_id, session_date = extract_ID_Date(session_name) or (None, None)
+    if subject_id is None or session_date is None:
+        print(f"Could not parse subject ID & date from '{session_name}'")
+        return None
 
-    # Build the filter and projection payloads
-    filter_payload = {
-        "nwb_name": session_name,
-        "analysis_results.fit_settings.agent_alias": model_alias,
-    }
-    projection_payload = {
-        "analysis_results.params": 1,
-        "analysis_results.fitted_latent_variables": 1,
-        "_id": 0,
-    }
+    # fetch all fits for this subject & date
+    df = get_mle_model_fitting(subject_id=subject_id, session_date=session_date)
+    if df is None or df.empty:
+        print(f"No model‐fitting results for subject {subject_id} on {session_date}")
+        return None
 
+    # if no alias requested, return full DataFrame
+    if model_alias is None:
+        return df
+
+    # otherwise, find and return the specific model
+    if "agent_alias" in df.columns:
+        alias_col = "agent_alias"
+    elif "analysis_results.fit_settings.agent_alias" in df.columns:
+        alias_col = "analysis_results.fit_settings.agent_alias"
+    else:
+        raise ValueError("Could not find alias column in fit‐results DataFrame")
+
+    sel = df[df[alias_col] == model_alias]
+    if sel.empty:
+        print(f"No entries for alias '{model_alias}' in fit results")
+        return None
+
+    row = sel.iloc[0]
     try:
-        response = requests.get(
-            url,
-            params={
-                "filter": json.dumps(filter_payload),
-                "projection": json.dumps(projection_payload),
-            },
-            timeout=timeout,
-        )
-        # Raise an HTTPError if the response was unsuccessful
-        response.raise_for_status()
-
-        data = response.json()
-        if not data:
-            print(f"The response returned an empty list. No data was found for session:{session_name} model:{model_alias}.")
-            return 
-
-        # Expect only one record for this session and model
-        record_dict = data[0]
-
-        # Extract fitted parameters and latent variables
-        analysis_results = record_dict.get("analysis_results", {})
-        if "params" not in analysis_results or "fitted_latent_variables" not in analysis_results:
-            raise ValueError(
-                "The expected keys ('params' and 'fitted_latent_variables') were not found in the response."
-            )
-
         return {
-            "params": analysis_results["params"],
-            "fitted_latent_variables": analysis_results["fitted_latent_variables"]
+            "params": row["params"],
+            "fitted_latent_variables": row["latent_variables"]
         }
+    except KeyError:
+        print("Fit‐results DataFrame missing 'params' or 'latent_variables' columns")
+        return None
 
-    except requests.exceptions.RequestException as e:
-        print(f"HTTP Request Error: {e}")
-        return
+
 
 def extract_fitted_data(
     nwb_behavior_data: Any,

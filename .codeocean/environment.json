@@ -25,7 +25,8 @@
 		"pip3": {
 			"packages": [
 				{
-					"name": "aind-analysis-arch-result-access"
+					"name": "aind-analysis-arch-result-access",
+					"version": "0.7.0"
 				},
 				{
 					"name": "aind-mri-utils",

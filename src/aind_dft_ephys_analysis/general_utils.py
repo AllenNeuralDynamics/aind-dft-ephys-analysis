@@ -9,6 +9,35 @@ import pandas as pd
 import xarray as xr
 
 
+def extract_ID_Date(session_name: str) -> Optional[Tuple[str, str]]:
+    """
+    Extract the animal ID and date string from a session name.
+
+    Looks for the pattern: _<6-digit-ID>_<YYYY-MM-DD>_
+    Examples:
+      "ecephys_706893_2024-05-28_15-15-38"     -> ("706893", "2024-05-28")
+      "behavior_123456_2024-12-01_processed"  -> ("123456", "2024-12-01")
+
+    Parameters
+    ----------
+    session_name : str
+        The session folder (or file) name.
+
+    Returns
+    -------
+    Optional[Tuple[str, str]]
+        (animal_id, date_str) if matched; otherwise None.
+    """
+    pattern = r'(\d{6})_(\d{4}-\d{2}-\d{2})'
+    match = re.search(pattern, session_name)
+    if not match:
+        return None
+
+    animal_id, date_str = match.group(1), match.group(2)
+    return animal_id, date_str
+
+
+
 def extract_session_name_core(session_name: str) -> str | None:
     """
     Extracts the core session name from a given session name string.

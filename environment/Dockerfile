@@ -1,4 +1,4 @@
-# hash:sha256:b956f9c7cfe55c1c02acb9d3656569055f3dde229ac3f1dba099ee6ba00102e1
+# hash:sha256:0e84905421733d7777bf10c3f31f839ac0999a8843315de0a563e3ac820806e7
 ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/c1-vscode:4.20.0-pylint2023.10.1-copilot1.143.601
 
@@ -19,7 +19,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install -U --no-cache-dir \
-    aind-analysis-arch-result-access \
+    aind-analysis-arch-result-access==0.7.0 \
     aind-mri-utils==0.3.0 \
     aind-spurious-correlation==0.0.6 \
     antspyx==0.5.3 \
