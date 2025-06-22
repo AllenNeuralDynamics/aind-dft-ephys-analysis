@@ -689,7 +689,7 @@ def find_trials(
 
 def generate_behavior_summary(
     nwb_data: Any,
-    model_alias:  Union[str, List[str]] = ['QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax','q_learning_Y1'],
+    model_alias:  Union[str, List[str]] = ['ForagingCompareThreshold','QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax','q_learning_Y1'],
     latent_names: Optional[List[str]] = None,
     trial_types : Optional[List[str]]  = None
 ) -> pd.DataFrame:
@@ -746,6 +746,7 @@ def generate_behavior_summary(
             'choice',
             'choice-1',
             'choice+1',
+            'value'
         ]
 
 
@@ -814,7 +815,7 @@ def generate_behavior_summary(
 
 def generate_behavior_summary_combined(
     session_names: List[str],
-    model_alias:  Union[str, List[str]] = ['QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax','q_learning_Y1'],
+    model_alias:  Union[str, List[str]] = ['ForagingCompareThreshold','QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax','q_learning_Y1'],
     latent_names: Optional[List[str]] = None,
     trial_types: Optional[List[str]] = None,
     save_folder: str = '/root/capsule/results',
