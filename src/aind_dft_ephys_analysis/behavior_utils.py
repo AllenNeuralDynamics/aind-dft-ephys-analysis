@@ -436,6 +436,9 @@ def extract_fitted_data(
         else:
             q0_full = q1_full = None
 
+        if 'value' in FL:
+            value_full= np.array(FL['value'])
+
         # Helper: apply trimming based on suffix
         def _trim_series(arr: np.ndarray, base: str, suffix: str) -> np.ndarray:
             """
@@ -466,8 +469,8 @@ def extract_fitted_data(
         # 3) Compute requested series
         # ----- value for ForagingCompareThreshold -----
         if base_name == 'value' and model_alias=='ForagingCompareThreshold':
-            value=FL['value']
-            return _trim_series(value, 'value', suffix)
+            return _trim_series(value_full, 'value', suffix)
+
         # ----- deltaQ -----
         if base_name == 'deltaQ':
             if q0_full is None or q1_full is None:
@@ -495,7 +498,7 @@ def extract_fitted_data(
             responses = trials['animal_response'][:]
 
             # Drop last trial from Q arrays before computing
-            value = FL['value'][:-1]
+            value = value_full[:-1]
             valid = responses != 2
             rewarded = (rewardedL | rewardedR).astype(int)[valid]
 
