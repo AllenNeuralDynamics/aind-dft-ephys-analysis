@@ -752,7 +752,9 @@ def generate_behavior_summary(
             'choice',
             'choice-1',
             'choice+1',
-            'value'
+            'value',
+            'value-1',
+            'value+1'
         ]
 
 
