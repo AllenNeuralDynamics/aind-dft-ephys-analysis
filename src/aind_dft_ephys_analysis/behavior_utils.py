@@ -1,8 +1,10 @@
 import os       
 import json   
-import requests   
+import requests 
+import io
 from typing import Optional, List, Any, Dict ,Union
 from pathlib import Path
+from contextlib import redirect_stdout, redirect_stderr
 
 import numpy as np   
 import pandas as pd
@@ -11,9 +13,17 @@ from general_utils import format_session_name
 from general_utils import extract_session_name_core, smart_read_csv, extract_ID_Date
 from nwb_utils import NWBUtils
 from model_fitting import fit_q_learning_model
-from aind_analysis_arch_result_access.han_pipeline import get_mle_model_fitting
+from aind_analysis_arch_result_access.han_pipeline import get_mle_model_fitting as _orig_get_mle_model_fitting
 
+def silent_get_mle_model_fitting(*args, **kwargs):
+    """
+    Call get_mle_model_fitting but suppress any output to stdout and stderr.
+    """
+    buf = io.StringIO()
+    with redirect_stdout(buf), redirect_stderr(buf):
+        return _orig_get_mle_model_fitting(*args, **kwargs)
 
+get_mle_model_fitting = silent_get_mle_model_fitting
 
 
 def extract_event_timestamps(
@@ -208,7 +218,6 @@ def extract_event_timestamps(
 
     raise ValueError(f"Unsupported event '{event_name}'")
 
-
 def get_fitted_model_names(
     session_name: str
 ) -> List[str]:
@@ -297,7 +306,7 @@ def get_fitted_latent(
         print(f"Could not parse subject ID & date from '{session_name}'")
         return None
 
-    # fetch all fits for this subject & date
+    # fetch all fits for this subject & date   
     df = get_mle_model_fitting(subject_id=subject_id, session_date=session_date)
     if df is None or df.empty:
         print(f"No model‐fitting results for subject {subject_id} on {session_date}")
@@ -631,7 +640,8 @@ def extract_fitted_data(
 
         # Unsupported latent_name
         return None
-    except Exception:
+    except:
+        # print your custom message plus the exception’s own message
         print(f"Can't extract {latent_name} from {model_alias}")
         return None
 
