@@ -1081,3 +1081,61 @@ def correlation_results_summary_combined(
             raise ValueError("`save_format` must be 'csv' or 'zarr'")
 
     return combined
+
+
+def extract_columns_by_filters(
+    corr_df: pd.DataFrame,
+    col_names: Union[str, List[str]],
+    filters: Optional[Dict[str, Any]] = None
+) -> pd.DataFrame:
+    """
+    Select and return one or more columns from the correlation results
+    DataFrame based on an arbitrary set of equality filters.
+
+    Parameters
+    ----------
+    corr_df : pd.DataFrame
+        The wide-format correlation results table. Must include any columns
+        you intend to filter on plus the target `col_names`.
+    col_names : str or list of str
+        Name or list of names of the column(s) to extract, e.g.
+        'simple_LR-...-pval' or
+        ['simple_LR-...-pval', 'ARDL_model-...-coef'].
+    filters : dict, optional
+        A mapping {column_name: value} that each row must match. For example:
+            {
+              'source_file': 'sig_dir_all_sessions.zarr',
+              'time_window': '-1_0',
+              'z_score': True
+            }
+        If `None` or empty, no filtering is applied.
+
+    Returns
+    -------
+    pd.DataFrame
+        A DataFrame containing only the requested columns from all rows
+        matching the filters.  If you pass a single string as `col_names`,
+        the result will still be a one-column DataFrame.
+
+    Raises
+    ------
+    ValueError
+        If any filter key or any requested column name is not present in corr_df.
+    """
+    # normalize col_names to list
+    names = [col_names] if isinstance(col_names, str) else list(col_names)
+
+    # apply filters
+    df = corr_df
+    if filters:
+        for key, val in filters.items():
+            if key not in df.columns:
+                raise ValueError(f"Filter column '{key}' not found in DataFrame")
+            df = df[df[key] == val]
+
+    # check requested columns exist
+    missing = [n for n in names if n not in df.columns]
+    if missing:
+        raise ValueError(f"Requested column(s) not found: {missing}")
+
+    return df[names]
