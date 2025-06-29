@@ -12,13 +12,14 @@ from typing import Any, List, Optional, Union, Tuple, Dict
 import multiprocessing
 
 
-from behavior_utils import extract_event_timestamps 
+from behavior_utils import extract_event_timestamps, find_trials
 from general_utils import extract_session_name_core
 from nwb_utils import NWBUtils
 from general_utils import smart_read_csv
 from aind_spurious_correlation import methods
 
 from ephys_utils import append_units_locations
+
 
 def get_units_passed_default_qc(nwb_data: Any) -> np.ndarray:
     """
@@ -1139,3 +1140,122 @@ def extract_columns_by_filters(
         raise ValueError(f"Requested column(s) not found: {missing}")
 
     return df[names]
+
+
+def project_psth_per_trial(
+    nwb_data: Any,
+    corr_df: pd.DataFrame,
+    filters: Dict[str, Any] = {"time_window": "-1_0", "z_score": False},
+    coef_col: str = "simple_LR-ForagingCompareThreshold-value-1-g2-s0-coef",
+    trial_type: str = "switch_trial",
+    align_to_event: str = "go_cue",
+    time_window: Tuple[float, float] = (-3.0, 5),
+    bin_size: float = 0.05
+) -> pd.DataFrame:
+    """
+    Compute a per-trial PSTH for each unit, then project onto a coefficient vector.
+
+    Parameters
+    ----------
+    nwb_data : Any
+        An NWB file handle containing an ephys `units` DynamicTable with a
+        'spike_times' column.
+    corr_df : pd.DataFrame
+        Wide-format correlation summary DataFrame (must include `unit_index`
+        and the coefficient column).
+    filters : Dict[str, Any], optional
+        Equality filters passed to `extract_columns_by_filters` to select
+        the subset of units. Defaults to:
+            {"time_window": "-1_0", "z_score": False}
+    coef_col : str, optional
+        Name of the coefficient column in `corr_df` to project onto.
+        Defaults to "simple_LR-ForagingCompareThreshold-value-1-g2-s0-coef".
+    trial_type : str, optional
+        Trial-type string passed to `find_trials`. Defaults to "switch_trial".
+    align_to_event : str, optional
+        Event name to align spikes to. Defaults to "go_cue".
+    time_window : Tuple[float, float], optional
+        Start and end (in seconds, relative to event) of the PSTH window.
+        Defaults to (-1.0, 0.0).
+    bin_size : float, optional
+        Width of each PSTH bin in seconds. Defaults to 0.05.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per selected trial with columns:
+          - trial_idx   (int): index of the trial within `nwb_data.trials`
+          - event_time  (float): timestamp of the align_to_event for that trial
+          - psth_bins   (np.ndarray): bin centers (shape (n_bins,))
+          - projection  (np.ndarray): projected PSTH time-series (shape (n_bins,))
+    """
+    session_base = Path(nwb_data.session_id).stem
+
+    # 1) extract unit → coef mapping
+    coef_tbl = extract_columns_by_filters(
+        corr_df=corr_df,
+        col_names=["unit_index", coef_col,"source_file"],
+        filters=filters
+    )
+    # keep only those rows whose source_file mentions our session
+    coef_tbl = coef_tbl[
+        coef_tbl["source_file"].str.contains(session_base)
+    ]
+
+    coef_map = dict(zip(coef_tbl["unit_index"], coef_tbl[coef_col]))
+    units_to_use = sorted(coef_map.keys())
+
+    # 2) find the kept trials & their event times
+    all_event_times = extract_event_timestamps(nwb_data, align_to_event)
+    keep_trials = find_trials(nwb_data, trial_type)
+    event_times = np.array(all_event_times)[keep_trials]
+
+    # 3) define PSTH bins
+    start, end = time_window
+    edges = np.arange(start, end + bin_size, bin_size)
+    centers = edges[:-1] + bin_size / 2.0
+    n_bins = len(centers)
+
+    # 4) build a 3D array: units × trials × bins
+    n_units = len(units_to_use)
+    n_trials = len(keep_trials)
+    psth = np.zeros((n_units, n_trials, n_bins), dtype=float)
+    tbl = nwb_data.units
+
+    for ui, u in enumerate(units_to_use):
+        spikes = np.array(tbl["spike_times"][u])  # absolute timestamps
+        for ti, t_idx in enumerate(keep_trials):
+            t0 = all_event_times[t_idx]
+            rel = spikes - t0
+            counts, _ = np.histogram(rel, bins=edges)
+            psth[ui, ti, :] = counts / bin_size  # spikes/sec
+
+    # 5) project across units for each trial & bin
+    coefs = np.array([coef_map[u] for u in units_to_use])[:, None, None]
+    weighted = psth * coefs
+    proj = np.sum(weighted, axis=0)  # shape (n_trials, n_bins)
+
+    # 6) assemble output
+    rows = []
+    for ti, t_idx in enumerate(keep_trials):
+        rows.append({
+            "source_file":    coef_tbl["source_file"].iat[0],
+            "trial_idx":      t_idx,
+            "event_time":     event_times[ti],
+            "psth_bins":      centers,
+            "projection":     proj[ti, :],
+            "filters":        filters,
+            "trial_type":     trial_type,
+            "align_to_event": align_to_event,
+            "time_window":    time_window,
+            "bin_size":       bin_size
+        })
+
+    return pd.DataFrame(rows, columns=[
+        "source_file", "trial_idx", "event_time",
+        "psth_bins", "projection",
+        "filters", "trial_type", "align_to_event",
+        "time_window", "bin_size"
+    ])
+
+

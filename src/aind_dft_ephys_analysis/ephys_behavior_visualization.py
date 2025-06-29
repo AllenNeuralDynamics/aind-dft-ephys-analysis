@@ -15,6 +15,7 @@ from general_utils import smart_read_csv
 from behavior_utils   import extract_fitted_data       
 from behavior_utils import extract_event_timestamps   # your helper that returns per-trial timestamps
 
+
 def plot_raster_graph(
     nwb_data: Any,
     unit_index: int,
@@ -1048,3 +1049,96 @@ def plot_diagonal_significance(
     )
     plt.tight_layout(rect=[0, 0, 1, 0.94])
     plt.show()
+
+
+def plot_projection(
+    proj_df: pd.DataFrame,
+    trial_idx: Optional[int] = None,
+    average: bool = False,
+    baseline_window: Optional[Tuple[float, float]] = None,
+    n_quantiles: int = 4,
+    figsize: Tuple[float, float] = (8, 4),
+    title: Optional[str] = None,
+    ax: Optional[plt.Axes] = None
+) -> plt.Axes:
+    """
+    Plot projected PSTH(s) from a proj_df DataFrame.
+
+    Parameters
+    ----------
+    proj_df : pd.DataFrame
+        Output of `project_psth_per_trial`, with columns:
+        ['source_file','trial_idx','event_time','psth_bins','projection',...].
+    trial_idx : int, optional
+        If provided, plots only that trial's projection.
+    average : bool, default False
+        If True and trial_idx is None, plots the mean ±1 SD across all trials.
+    baseline_window : tuple, optional
+        (start, end) in seconds relative to event. If provided, groups trials
+        by the mean projection in this window into `n_quantiles` and plots
+        one line per quantile (average within group) and annotates group size.
+    n_quantiles : int, default 4
+        Number of quantile groups when `baseline_window` is specified.
+    figsize : tuple, default (8,4)
+        Figure size (width, height).
+    title : str, optional
+        Plot title. If None, a default is chosen.
+    ax : plt.Axes, optional
+        Existing axes to draw on.
+
+    Returns
+    -------
+    ax : plt.Axes
+        Axes containing the plot.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+
+    bins = proj_df["psth_bins"].iat[0]
+    all_proj = np.stack(proj_df.projection.values, axis=0)  # shape (n_trials, n_bins)
+
+    # Single-trial override
+    if trial_idx is not None:
+        row = proj_df[proj_df.trial_idx == trial_idx]
+        if row.empty:
+            raise ValueError(f"No trial_idx = {trial_idx}")
+        y = row.projection.iloc[0]
+        ax.plot(bins, y, color="C0", lw=2, label=f"Trial {trial_idx}")
+        ax.set_title(title or f"Projected PSTH, trial {trial_idx}")
+
+    # Quantile grouping override
+    elif baseline_window is not None:
+        start, end = baseline_window
+        mask = (bins >= start) & (bins < end)
+        # compute baseline mean per trial
+        baseline_mean = all_proj[:, mask].mean(axis=1)
+        # assign quantile group labels 0..n_quantiles-1
+        groups = pd.qcut(baseline_mean, q=n_quantiles, labels=False, duplicates='drop')
+        for q in range(groups.max() + 1):
+            grp_mask = groups == q
+            mean_q = all_proj[grp_mask].mean(axis=0)
+            count = int(grp_mask.sum())
+            ax.plot(bins, mean_q, lw=2, label=f"Q{q+1} (n={count})")
+        ax.set_title(title or
+            f"Projection by {n_quantiles} quantiles\n(baseline {start}-{end}s)")
+    
+    # Average across all trials
+    elif average:
+        mean = all_proj.mean(axis=0)
+        sd = all_proj.std(axis=0)
+        ax.plot(bins, mean, color="C1", lw=2, label="Mean")
+        ax.fill_between(bins, mean-sd, mean+sd, color="C1", alpha=0.3, label="±1 SD")
+        ax.set_title(title or "Mean projected PSTH ±1 SD")
+
+    # Plot each trial
+    else:
+        for y in all_proj:
+            ax.plot(bins, y, color="gray", alpha=0.4)
+        ax.set_title(title or "Projected PSTH, all trials")
+
+    ax.set_xlabel("Time (s) relative to event")
+    ax.set_ylabel("Projection")
+    ax.legend()
+    ax.grid(True)
+    return ax
+
