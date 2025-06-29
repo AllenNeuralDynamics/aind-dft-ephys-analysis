@@ -672,9 +672,15 @@ def find_trials(
         - 'right_rewarded'   : trials where right side was rewarded
 
         **Switch-based types**
-        - 'switch_trial'     : trials where choice switches from the previous trial (both prev and curr not no-response)
-        - 'switch_LR'        : trials where previous choice was left (0) and current is right (1), excluding no-response trials
-        - 'switch_RL'        : trials where previous choice was right (1) and current is left (0), excluding no-response trials
+        - 'switch_trial'             : any switch between consecutive trials
+        - 'switch_trial_reward'      : switch trials that **are** rewarded
+        - 'switch_trial_noreward'    : switch trials that **aren't** rewarded
+        - 'switch_LR'                : switch from left → right
+        - 'switch_LR_reward'         : left→right **and** rewarded
+        - 'switch_LR_noreward'       : left→right **and not** rewarded
+        - 'switch_RL'                : switch from right → left
+        - 'switch_RL_reward'         : right→left **and** rewarded
+        - 'switch_RL_noreward'       : right→left **and not** rewarded
 
     Returns
     -------
@@ -694,21 +700,50 @@ def find_trials(
     rewardedR = trials['rewarded_historyR'][:]
     rewarded = np.logical_or(rewardedL, rewardedR)
 
-    # Handle switch-based trial types
-    if trial_type in ('switch_trial', 'switch_LR', 'switch_RL'):
+    # Handle all switch‐based trial types (including reward variants)
+    switch_types = {
+        'switch_trial',
+        'switch_trial_reward',
+        'switch_trial_noreward',
+        'switch_LR',
+        'switch_LR_reward',
+        'switch_LR_noreward',
+        'switch_RL',
+        'switch_RL_reward',
+        'switch_RL_noreward',
+    }
+    if trial_type in switch_types:
         switch_indices: List[int] = []
-        # iterate over all trials, checking previous and current
         for idx in range(1, len(resp)):
             prev, curr = resp[idx-1], resp[idx]
             # skip if either is no-response
             if prev == 2 or curr == 2:
                 continue
-            if trial_type == 'switch_trial' and curr != prev:
+
+            is_switch = (curr != prev)
+            is_LR = (prev == 0 and curr == 1)
+            is_RL = (prev == 1 and curr == 0)
+            is_rew = bool(rewarded[idx])
+
+            if trial_type == 'switch_trial' and is_switch:
                 switch_indices.append(idx)
-            elif trial_type == 'switch_LR' and prev == 0 and curr == 1:
+            elif trial_type == 'switch_trial_reward' and is_switch and is_rew:
                 switch_indices.append(idx)
-            elif trial_type == 'switch_RL' and prev == 1 and curr == 0:
+            elif trial_type == 'switch_trial_noreward' and is_switch and not is_rew:
                 switch_indices.append(idx)
+            elif trial_type == 'switch_LR' and is_LR:
+                switch_indices.append(idx)
+            elif trial_type == 'switch_LR_reward' and is_LR and is_rew:
+                switch_indices.append(idx)
+            elif trial_type == 'switch_LR_noreward' and is_LR and not is_rew:
+                switch_indices.append(idx)
+            elif trial_type == 'switch_RL' and is_RL:
+                switch_indices.append(idx)
+            elif trial_type == 'switch_RL_reward' and is_RL and is_rew:
+                switch_indices.append(idx)
+            elif trial_type == 'switch_RL_noreward' and is_RL and not is_rew:
+                switch_indices.append(idx)
+
         return switch_indices
 
     # Standard trial types
