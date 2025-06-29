@@ -655,37 +655,63 @@ def find_trials(
     Parameters
     ----------
     nwb_behavior_data : Any
-        NWB object with .trials table containing:
-          - 'rewarded_historyL', 'rewarded_historyR', 'animal_response'
-    trial_type : str or list of str, optional
-        One or more of:
-          - 'no_response'      : trials where animal_response == 2
-          - 'response'         : trials where animal_response != 2
-          - 'rewarded'         : trials where either L or R was rewarded
-          - 'unrewarded'       : trials where no reward and response != 2
-          - 'left_rewarded'    : trials where left side was rewarded
-          - 'right_rewarded'   : trials where right side was rewarded
-        Default is 'no_response'. If a list is provided, results are unioned.
+        An NWB behavior object with a `.trials` table containing at least:
+          - 'animal_response'          (0=left, 1=right, 2=no‐response)
+          - 'rewarded_historyL'        (boolean array)
+          - 'rewarded_historyR'        (boolean array)
+
+    trial_type : str or list of str, optional (default: 'no_response')
+        One or more of the following:
+
+        **Standard types**
+        - 'no_response'      : trials where animal_response == 2
+        - 'response'         : trials where animal_response != 2
+        - 'rewarded'         : trials where either side was rewarded
+        - 'unrewarded'       : trials where no reward and response != 2
+        - 'left_rewarded'    : trials where left side was rewarded
+        - 'right_rewarded'   : trials where right side was rewarded
+
+        **Switch-based types**
+        - 'switch_trial'     : trials where choice switches from the previous trial (both prev and curr not no-response)
+        - 'switch_LR'        : trials where previous choice was left (0) and current is right (1), excluding no-response trials
+        - 'switch_RL'        : trials where previous choice was right (1) and current is left (0), excluding no-response trials
 
     Returns
     -------
     List[int]
-        Sorted list of zero-based trial indices matching the type(s).
+        Zero-based indices of trials matching the specified type(s).
     """
-    # If given a list, union together each single-type result
+    # If given a list, union results for each type recursively
     if isinstance(trial_type, (list, tuple)):
         idx_set = set()
         for t in trial_type:
             idx_set.update(find_trials(nwb_behavior_data, t))
         return sorted(idx_set)
 
-    # single-trial_type logic
     trials = nwb_behavior_data.trials
     resp = trials['animal_response'][:]
     rewardedL = trials['rewarded_historyL'][:]
     rewardedR = trials['rewarded_historyR'][:]
     rewarded = np.logical_or(rewardedL, rewardedR)
 
+    # Handle switch-based trial types
+    if trial_type in ('switch_trial', 'switch_LR', 'switch_RL'):
+        switch_indices: List[int] = []
+        # iterate over all trials, checking previous and current
+        for idx in range(1, len(resp)):
+            prev, curr = resp[idx-1], resp[idx]
+            # skip if either is no-response
+            if prev == 2 or curr == 2:
+                continue
+            if trial_type == 'switch_trial' and curr != prev:
+                switch_indices.append(idx)
+            elif trial_type == 'switch_LR' and prev == 0 and curr == 1:
+                switch_indices.append(idx)
+            elif trial_type == 'switch_RL' and prev == 1 and curr == 0:
+                switch_indices.append(idx)
+        return switch_indices
+
+    # Standard trial types
     if trial_type == 'no_response':
         return np.where(resp == 2)[0].tolist()
     elif trial_type == 'response':
