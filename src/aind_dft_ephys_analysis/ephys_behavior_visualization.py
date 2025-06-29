@@ -855,3 +855,196 @@ def fit_and_plot_all_sessions(
     plt.show()
 
     return fit_results
+
+
+def plot_diagonal_significance(
+    ds,
+    filter_region: str,
+    time_window: str,
+    col_x: str,
+    col_y: str,
+    col_pval_x: str,
+    col_pval_y: str,
+    diagonal: str = 'negative',  # 'both', 'negative', or 'positive'
+    angle_tolerance_deg: float = 10.0,
+    xlim: tuple = (-30, 30),
+    ylim: tuple = (-30, 30),
+    point_size: float = 5.0,
+    p_value: float = 0.05
+):
+    """
+    Filter a DataFrame by region and time window, compute significance masks
+    for X and Y variables, and plot diagonal panels as specified.
+
+    Parameters
+    ----------
+    ds : pandas.DataFrame
+        The full dataset containing at least the columns specified.
+    filter_region : str
+        Region filter: '' for all regions, '!MD' for non-MD, or a specific region code.
+    time_window : str
+        The time_window value to select (e.g. '-1_0').
+    col_x, col_y : str
+        Column names for the X and Y statistics (e.g. t-values).
+    col_pval_x, col_pval_y : str
+        Column names for the corresponding p-values.
+    diagonal : str, optional
+        Which diagonal to plot: 'both', 'negative', or 'positive'. Default is 'both'.
+    angle_tolerance_deg : float, optional
+        Tolerance around the diagonal in degrees (default=10°).
+    xlim : tuple, optional
+        X-axis limits (default=(-30, 30)).
+    ylim : tuple, optional
+        Y-axis limits (default=(-30, 30)).
+    point_size : float, optional
+        Marker size for all scatter points (default=5).
+    p_value : float, optional
+        The p value used to determine the signficant neuron.
+    """
+    # 1) Filter dataset by region and time window
+    if filter_region == '':
+        filtered = ds[ds['time_window'] == time_window]
+        region_label = 'all regions'
+    elif filter_region == '!MD':
+        filtered = ds[
+            (ds['brain_region'] != 'MD') &
+            (ds['time_window'] == time_window)
+        ]
+        region_label = 'non-MD regions'
+    else:
+        filtered = ds[
+            (ds['brain_region'] == filter_region) &
+            (ds['time_window'] == time_window)
+        ]
+        region_label = filter_region
+
+    # 2) Compute significance masks
+    mask_x    = filtered[col_pval_x] < p_value
+    mask_y    = filtered[col_pval_y] < p_value
+    mask_none = ~(mask_x | mask_y)
+    mask_both = mask_x & mask_y
+
+    # 3) Diagonal-band masks
+    angle_tol = np.deg2rad(angle_tolerance_deg)
+    angles    = np.arctan2(filtered[col_y], filtered[col_x])
+
+    def in_band(center):
+        delta = np.abs(np.arctan2(np.sin(angles - center),
+                                  np.cos(angles - center)))
+        return delta < angle_tol
+
+    band_neg = mask_both & (in_band(-np.pi/4) | in_band(3*np.pi/4))
+    band_pos = mask_both & (in_band( np.pi/4) | in_band(-3*np.pi/4))
+
+    # 4) Totals and counts
+    total           = len(filtered)
+    count_none      = mask_none.sum()
+    count_x         = mask_x.sum()
+    count_y         = mask_y.sum()
+    count_both      = mask_both.sum()
+    count_neg_band  = band_neg.sum()
+    count_pos_band  = band_pos.sum()
+
+    # 5) Fractions for X-sig and Y-sig by sign
+    cnt_x_pos = (mask_x & (filtered[col_x] > 0)).sum()
+    cnt_x_neg = (mask_x & (filtered[col_x] < 0)).sum()
+    frac_x_pos = cnt_x_pos / count_x if count_x else 0
+    frac_x_neg = cnt_x_neg / count_x if count_x else 0
+
+    cnt_y_pos = (mask_y & (filtered[col_y] > 0)).sum()
+    cnt_y_neg = (mask_y & (filtered[col_y] < 0)).sum()
+    frac_y_pos = cnt_y_pos / count_y if count_y else 0
+    frac_y_neg = cnt_y_neg / count_y if count_y else 0
+
+    # 6) Quadrant fractions for each band
+    cnt_neg_q2 = (band_neg & (filtered[col_x] < 0) & (filtered[col_y] > 0)).sum()
+    cnt_neg_q4 = (band_neg & (filtered[col_x] > 0) & (filtered[col_y] < 0)).sum()
+    frac_neg_q2 = cnt_neg_q2 / count_neg_band if count_neg_band else 0
+    frac_neg_q4 = cnt_neg_q4 / count_neg_band if count_neg_band else 0
+
+    cnt_pos_q1 = (band_pos & (filtered[col_x] > 0) & (filtered[col_y] > 0)).sum()
+    cnt_pos_q3 = (band_pos & (filtered[col_x] < 0) & (filtered[col_y] < 0)).sum()
+    frac_pos_q1 = cnt_pos_q1 / count_pos_band if count_pos_band else 0
+    frac_pos_q3 = cnt_pos_q3 / count_pos_band if count_pos_band else 0
+
+    # Determine which panels to draw
+    draw_neg = diagonal in ('both', 'negative')
+    draw_pos = diagonal in ('both', 'positive')
+    n_panels = int(draw_neg) + int(draw_pos)
+
+    # 7) Plot setup
+    fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 6), sharex=True, sharey=True)
+    if n_panels == 1:
+        axes = [axes]
+    ax_idx = 0
+    x_vals = np.linspace(*xlim, 200)
+
+    def draw_panel(ax, negative: bool):
+        # Plot all points
+        ax.scatter(filtered[col_x], filtered[col_y], color='lightgray', s=point_size,
+                   label=f'Non-sig (n={count_none}; {count_none/total:.1%})')
+        ax.scatter(filtered.loc[mask_x, col_x], filtered.loc[mask_x, col_y],
+                   color='blue', s=point_size,
+                   label=f'X-sig (n={count_x}; {count_x/total:.1%})')
+        ax.scatter(filtered.loc[mask_y, col_x], filtered.loc[mask_y, col_y],
+                   color='green', s=point_size,
+                   label=f'Y-sig (n={count_y}; {count_y/total:.1%})')
+        ax.scatter(filtered.loc[mask_both, col_x], filtered.loc[mask_both, col_y],
+                   color='red', s=point_size,
+                   label=f'Both-sig (n={count_both}; {count_both/total:.1%})')
+
+        # Overlay diagonal band
+        band_mask = band_neg if negative else band_pos
+        cnt_band = count_neg_band if negative else count_pos_band
+        ax.scatter(filtered.loc[band_mask, col_x], filtered.loc[band_mask, col_y],
+                   color='purple', s=point_size,
+                   label=f'Diag band (n={cnt_band}; {cnt_band/total:.1%})')
+
+        # Plot diagonal and boundaries
+        center    = -np.pi/4 if negative else np.pi/4
+        diag_line = -x_vals if negative else x_vals
+        label_line = 'y = -x' if negative else 'y = +x'
+        ax.plot(x_vals, diag_line, '--', color='k', label=label_line)
+        ax.plot(x_vals, np.tan(center + angle_tol) * x_vals, ':', color='k')
+        ax.plot(x_vals, np.tan(center - angle_tol) * x_vals, ':', color='k')
+
+        # Annotation text
+        if negative:
+            quad_text = f"Band Q2: {cnt_neg_q2} ({frac_neg_q2:.1%}), Q4: {cnt_neg_q4} ({frac_neg_q4:.1%})"
+            title = f"Negative Diagonal (±{angle_tolerance_deg}°)"
+        else:
+            quad_text = f"Band Q1: {cnt_pos_q1} ({frac_pos_q1:.1%}), Q3: {cnt_pos_q3} ({frac_pos_q3:.1%})"
+            title = f"Positive Diagonal (±{angle_tolerance_deg}°)"
+
+        stats_text = (
+            f"X-sig: + {cnt_x_pos} ({frac_x_pos:.1%}), − {cnt_x_neg} ({frac_x_neg:.1%})\n"
+            f"Y-sig: + {cnt_y_pos} ({frac_y_pos:.1%}), − {cnt_y_neg} ({frac_y_neg:.1%})\n\n"
+            f"{quad_text}"
+        )
+
+        ax.set_title(title)
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        ax.set_xlabel(col_x)
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+                verticalalignment='top', fontsize='small',
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray"))
+        ax.legend(loc='upper right', fontsize='small')
+
+    # Draw panels according to selection
+    if draw_neg:
+        draw_panel(axes[ax_idx], negative=True)
+        axes[ax_idx].set_ylabel(col_y)
+        ax_idx += 1
+    if draw_pos:
+        draw_panel(axes[ax_idx], negative=False)
+
+    # Supertitle & layout
+    plt.suptitle(
+        f"{region_label}, time_window = {time_window}\n"
+        "Gray=non-sig, Blue=X-sig, Green=Y-sig, Red=both-sig;\n"
+        "Purple=diagonal band & both-sig",
+        fontsize=14
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.show()
