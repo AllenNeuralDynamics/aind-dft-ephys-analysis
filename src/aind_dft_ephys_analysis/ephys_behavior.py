@@ -1142,6 +1142,11 @@ def extract_columns_by_filters(
     return df[names]
 
 
+from pathlib import Path
+from typing import Any, Dict, Tuple, Optional, List
+import numpy as np
+import pandas as pd
+
 def project_psth_per_trial(
     nwb_data: Any,
     corr_df: pd.DataFrame,
@@ -1150,10 +1155,13 @@ def project_psth_per_trial(
     trial_type: str = "switch_trial",
     align_to_event: str = "go_cue",
     time_window: Tuple[float, float] = (-3.0, 5),
-    bin_size: float = 0.05
+    bin_size: float = 0.05,
+    coef_direction: Optional[str] = "both",
+    p_value: Optional[float] = 0.05
 ) -> pd.DataFrame:
     """
-    Compute a per-trial PSTH for each unit, then project onto a coefficient vector.
+    Compute a per-trial PSTH for each unit, then project onto a coefficient vector
+    or onto the p-values (if `p_value` thresholding is used).
 
     Parameters
     ----------
@@ -1162,50 +1170,88 @@ def project_psth_per_trial(
         'spike_times' column.
     corr_df : pd.DataFrame
         Wide-format correlation summary DataFrame (must include `unit_index`
-        and the coefficient column).
+        and the coefficient & p-value columns).
     filters : Dict[str, Any], optional
         Equality filters passed to `extract_columns_by_filters` to select
-        the subset of units. Defaults to:
-            {"time_window": "-1_0", "z_score": False}
+        subset of units. Defaults to {"time_window": "-1_0", "z_score": False}.
     coef_col : str, optional
-        Name of the coefficient column in `corr_df` to project onto.
-        Defaults to "simple_LR-ForagingCompareThreshold-value-1-g2-s0-coef".
+        Name of the coefficient column in `corr_df`. Must end with "-coef".
     trial_type : str, optional
         Trial-type string passed to `find_trials`. Defaults to "switch_trial".
     align_to_event : str, optional
         Event name to align spikes to. Defaults to "go_cue".
     time_window : Tuple[float, float], optional
-        Start and end (in seconds, relative to event) of the PSTH window.
-        Defaults to (-1.0, 0.0).
+        Start and end (sec, relative to event) of PSTH window. Defaults to (-3, 5).
     bin_size : float, optional
         Width of each PSTH bin in seconds. Defaults to 0.05.
+    coef_direction : str, optional
+        One of:
+          - "positive": keep only units with coef_col > 0
+          - "negative": keep only units with coef_col < 0
+          - "both" (default) or None: keep all units
+    p_value : float, optional
+        If set, threshold on the corresponding p-value column (derived by
+        replacing '-coef' with '-pval' in coef_col). Only units with pval < p_value
+        are kept, and weights = their p-values.
 
     Returns
     -------
     pd.DataFrame
         One row per selected trial with columns:
-          - trial_idx   (int): index of the trial within `nwb_data.trials`
-          - event_time  (float): timestamp of the align_to_event for that trial
-          - psth_bins   (np.ndarray): bin centers (shape (n_bins,))
-          - projection  (np.ndarray): projected PSTH time-series (shape (n_bins,))
+          - source_file, trial_idx, event_time,
+          - psth_bins (np.ndarray), projection (np.ndarray),
+          - filters, trial_type, align_to_event,
+          - time_window, bin_size, coef_col,
+          - coef_direction, p_value
     """
     session_base = Path(nwb_data.session_id).stem
 
-    # 1) extract unit → coef mapping
+    # Validate coef_col and derive pval column
+    if not coef_col.endswith("-coef"):
+        raise ValueError(f"coef_col must end with '-coef', got {coef_col!r}")
+    pval_col = coef_col.replace("-coef", "-pval")
+
+    # 1) extract unit → coef & p-val mapping
+    col_names = ["unit_index", coef_col, pval_col, "source_file"]
     coef_tbl = extract_columns_by_filters(
         corr_df=corr_df,
-        col_names=["unit_index", coef_col,"source_file"],
+        col_names=col_names,
         filters=filters
     )
-    # keep only those rows whose source_file mentions our session
-    coef_tbl = coef_tbl[
-        coef_tbl["source_file"].str.contains(session_base)
-    ]
+    coef_tbl = coef_tbl[coef_tbl["source_file"].str.contains(session_base)]
 
-    coef_map = dict(zip(coef_tbl["unit_index"], coef_tbl[coef_col]))
+    # 1a) apply coefficient-direction filter
+    if coef_direction == "positive":
+        coef_tbl = coef_tbl[coef_tbl[coef_col] > 0]
+    elif coef_direction == "negative":
+        coef_tbl = coef_tbl[coef_tbl[coef_col] < 0]
+    elif coef_direction in (None, "both"):
+        pass
+    else:
+        raise ValueError("coef_direction must be 'positive', 'negative', 'both', or None")
+
+    # 1b) apply p-value threshold and switch to p-value weights if needed
+    weight_col = coef_col
+    if p_value is not None:
+        coef_tbl = coef_tbl[coef_tbl[pval_col] < p_value]
+        weight_col = pval_col
+
+    # If no units remain, return empty DataFrame with correct columns
+    out_cols = [
+        "source_file", "trial_idx", "event_time",
+        "psth_bins", "projection",
+        "filters", "trial_type", "align_to_event",
+        "time_window", "bin_size", "coef_col",
+        "coef_direction", "p_value"
+    ]
+    if coef_tbl.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    # Build weight map and unit list
+    coef_map = dict(zip(coef_tbl["unit_index"], coef_tbl[weight_col]))
     units_to_use = sorted(coef_map.keys())
 
-    # 2) find the kept trials & their event times
+    # 2) find trials & event times
     all_event_times = extract_event_timestamps(nwb_data, align_to_event)
     keep_trials = find_trials(nwb_data, trial_type)
     event_times = np.array(all_event_times)[keep_trials]
@@ -1216,27 +1262,26 @@ def project_psth_per_trial(
     centers = edges[:-1] + bin_size / 2.0
     n_bins = len(centers)
 
-    # 4) build a 3D array: units × trials × bins
+    # 4) build 3D PSTH array (units × trials × bins)
     n_units = len(units_to_use)
     n_trials = len(keep_trials)
     psth = np.zeros((n_units, n_trials, n_bins), dtype=float)
     tbl = nwb_data.units
 
     for ui, u in enumerate(units_to_use):
-        spikes = np.array(tbl["spike_times"][u])  # absolute timestamps
+        spikes = np.array(tbl["spike_times"][u])
         for ti, t_idx in enumerate(keep_trials):
             t0 = all_event_times[t_idx]
             rel = spikes - t0
             counts, _ = np.histogram(rel, bins=edges)
-            psth[ui, ti, :] = counts / bin_size  # spikes/sec
+            psth[ui, ti, :] = counts / bin_size
 
-    # 5) project across units for each trial & bin
+    # 5) project across units using chosen weights
     coefs = np.array([coef_map[u] for u in units_to_use])[:, None, None]
-    weighted = psth * coefs
-    proj = np.sum(weighted, axis=0)  # shape (n_trials, n_bins)
+    proj = np.sum(psth * coefs, axis=0)  # shape (n_trials, n_bins)
 
-    # 6) assemble output
-    rows = []
+    # 6) assemble output DataFrame
+    rows: List[Dict[str, Any]] = []
     for ti, t_idx in enumerate(keep_trials):
         rows.append({
             "source_file":    coef_tbl["source_file"].iat[0],
@@ -1244,18 +1289,18 @@ def project_psth_per_trial(
             "event_time":     event_times[ti],
             "psth_bins":      centers,
             "projection":     proj[ti, :],
+            "n_units":        n_units,
             "filters":        filters,
             "trial_type":     trial_type,
             "align_to_event": align_to_event,
             "time_window":    time_window,
-            "bin_size":       bin_size
+            "bin_size":       bin_size,
+            "coef_col":       coef_col,
+            "coef_direction": coef_direction,
+            "p_value":        p_value
         })
 
-    return pd.DataFrame(rows, columns=[
-        "source_file", "trial_idx", "event_time",
-        "psth_bins", "projection",
-        "filters", "trial_type", "align_to_event",
-        "time_window", "bin_size"
-    ])
+    return pd.DataFrame(rows, columns=out_cols)
+
 
 

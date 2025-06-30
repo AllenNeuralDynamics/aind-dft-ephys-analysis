@@ -1059,7 +1059,8 @@ def plot_projection(
     n_quantiles: int = 4,
     figsize: Tuple[float, float] = (8, 4),
     title: Optional[str] = None,
-    ax: Optional[plt.Axes] = None
+    ax: Optional[plt.Axes] = None,
+    unit_number: Optional[int] = None
 ) -> plt.Axes:
     """
     Plot projected PSTH(s) from a proj_df DataFrame.
@@ -1067,8 +1068,7 @@ def plot_projection(
     Parameters
     ----------
     proj_df : pd.DataFrame
-        Output of `project_psth_per_trial`, with columns:
-        ['source_file','trial_idx','event_time','psth_bins','projection',...].
+        Output of `project_psth_per_trial`.
     trial_idx : int, optional
         If provided, plots only that trial's projection.
     average : bool, default False
@@ -1076,7 +1076,7 @@ def plot_projection(
     baseline_window : tuple, optional
         (start, end) in seconds relative to event. If provided, groups trials
         by the mean projection in this window into `n_quantiles` and plots
-        one line per quantile (average within group) and annotates group size.
+        one line per quantile.
     n_quantiles : int, default 4
         Number of quantile groups when `baseline_window` is specified.
     figsize : tuple, default (8,4)
@@ -1085,6 +1085,8 @@ def plot_projection(
         Plot title. If None, a default is chosen.
     ax : plt.Axes, optional
         Existing axes to draw on.
+    unit_number : int, optional
+        If provided, appends "(n_units=<unit_number>)" to the title.
 
     Returns
     -------
@@ -1095,7 +1097,10 @@ def plot_projection(
         fig, ax = plt.subplots(figsize=figsize)
 
     bins = proj_df["psth_bins"].iat[0]
-    all_proj = np.stack(proj_df.projection.values, axis=0)  # shape (n_trials, n_bins)
+    all_proj = np.stack(proj_df.projection.values, axis=0)
+
+    # prepare title suffix if unit_number is given
+    suffix = f" (n_units={unit_number})" if unit_number is not None else ""
 
     # Single-trial override
     if trial_idx is not None:
@@ -1104,41 +1109,41 @@ def plot_projection(
             raise ValueError(f"No trial_idx = {trial_idx}")
         y = row.projection.iloc[0]
         ax.plot(bins, y, color="C0", lw=2, label=f"Trial {trial_idx}")
-        ax.set_title(title or f"Projected PSTH, trial {trial_idx}")
+        base_title = title or f"Projected PSTH, trial {trial_idx}"
 
     # Quantile grouping override
     elif baseline_window is not None:
         start, end = baseline_window
         mask = (bins >= start) & (bins < end)
-        # compute baseline mean per trial
         baseline_mean = all_proj[:, mask].mean(axis=1)
-        # assign quantile group labels 0..n_quantiles-1
         groups = pd.qcut(baseline_mean, q=n_quantiles, labels=False, duplicates='drop')
         for q in range(groups.max() + 1):
             grp_mask = groups == q
             mean_q = all_proj[grp_mask].mean(axis=0)
             count = int(grp_mask.sum())
             ax.plot(bins, mean_q, lw=2, label=f"Q{q+1} (n={count})")
-        ax.set_title(title or
-            f"Projection by {n_quantiles} quantiles\n(baseline {start}-{end}s)")
-    
+        base_title = title or f"Projection by {n_quantiles} quantiles\n(baseline {start}-{end}s)"
+
     # Average across all trials
     elif average:
         mean = all_proj.mean(axis=0)
         sd = all_proj.std(axis=0)
         ax.plot(bins, mean, color="C1", lw=2, label="Mean")
-        ax.fill_between(bins, mean-sd, mean+sd, color="C1", alpha=0.3, label="±1 SD")
-        ax.set_title(title or "Mean projected PSTH ±1 SD")
+        ax.fill_between(bins, mean - sd, mean + sd, color="C1", alpha=0.3, label="±1 SD")
+        base_title = title or "Mean projected PSTH ±1 SD"
 
     # Plot each trial
     else:
         for y in all_proj:
             ax.plot(bins, y, color="gray", alpha=0.4)
-        ax.set_title(title or "Projected PSTH, all trials")
+        base_title = title or "Projected PSTH, all trials"
 
+    # set title with optional unit count suffix
+    ax.set_title(base_title + suffix)
     ax.set_xlabel("Time (s) relative to event")
     ax.set_ylabel("Projection")
     ax.legend()
     ax.grid(True)
     return ax
+
 
