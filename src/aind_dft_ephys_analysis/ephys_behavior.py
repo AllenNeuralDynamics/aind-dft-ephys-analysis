@@ -1240,10 +1240,12 @@ def project_psth_per_trial(
     out_cols = [
         "source_file", "trial_idx", "event_time",
         "psth_bins", "projection",
+        "n_units",
         "filters", "trial_type", "align_to_event",
         "time_window", "bin_size", "coef_col",
         "coef_direction", "p_value"
     ]
+
     if coef_tbl.empty:
         return pd.DataFrame(columns=out_cols)
 
