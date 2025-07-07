@@ -1141,12 +1141,6 @@ def extract_columns_by_filters(
 
     return df[names]
 
-
-from pathlib import Path
-from typing import Any, Dict, Tuple, Optional, List
-import numpy as np
-import pandas as pd
-
 def project_psth_per_trial(
     nwb_data: Any,
     corr_df: pd.DataFrame,
