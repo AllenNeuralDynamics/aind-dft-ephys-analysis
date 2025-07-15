@@ -409,22 +409,23 @@ def _multi_row_task(
         str,                    # 4. model_name
         Dict[str, Any],         # 5. model_kwargs
         int,                    # 6. trial_shift  (can be 0, ±1, ±2, …)
-        int                     # 7. group_idx  (variable-group index)
+        int,                    # 7. group_idx  (variable-group index)
+        Union[int]              # 8. correlation_direction (0 or 1)
     ]
 ) -> Tuple[int, str, int, int, object]:
     """
-    Pool-worker helper.  Returns a quadruple:
+    Pool-worker helper. Returns a quadruple:
 
         (row_idx, model_name, group_idx, result_object)
 
     • *result_object*  –
-        statsmodels results instance   … on success  
+        statsmodels results instance … on success  
         None                           … if this row is skipped  
         {'ERROR': <msg>}               … if the fit raised an Exception
     """
     (row_idx, firing_row, beh_summary,
      variables, model_name, model_kwargs,
-     shift, group_idx) = task
+     shift, group_idx, correlation_direction) = task
 
     session_id: str     = firing_row["session_id"]
     rates_all           = np.asarray(firing_row["rates"], dtype=float)
@@ -471,6 +472,7 @@ def _multi_row_task(
     # ─────────────  dispatch to the selected model  ───────────────
     try:
         model_fn = getattr(methods, model_name)
+        
         res = model_fn(
             fr_ts=rates_trim,
             behavior_ts=beh_vectors,
@@ -480,9 +482,13 @@ def _multi_row_task(
         res_serial["trial_shift"] = shift
         res_serial["fit_parameters"] = dict(model_kwargs)
         res_serial["fit_variables"]  = list(beh_vectors.keys())
-        return row_idx, model_name, group_idx, shift, res_serial
+        res_serial["correlation_direction"] = correlation_direction
+
+        return row_idx, model_name, group_idx, shift, correlation_direction, res_serial
+
     except Exception as e:
         return row_idx, model_name, group_idx, shift, {"ERROR": str(e)}
+
 
 
 def _stats_to_dict(res: Any) -> Dict[str, Any]:
@@ -587,6 +593,7 @@ def correlate_firing_latent_multiple_variable(
     save_result: bool = False,
     save_format: str = "zarr", 
     exclude_columns: Optional[List[str]] = ["rates"],
+    correlation_direction: List[int] = [0,1],
 ) -> pd.DataFrame | xr.Dataset:
     """
     Fit **one multivariate model per (session, unit)** for **each** requested
@@ -640,7 +647,11 @@ def correlate_firing_latent_multiple_variable(
         • 1     → behaviour at *t + 1* vs. firing at *t* (look-ahead)  
         • -2    → behaviour two trials **earlier** than firing  
         • [-2,0,+2] → run all three lags and store them side-by-side.
-
+    correlation_direction : int or list[int]
+        The direction(s) of the regression:
+        - 0: regress the behavior variable to the neural activity
+        - 1: regress the neural activity to the behavior
+        If a list is provided, both 0 and 1 will be applied for each trial shift.
     Returns
     -------
     pd.DataFrame
@@ -714,7 +725,7 @@ def correlate_firing_latent_multiple_variable(
         p_rpe = fit["pvalues"].get("RPE", np.nan)
 
     """
-    # ──────────────────────────────────────────────────────────────────
+        # ──────────────────────────────────────────────────────────────────
     # 0) NORMALISE  – model list  &  variable-group list
     # ──────────────────────────────────────────────────────────────────
 
@@ -759,9 +770,10 @@ def correlate_firing_latent_multiple_variable(
             kwargs = model_kwargs.get(m, {})
             for g_idx, group in enumerate(var_groups):
                 for shift in trial_shifts:
-                    tasks.append(
-                        (idx, row_dict, beh_summary, group, m, kwargs, shift, g_idx)
-                    )
+                    for direction in correlation_direction:
+                        tasks.append(
+                            (idx, row_dict, beh_summary, group, m, kwargs, shift, g_idx, direction)
+                        )
 
     # ──────────────────────────────────────────────────────────────────
     # 3) MULTIPROCESS POOL
@@ -771,20 +783,34 @@ def correlate_firing_latent_multiple_variable(
 
     with multiprocessing.Pool(processes=n_jobs) as pool:
         total = len(tasks)
-        for done, (row_idx, model_name, g_idx, shift, res_obj) in enumerate(
+        for done, (row_idx, model_name, g_idx, shift, direction, res_obj) in enumerate(
             pool.imap_unordered(_multi_row_task, tasks), start=1
         ):
             store = result.at[row_idx, "correlation_results"]
 
-            # first time we encounter this model → allocate list-of-lists
+            # Ensure the model is initialized in the store
             if model_name not in store:
                 store[model_name] = [
-                    [None] * len(trial_shifts)       # one list per shift
-                    for _ in range(len(var_groups))  # one per variable-group
+                    [None] * len(trial_shifts)       # One list per shift
+                    for _ in range(len(var_groups))  # One per variable-group
                 ]
 
-            shift_idx = trial_shifts.index(shift)
-            store[model_name][g_idx][shift_idx] = res_obj
+            # Ensure that the group index is initialized
+            if g_idx >= len(store[model_name]):
+                store[model_name].append([None] * len(trial_shifts))  # Append new group if needed
+
+            # Ensure that the shift index is initialized
+            shift_idx = trial_shifts.index(shift)  # This is the key line to ensure shift_idx is set correctly
+
+            if shift_idx >= len(store[model_name][g_idx]):
+                store[model_name][g_idx].append([None] * len(correlation_direction))  # Append new shift if needed
+
+            # Ensure the direction is initialized properly, even if it is None
+            if store[model_name][g_idx][shift_idx] is None:
+                store[model_name][g_idx][shift_idx] = [None] * len(correlation_direction)  # Initialize with None
+
+            # Now assign the result object to the direction
+            store[model_name][g_idx][shift_idx][direction] = res_obj
 
             if done % 100 == 0 or done == total:
                 print(f"[multi-var] progress: {done}/{total} fits completed")
@@ -840,7 +866,7 @@ def correlation_results_summary(
 ) -> pd.DataFrame:
     """
     Summarise the nested ``correlation_results`` column created by
-    ``correlate_firing_latent_multiple_variable``.
+    ``correlate_firing_latent_multiple_variable`` and iterate through the direction layer as well.
 
     NEW BEHAVIOUR  ───────────────────────────────────────────────────────────
     • The *group index* **g#** is now defined by
@@ -852,21 +878,19 @@ def correlation_results_summary(
 
     COLUMN NAMING SCHEME  (hyphens everywhere)
     ──────────────────────────────────────────────────────────────────────────
-        <model>-<var>-g<i>-s<k>-pval   (minimum p across lags)
-        <model>-<var>-g<i>-s<k>-coef   (β coefficient, first lag)
-        <model>-<var>-g<i>-s<k>-tval   (t-statistic)
+        <model>-<var>-g<i>-s<k>-d<j>-pval   (minimum p across lags)
+        <model>-<var>-g<i>-s<k>-d<j>-coef   (β coefficient, first lag)
+        <model>-<var>-g<i>-s<k>-d<j>-tval   (t-statistic)
 
         <model>-g<i>-s<k>-aic          (global metrics per fit)
         <model>-g<i>-s<k>-bic
         <model>-g<i>-s<k>-rsq
         …
 
-        fit_metadata  – dict keyed by "<model>-g<i>-s<k>" containing
+        fit_metadata  – dict keyed by "<model>-g<i>-s<k>-d<j>" containing
             • fit_parameters   • fit_variables   • trial_shift
     """
-    # ───────────────────────────────────────────────────────────────
-    # 0) Load input → df_raw  (exact code you asked for)
-    # ───────────────────────────────────────────────────────────────
+    # 1) Load input → df_raw  (exact code you asked for)
     if isinstance(corr_df_or_ds, (str, Path)) and str(corr_df_or_ds).endswith(".zarr"):
         ds = xr.open_zarr(corr_df_or_ds, consolidated=False)
         df_raw = ds.to_dataframe()
@@ -892,80 +916,83 @@ def correlation_results_summary(
     if "correlation_results" not in df_raw.columns:
         raise ValueError("Input missing 'correlation_results' column")
 
-    # ───────────────────────────────────────────────────────────────
-    # 1) Metadata scaffold
-    # ───────────────────────────────────────────────────────────────
+    # 2) Metadata scaffold
     if meta_cols is None:
-        meta_cols = ["session_id", "unit_index", "time_window", "z_score","ccf_location","brain_region"]
+        meta_cols = ["session_id", "unit_index", "time_window", "z_score", "ccf_location", "brain_region"]
 
     meta_df = df_raw[meta_cols].copy()
     meta_df["fit_metadata"] = [{} for _ in range(len(meta_df))]
 
-    # ───────────────────────────────────────────────────────────────
-    # 2) Collect new columns row-by-row in dicts (no fragmentation)
-    # ───────────────────────────────────────────────────────────────
+    # 3) Collect new columns row-by-row in dicts (no fragmentation)
     new_rows: List[Dict[str, Any]] = [{} for _ in range(len(meta_df))]
     group_index_map: Dict[str, Dict[Tuple[Any, ...], int]] = defaultdict(dict)
 
     for row_idx, row in df_raw.iterrows():
         corr_dict: Dict[str, List[List[Dict[str, Any]]]] = row["correlation_results"]
         meta_blob: Dict[str, Any] = {}
-        values   = new_rows[row_idx]
+        values = new_rows[row_idx]
 
         for model, group_list in corr_dict.items():
             for shift_list in (group_list or []):
-                for fit in (shift_list or []):
-                    if not fit or "params" not in fit:
-                        continue
-
-                    shift_val = int(fit.get("trial_shift", 0))
-                    shift_tag = f"s{shift_val:+d}".replace("+", "")
-                    var_tuple = tuple(fit.get("fit_variables", []))
-                    group_key = var_tuple      # shift included
-                    if group_key not in group_index_map[model]:
-                        group_index_map[model][group_key] = len(group_index_map[model])
-                    g_idx = group_index_map[model][group_key]
-
-                    params  : Dict[str, float] = fit["params"]
-                    pvalues : Dict[str, float] = fit["pvalues"]
-                    tvalues : Dict[str, float] = fit.get("tvalues", {})
-
-                    # ── behaviour-specific metrics ─────────────────
-                    base_vars = {k.split(".")[0] for k in params if k.split(".")[0] != "const"}
-                    for var in base_vars:
-                        lag_keys = [k for k in params if k.startswith(var)]
-                        if not lag_keys:
+                for direction_list in (shift_list or []):
+                    if direction_list is None:
+                        print(f"Skipping empty direction_list for model: {model}, shift_list: {shift_list}")
+                        continue  # Skip to the next valid direction_list
+                    
+                    # Iterate over the direction layer
+                    for fit in direction_list:
+                        if not fit or "params" not in fit:
                             continue
-                        beta  = params[lag_keys[0]]
-                        p_min = min(pvalues.get(k, np.nan) for k in lag_keys)
-                        t_val = tvalues.get(lag_keys[0], np.nan)
+                        direction = int(fit.get("correlation_direction"))
+                        shift_val = int(fit.get("trial_shift", 0))
+                        shift_tag = f"s{shift_val:+d}".replace("+", "")
+                        var_tuple = tuple(fit.get("fit_variables", []))
+                        group_key = var_tuple      # shift included
+                        if group_key not in group_index_map[model]:
+                            group_index_map[model][group_key] = len(group_index_map[model])
+                        g_idx = group_index_map[model][group_key]
 
-                        values[f"{model}-{var}-g{g_idx}-{shift_tag}-pval"] = p_min
-                        values[f"{model}-{var}-g{g_idx}-{shift_tag}-coef"] = beta
-                        values[f"{model}-{var}-g{g_idx}-{shift_tag}-tval"] = t_val
+                        params: Dict[str, float] = fit["params"]
+                        pvalues: Dict[str, float] = fit["pvalues"]
+                        tvalues: Dict[str, float] = fit.get("tvalues", {})
 
-                    # ── global fit metrics ─────────────────────────
-                    for metric in ("rsq", "rsq_adj", "aic", "bic", "hqic",
-                                   "llf", "sigma2", "f_stat", "f_pvalue"):
-                        values[f"{model}-g{g_idx}-{shift_tag}-{metric}"] = fit.get(metric, np.nan)
+                        # ── behaviour-specific metrics ─────────────────
+                        base_vars = {k.split(".")[0] for k in params if k.split(".")[0] != "const"}
+                        for var in base_vars:
+                            lag_keys = [k for k in params if k.startswith(var)]
+                            if not lag_keys:
+                                continue
+                            beta = params[lag_keys[0]]
+                            p_min = min(pvalues.get(k, np.nan) for k in lag_keys)
+                            t_val = tvalues.get(lag_keys[0], np.nan)
 
-                    # ── metadata per fit ───────────────────────────
-                    meta_key = f"{model}-g{g_idx}-{shift_tag}"
-                    meta_blob[meta_key] = {
-                        "fit_parameters": fit.get("fit_parameters", {}),
-                        "fit_variables":  list(var_tuple),
-                        "trial_shift":    shift_val,
-                    }
+                            values[f"{model}-{var}-g{g_idx}-{shift_tag}-d{direction}-pval"] = p_min
+                            values[f"{model}-{var}-g{g_idx}-{shift_tag}-d{direction}-coef"] = beta
+                            values[f"{model}-{var}-g{g_idx}-{shift_tag}-d{direction}-tval"] = t_val
+
+                        # ── global fit metrics ─────────────────────────
+                        for metric in ("rsq", "rsq_adj", "aic", "bic", "hqic",
+                                    "llf", "sigma2", "f_stat", "f_pvalue"):
+                            values[f"{model}-g{g_idx}-{shift_tag}-d{direction}-{metric}"] = fit.get(metric, np.nan)
+
+                        # ── metadata per fit ───────────────────────────
+                        meta_key = f"{model}-g{g_idx}-{shift_tag}-d{direction}"
+                        meta_blob[meta_key] = {
+                            "fit_parameters": fit.get("fit_parameters", {}),
+                            "fit_variables": list(var_tuple),
+                            "trial_shift": shift_val,
+                            "direction": direction,
+                        }
 
         meta_df.at[row_idx, "fit_metadata"] = meta_blob
 
-    # ───────────────────────────────────────────────────────────────
-    # 3) One big concat → no fragmentation
-    # ───────────────────────────────────────────────────────────────
+    # 4) One big concat → no fragmentation
     wide_df = pd.DataFrame(new_rows, index=meta_df.index, dtype=float)
-    result  = pd.concat([meta_df, wide_df], axis=1)
+    result = pd.concat([meta_df, wide_df], axis=1)
 
     return result
+
+
 
 
 
@@ -1145,7 +1172,7 @@ def project_psth_per_trial(
     nwb_data: Any,
     corr_df: pd.DataFrame,
     filters: Dict[str, Any] = {"time_window": "-1_0", "z_score": False},
-    coef_col: str = "simple_LR-ForagingCompareThreshold-value-1-g2-s0-coef",
+    coef_col: str = "simple_LR-ForagingCompareThreshold-value-1-g2-s0-d1-coef",
     trial_type: str = "switch_trial",
     align_to_event: str = "go_cue",
     time_window: Tuple[float, float] = (-3.0, 5),
