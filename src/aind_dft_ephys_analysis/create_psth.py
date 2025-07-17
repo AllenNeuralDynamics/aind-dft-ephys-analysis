@@ -7,7 +7,7 @@ from behavior_utils import extract_event_timestamps, find_trials
 import numpy as np
 import xarray as xr
 from pathlib import Path
-from typing import Any, Iterable, Tuple, Optional, Union
+from typing import Any, Iterable, Tuple, Optional, Union, Literal
 
 def extract_neuron_psth_to_zarr(
     nwb_data: Any,
@@ -123,3 +123,116 @@ def extract_neuron_psth_to_zarr(
     print(f"PSTH saved to {dest}  [shape={psth.shape}]")
 
     return da
+
+def load_psth_subset(
+    source: Union[str, Path, xr.DataArray, xr.Dataset],
+    trial_ids: Optional[Sequence[int]] = None,
+    *,
+    unit_ids: Optional[Sequence[int]] = None,
+    time_window: Optional[Tuple[float, float]] = None,
+) -> xr.DataArray:
+    """
+    Return a view of the PSTH cube restricted to the requested trials,
+    units and/or time range.
+
+    Parameters
+    ----------
+    source : str | Path | xr.DataArray | xr.Dataset
+        • Path / string  → Zarr folder created by `extract_neuron_psth_to_zarr`.  
+        • `xr.Dataset`   → loaded dataset (must contain variable *psth*).  
+        • `xr.DataArray` → loaded *psth* array.
+    trial_ids : Sequence[int] | None
+        Trial indices (i.e. values of the *trial* coordinate) to keep.
+        `None` keeps all trials.
+    unit_ids : Sequence[int] | None, keyword‑only
+        Unit indices (values of the *unit* coordinate) to keep.
+        `None` keeps all units.
+    time_window : (float, float) | None, keyword‑only
+        `(start, end)` in seconds relative to the alignment event.
+        Must fall within the original PSTH window.  `None` keeps all bins.
+
+    Returns
+    -------
+    xr.DataArray
+        A **view** (lazy slice) of the PSTH array; attrs & coords preserved.
+    """
+    # ------------------------------------------------------------------ #
+    # 1  resolve DataArray                                               #
+    # ------------------------------------------------------------------ #
+    if isinstance(source, xr.DataArray):
+        da = source
+    elif isinstance(source, xr.Dataset):
+        if "psth" not in source:
+            raise KeyError("'psth' variable not found in the supplied Dataset")
+        da = source["psth"]
+    else:  # assume path‑like
+        zarr_path = Path(source).expanduser()
+        if not zarr_path.exists():
+            raise FileNotFoundError(f"Zarr folder not found: {zarr_path}")
+        da = xr.open_zarr(zarr_path)["psth"]
+
+    # ------------------------------------------------------------------ #
+    # 2  trial subset                                                    #
+    # ------------------------------------------------------------------ #
+    if trial_ids is not None:
+        da = da.sel(trial=trial_ids)
+
+    # ------------------------------------------------------------------ #
+    # 3  unit subset                                                     #
+    # ------------------------------------------------------------------ #
+    if unit_ids is not None:
+        da = da.sel(unit=unit_ids)
+
+    # ------------------------------------------------------------------ #
+    # 4  time‑window slice                                               #
+    # ------------------------------------------------------------------ #
+    if time_window is not None:
+        t0, t1 = time_window
+        da = da.sel(time=slice(t0, t1))
+
+    return da
+
+
+
+def load_psth_from_zarr(
+    zarr_path: Union[str, Path],
+    *,
+    as_object: Literal["dataarray", "dataset"] = "dataarray",
+    consolidated: bool = True,
+) -> Union[xr.DataArray, xr.Dataset]:
+    """
+    Load a Zarr folder created by `extract_neuron_psth_to_zarr`.
+
+    Parameters
+    ----------
+    zarr_path : str or Path
+        Path to the “*.zarr” folder.
+    as_object : {"dataarray", "dataset"}, default "dataarray"
+        • "dataarray" → return the single variable **psth** (dims: unit×trial×time)  
+        • "dataset"   → return the whole Dataset (identical to `.to_dataset()` output)
+    consolidated : bool, default True
+        Use the consolidated metadata path (faster when the folder was written
+        with `consolidated=True`, which is the default of the extractor).
+
+    Returns
+    -------
+    xarray.DataArray or xarray.Dataset
+        The entire PSTH cube with coordinates and attributes intact.
+    """
+    zarr_path = Path(zarr_path).expanduser()
+    if not zarr_path.exists():
+        raise FileNotFoundError(f"Zarr folder not found: {zarr_path}")
+
+    ds = xr.open_zarr(zarr_path, consolidated=consolidated)
+
+    if as_object == "dataset":
+        return ds
+    elif as_object == "dataarray":
+        if "psth" not in ds:
+            raise KeyError(
+                f"'psth' variable not found in dataset at {zarr_path}. "
+                "Did you pass the correct Zarr folder?"
+            )
+        return ds["psth"]
+    else:
+        raise ValueError("`as_object` must be 'dataarray' or 'dataset'")
