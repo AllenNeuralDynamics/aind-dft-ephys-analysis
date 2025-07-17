@@ -467,17 +467,36 @@ def _multi_row_task(
         beh_vectors[v] = bv_trim
 
     if rates_trim.size == 0:
-        return row_idx, model_name, group_idx, shift, None
+        return row_idx, model_name, group_idx, shift, correlation_direction, {"ERROR": "rates_trim size is 0"}
 
     # ─────────────  dispatch to the selected model  ───────────────
     try:
         model_fn = getattr(methods, model_name)
-        
-        res = model_fn(
-            fr_ts=rates_trim,
-            behavior_ts=beh_vectors,
-            **model_kwargs
-        )
+        if correlation_direction == 0:
+            res = model_fn(
+                fr_ts=rates_trim,
+                behavior_ts=beh_vectors,
+                **model_kwargs
+            )
+        elif correlation_direction == 1:
+            if isinstance(beh_vectors, dict):
+                if len(beh_vectors) == 1:
+                    beh_vectors = list(beh_vectors.values())[0]
+                else:
+                    raise ValueError("Multiple behavior vectors detected, expected only one.")
+            # Call the model function
+            #print(f'beh_vectors: {beh_vectors}')
+            #print(f'beh_vectors size: {len(beh_vectors)}')
+            #print(f'rates_trim: {rates_trim}')
+            #print(f'rates_trim size: {len(rates_trim)}')
+            if len(beh_vectors) != len(rates_trim):
+                print('beh_vectors size does not equal to the rates_trim size')
+            res = model_fn(
+                fr_ts=beh_vectors,
+                behavior_ts={'firing_rate':rates_trim},
+                **model_kwargs
+            )
+
         res_serial = _stats_to_dict(res)
         res_serial["trial_shift"] = shift
         res_serial["fit_parameters"] = dict(model_kwargs)
@@ -487,7 +506,7 @@ def _multi_row_task(
         return row_idx, model_name, group_idx, shift, correlation_direction, res_serial
 
     except Exception as e:
-        return row_idx, model_name, group_idx, shift, {"ERROR": str(e)}
+        return row_idx, model_name, group_idx, shift, correlation_direction, {"ERROR": str(e)}
 
 
 
