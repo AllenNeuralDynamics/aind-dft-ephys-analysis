@@ -1191,7 +1191,7 @@ def project_psth_per_trial(
     nwb_data: Any,
     corr_df: pd.DataFrame,
     filters: Dict[str, Any] = {"time_window": "-1_0", "z_score": False},
-    coef_col: str = "simple_LR-ForagingCompareThreshold-value-1-g2-s0-d1-coef",
+    coef_col: str = "simple_LR-ForagingCompareThreshold-value-1-g2-s0-d0-coef",
     trial_type: str = "switch_trial",
     align_to_event: str = "go_cue",
     time_window: Tuple[float, float] = (-3.0, 5),

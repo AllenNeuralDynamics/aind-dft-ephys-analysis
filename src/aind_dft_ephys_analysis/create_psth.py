@@ -8,103 +8,156 @@ import numpy as np
 import xarray as xr
 from pathlib import Path
 from typing import Any, Iterable, Tuple, Optional, Union, Literal
+import matplotlib.pyplot as plt
+
 
 def extract_neuron_psth_to_zarr(
     nwb_data: Any,
     units: Optional[Iterable[int]] = None,
     *,
-    align_to_event: str = "go_cue",
+    align_to_event: Union[str, Sequence[str]] = "go_cue",
     time_window: Tuple[float, float] = (-3.0, 5.0),
     bin_size: float = 0.05,
     trial_type: Optional[str] = None,
     save_folder: Union[str, Path] = "/root/capsule/results",
-    save_name: Optional[str] = None, 
+    save_name: Optional[str] = None,
     overwrite: bool = True,
-) -> xr.DataArray:
+) -> xr.Dataset:
     """
-    Compute per‑trial PSTHs for the requested units and persist them as Zarr.
+    Compute per‑trial PSTHs for one or many alignment events and persist them as Zarr.
+
+    Each alignment event produces an independent PSTH cube stored as a separate
+    variable inside the returned Dataset. Because different events can have
+    different numbers of trials, each PSTH uses a **unique trial dimension**
+    name: ``trial_<event>`` and a matching coordinate ``trial_index_<event>``.
 
     Parameters
     ----------
     nwb_data : Any
-        NWB handle that provides
-        • ``units['spike_times']`` – list‑of‑arrays, one per unit
-        • ``session_id``           – recording identifier
-        • behavioural event data accessible by ``extract_event_timestamps``.
-    units : iterable[int] or None
-        Unit indices to include; None → all units that pass QC.
-    align_to_event, time_window, bin_size, trial_type
-        Standard PSTH parameters (see previous version).
+        NWB handle that provides:
+        * ``units['spike_times']`` – list‑of‑arrays (one array per unit)
+        * ``session_id`` – recording identifier (attribute)
+        * behavioural event data accessible through
+          :func:`extract_event_timestamps` and :func:`find_trials`.
+    units : Iterable[int] or None, optional
+        Explicit unit indices to include. ``None`` → automatically select all
+        units that pass QC via :func:`get_units_passed_default_qc`.
+    align_to_event : str or Sequence[str], default "go_cue"
+        Single event name or a sequence of event names. For each event a
+        variable named ``psth_<event>`` is created.
+    time_window : (float, float), default (-3.0, 5.0)
+        Time window relative to each event timestamp (seconds).
+        The first value is the start (negative allowed), the second the end.
+    bin_size : float, default 0.05
+        Histogram bin width in seconds. Firing rate is reported as
+        ``counts / bin_size`` (spikes per second).
+    trial_type : str or None, optional
+        Behavioural trial type label used to filter trials. ``None`` keeps all
+        trials for each event.
     save_folder : str or Path, default "/root/capsule/results"
-        Directory in which the Zarr folder will be created.
-    save_name : str or None
-        • None → use `<session_id>.zarr`
-        • Otherwise use the given string (".zarr" appended if missing)..
+        Directory where the Zarr folder will be written (created if missing).
+    save_name : str or None, optional
+        Output folder name. When ``None`` uses ``<session_id>.zarr``.
+        ``.zarr`` suffix is appended if absent.
     overwrite : bool, default True
-        Overwrite an existing destination folder if it exists.
+        If ``True`` and the destination folder already exists, it is deleted
+        before writing.
 
     Returns
     -------
-    xr.DataArray
-        The PSTH array with dimensions ('unit', 'trial', 'time').
+    xarray.Dataset
+        Dataset containing one DataArray per event (variables
+        ``psth_<event>``). Each DataArray has dimensions
+        ``("unit", "trial_<event>", "time")`` and coordinates:
+        * ``unit_index`` – unit indices
+        * ``trial_index_<event>`` – integer trial indices for that event
+        * ``time`` – bin centres (seconds)
+
+        Dataset‑level attributes include ``align_to_events``,
+        ``n_trials_per_event``, and other metadata.
+
+    Raises
+    ------
+    ValueError
+        If ``align_to_event`` is empty or if no trials match the criteria for
+        a given event.
     """
-    # ──────────────── 1  resolve units ────────────────
     if units is None:
         units = get_units_passed_default_qc(nwb_data)
     units = list(units)
 
-    # ──────────────── 2  alignment times ─────────────
-    all_event_times = np.asarray(
-        extract_event_timestamps(nwb_data, align_to_event), dtype=float
-    )
-    if trial_type is not None:
-        trial_mask   = find_trials(nwb_data, trial_type)
-        event_times  = all_event_times[trial_mask]
-        trial_index  = np.nonzero(trial_mask)[0]
+    if isinstance(align_to_event, (str, bytes)):
+        events = [str(align_to_event)]
     else:
-        event_times  = all_event_times
-        trial_index  = np.arange(len(event_times), dtype=int)
+        events = [str(e) for e in align_to_event]
+    if not events:
+        raise ValueError("`align_to_event` cannot be empty.")
 
-    if len(event_times) == 0:
-        raise ValueError("No trials matched your criteria.")
-
-    # ──────────────── 3  binning grid ───────────────
     start, end = time_window
-    edges   = np.arange(start, end + bin_size, bin_size)
+    edges = np.arange(start, end + bin_size, bin_size)
     centres = edges[:-1] + bin_size / 2.0
 
-    # ──────────────── 4  build PSTH cube ────────────
-    psth = np.zeros((len(units), len(event_times), len(centres)), dtype=np.float32)
-    for ui, u in enumerate(units):
-        spikes = np.asarray(nwb_data.units["spike_times"][u], dtype=float)
-        for ti, t0 in enumerate(event_times):
-            rel = spikes - t0
-            counts, _ = np.histogram(rel, bins=edges)
-            psth[ui, ti, :] = counts / bin_size  # spikes / s
+    data_vars = {}
+    n_trials_per_event = {}
 
-    # ──────────────── 5  wrap in xarray ─────────────
-    da = xr.DataArray(
-        psth,
-        dims   = ("unit", "trial", "time"),
-        coords = {
-            "unit_index": ("unit", units),
-            "trial_index": ("trial", trial_index),
-            "time": ("time", centres),
-        },
-        name   = "psth",
-        attrs  = {
+    for evt in events:
+        all_event_times = np.asarray(extract_event_timestamps(nwb_data, evt), dtype=float)
+        if trial_type is not None:
+            trial_index = np.asarray(find_trials(nwb_data, trial_type), dtype=int)
+            event_times = all_event_times[trial_index]
+        else:
+            event_times = all_event_times
+            trial_index = np.arange(len(event_times), dtype=int)
+
+        if len(event_times) == 0:
+            raise ValueError(f"No trials matched criteria for event '{evt}'.")
+
+        psth = np.zeros((len(units), len(event_times), len(centres)), dtype=np.float32)
+        for ui, u in enumerate(units):
+            spikes = np.asarray(nwb_data.units["spike_times"][u], dtype=float)
+            for ti, t0 in enumerate(event_times):
+                rel = spikes - t0
+                counts, _ = np.histogram(rel, bins=edges)
+                psth[ui, ti, :] = counts / bin_size
+
+        trial_dim = f"trial_{evt}"
+        da = xr.DataArray(
+            psth,
+            dims=("unit", trial_dim, "time"),
+            coords={
+                "unit_index": ("unit", units),
+                f"trial_index_{evt}": (trial_dim, trial_index),
+                "time": ("time", centres),
+            },
+            name=f"psth_{evt}",
+            attrs={
+                "session_id": getattr(nwb_data, "session_id", "unknown"),
+                "align_to_event": evt,
+                "time_window": time_window,
+                "bin_size": bin_size,
+                "trial_type": trial_type if trial_type else "all_trials",
+                "n_units": len(units),
+                "n_trials": len(event_times),
+                "created_with": "extract_neuron_psth_to_zarr",
+            },
+        )
+        data_vars[f"psth_{evt}"] = da
+        n_trials_per_event[evt] = len(event_times)
+
+    ds = xr.Dataset(data_vars)
+    ds.attrs.update(
+        {
             "session_id": getattr(nwb_data, "session_id", "unknown"),
-            "align_to_event": align_to_event,
-            "time_window":   time_window,
-            "bin_size":      bin_size,
-            "trial_type":    trial_type if trial_type else "all_trials",
-            "n_units":       len(units),
-            "n_trials":      len(event_times),
-            "created_with":  "extract_neuron_psth_to_zarr",
-        },
+            "align_to_events": events,
+            "time_window": time_window,
+            "bin_size": bin_size,
+            "trial_type": trial_type if trial_type else "all_trials",
+            "n_units": len(units),
+            "n_trials_per_event": n_trials_per_event,
+            "created_with": "extract_neuron_psth_to_zarr",
+        }
     )
 
-    # ──────────────── 6  save to Zarr ───────────────
     session_id = getattr(nwb_data, "session_id", "unknown_session")
     if save_name is None:
         save_name = f"{session_id}.zarr"
@@ -114,15 +167,14 @@ def extract_neuron_psth_to_zarr(
     save_folder = Path(save_folder).expanduser()
     save_folder.mkdir(parents=True, exist_ok=True)
     dest = save_folder / save_name
-
     if dest.exists() and overwrite:
         import shutil
         shutil.rmtree(dest)
+    ds.to_zarr(dest, mode="w", consolidated=True)
+    print(f"PSTHs saved to {dest}  [events={events}]")
+    return ds
 
-    da.to_dataset().to_zarr(dest, mode="w", consolidated=True)
-    print(f"PSTH saved to {dest}  [shape={psth.shape}]")
 
-    return da
 
 def load_psth_subset(
     source: Union[str, Path, xr.DataArray, xr.Dataset],
@@ -138,32 +190,32 @@ def load_psth_subset(
     Parameters
     ----------
     source : str | Path | xr.DataArray | xr.Dataset
-        • Path / string  → Zarr folder created by `extract_neuron_psth_to_zarr`.  
-        • `xr.Dataset`   → loaded dataset (must contain variable *psth*).  
-        • `xr.DataArray` → loaded *psth* array.
+        • Path / string  → Zarr folder produced by
+          ``extract_neuron_psth_to_zarr``.  
+        • ``xr.Dataset`` → already‑opened dataset (must contain “psth”).  
+        • ``xr.DataArray`` → the PSTH array itself.
     trial_ids : Sequence[int] | None
-        Trial indices (i.e. values of the *trial* coordinate) to keep.
-        `None` keeps all trials.
+        Trial **indices** (as stored in the *trial_index* coordinate) to keep.  
+        ``None`` → keep all trials.
     unit_ids : Sequence[int] | None, keyword‑only
-        Unit indices (values of the *unit* coordinate) to keep.
-        `None` keeps all units.
+        Unit **indices** (as stored in the *unit_index* coordinate) to keep.  
+        ``None`` → keep all units.
     time_window : (float, float) | None, keyword‑only
-        `(start, end)` in seconds relative to the alignment event.
-        Must fall within the original PSTH window.  `None` keeps all bins.
+        `(start, end)` in seconds relative to alignment.  ``None`` → full range.
 
     Returns
     -------
     xr.DataArray
-        A **view** (lazy slice) of the PSTH array; attrs & coords preserved.
+        A **lazy slice** of the PSTH array with attributes & coordinates intact.
     """
-    # ------------------------------------------------------------------ #
-    # 1  resolve DataArray                                               #
-    # ------------------------------------------------------------------ #
+    # ──────────────────────────────────────────────────────────────────
+    # 1)  Resolve DataArray
+    # ──────────────────────────────────────────────────────────────────
     if isinstance(source, xr.DataArray):
         da = source
     elif isinstance(source, xr.Dataset):
         if "psth" not in source:
-            raise KeyError("'psth' variable not found in the supplied Dataset")
+            raise KeyError("'psth' variable not found in supplied Dataset.")
         da = source["psth"]
     else:  # assume path‑like
         zarr_path = Path(source).expanduser()
@@ -171,33 +223,76 @@ def load_psth_subset(
             raise FileNotFoundError(f"Zarr folder not found: {zarr_path}")
         da = xr.open_zarr(zarr_path)["psth"]
 
-    # ------------------------------------------------------------------ #
-    # 2  trial subset                                                    #
-    # ------------------------------------------------------------------ #
+    # ──────────────────────────────────────────────────────────────────
+    # 2)  Trial subset  (use *trial_index* coordinate, not dimension name)
+    # ──────────────────────────────────────────────────────────────────
     if trial_ids is not None:
-        da = da.sel(trial=trial_ids)
+        if "trial_index" in da.coords and da.indexes.get("trial_index") is not None:
+            # trial_index is an indexed coordinate → fast label selection
+            da = da.sel(trial_index=list(trial_ids))
+        else:
+            # fall back: boolean mask along the “trial” dimension
+            mask = np.isin(da.coords["trial_index"].values, trial_ids)
+            da   = da.isel(trial=mask)
 
-    # ------------------------------------------------------------------ #
-    # 3  unit subset                                                     #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # 3) unit subset  (same idea for units)
+    # ------------------------------------------------------------------
     if unit_ids is not None:
-        da = da.sel(unit=unit_ids)
+        if "unit_index" in da.coords and da.indexes.get("unit_index") is not None:
+            da = da.sel(unit_index=list(unit_ids))
+        else:
+            mask = np.isin(da.coords["unit_index"].values, unit_ids)
+            da   = da.isel(unit=mask)
 
-    # ------------------------------------------------------------------ #
-    # 4  time‑window slice                                               #
-    # ------------------------------------------------------------------ #
+    # ──────────────────────────────────────────────────────────────────
+    # 4)  Time‑window slice  (the *time* coordinate is already along
+    #                         the "time" dimension)
+    # ──────────────────────────────────────────────────────────────────
     if time_window is not None:
         t0, t1 = time_window
         da = da.sel(time=slice(t0, t1))
 
     return da
 
+def load_zarr(
+    zarr_path: Union[str, Path],
+    *,
+    consolidated: bool = True,
+) -> xr.Dataset:
+    """
+    Directly open a Zarr folder (no PSTH variable selection).
+
+    Parameters
+    ----------
+    zarr_path : str or Path
+        Path to the ``*.zarr`` folder produced by
+        :func:`extract_neuron_psth_to_zarr`.
+    consolidated : bool, default True
+        Whether to use consolidated metadata (faster when the folder
+        was written with ``consolidated=True``).
+
+    Returns
+    -------
+    xarray.Dataset
+        The raw Dataset stored in the Zarr folder.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the path does not exist.
+    """
+    zarr_path = Path(zarr_path).expanduser()
+    if not zarr_path.exists():
+        raise FileNotFoundError(f"Zarr folder not found: {zarr_path}")
+    return xr.open_zarr(zarr_path, consolidated=consolidated)
 
 
 def load_psth_from_zarr(
     zarr_path: Union[str, Path],
     *,
     as_object: Literal["dataarray", "dataset"] = "dataarray",
+    event: Optional[str] = None,
     consolidated: bool = True,
 ) -> Union[xr.DataArray, xr.Dataset]:
     """
@@ -208,16 +303,32 @@ def load_psth_from_zarr(
     zarr_path : str or Path
         Path to the “*.zarr” folder.
     as_object : {"dataarray", "dataset"}, default "dataarray"
-        • "dataarray" → return the single variable **psth** (dims: unit×trial×time)  
-        • "dataset"   → return the whole Dataset (identical to `.to_dataset()` output)
+        * "dataset"   → return the whole Dataset (all events).
+        * "dataarray" → return a single PSTH DataArray.
+            - Multi‑event case: you must specify *event*.
+            - Single‑event case: the sole variable is returned automatically.
+    event : str or None, optional
+        Event name (without the ``psth_`` prefix) selecting which PSTH to
+        return when ``as_object == "dataarray"``.  Ignored if
+        ``as_object == "dataset"``.  If omitted and exactly one PSTH
+        variable exists, that one is used.
     consolidated : bool, default True
-        Use the consolidated metadata path (faster when the folder was written
-        with `consolidated=True`, which is the default of the extractor).
+        Use consolidated metadata (faster when written with
+        ``consolidated=True``).
 
     Returns
     -------
-    xarray.DataArray or xarray.Dataset
-        The entire PSTH cube with coordinates and attributes intact.
+    xarray.Dataset or xarray.DataArray
+        Dataset with all PSTHs, or the selected single PSTH DataArray.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the Zarr path does not exist.
+    KeyError
+        If the requested event variable is missing.
+    ValueError
+        If multiple events exist but *event* is not provided.
     """
     zarr_path = Path(zarr_path).expanduser()
     if not zarr_path.exists():
@@ -228,11 +339,240 @@ def load_psth_from_zarr(
     if as_object == "dataset":
         return ds
     elif as_object == "dataarray":
-        if "psth" not in ds:
+        # collect variables that follow the multi‑event naming scheme
+        psth_vars = [v for v in ds.data_vars if v.startswith("psth_")]
+
+        if not psth_vars:
             raise KeyError(
-                f"'psth' variable not found in dataset at {zarr_path}. "
-                "Did you pass the correct Zarr folder?"
+                f"No variables starting with 'psth_' found in dataset at {zarr_path}."
             )
-        return ds["psth"]
+
+        if event is None:
+            if len(psth_vars) == 1:
+                var_name = psth_vars[0]
+            else:
+                raise ValueError(
+                    "Multiple PSTH variables found "
+                    f"{psth_vars} – please specify `event=`."
+                )
+        else:
+            var_name = f"psth_{event}"
+            if var_name not in ds:
+                raise KeyError(
+                    f"PSTH variable '{var_name}' not found. "
+                    f"Available: {psth_vars}"
+                )
+
+        return ds[var_name]
     else:
         raise ValueError("`as_object` must be 'dataarray' or 'dataset'")
+
+
+
+def mean_firing_rate_matrix(
+    source: Union[str, Path, xr.Dataset, xr.DataArray],
+    trial_ids: Optional[Sequence[int]] = None,
+    *,
+    unit_ids: Optional[Sequence[int]] = None,
+    time_window: Optional[Tuple[float, float]] = None,
+) -> xr.DataArray:
+    """
+    Return a 2‑D matrix  (unit  ×  trial)  containing the mean firing rate
+    (spikes / s) **per unit, per trial** across the requested time window.
+
+    Parameters
+    ----------
+    source : str | Path | xr.Dataset | xr.DataArray
+        Zarr folder path **or** an already‑loaded PSTH Dataset/DataArray.
+    trial_ids, unit_ids, time_window
+        Same semantics as in `load_psth_subset`.
+        • trial_ids   → list/array of trial indices to keep
+        • unit_ids    → list/array of unit indices to keep
+        • time_window → (start, end) in seconds.  None ⇒ full window.
+
+    Returns
+    -------
+    xr.DataArray
+        Dimensions     :  ("unit", "trial")
+        Coordinates     :  *unit_index*, *trial_index*
+        Attributes      :  all attrs are preserved and copied.
+    """
+    # 1) slice down to the desired subset (lazy view)
+    da_sub = load_psth_subset(
+        source,
+        trial_ids=trial_ids,
+        unit_ids=unit_ids,
+        time_window=time_window,
+    )
+
+    if da_sub.size == 0:
+        raise ValueError("Selected subset is empty – nothing to average.")
+
+    # 2) mean across the 'time' dimension → unit × trial matrix
+    mean_da = da_sub.mean("time")            # dims now ('unit', 'trial')
+
+    # 3) tidy up name & attrs
+    mean_da = mean_da.rename("mean_firing_rate")
+    mean_da.attrs = {
+        **da_sub.attrs,
+        "computed_with": "mean_firing_rate_matrix",
+    }
+
+    return mean_da
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper ── plot PSTHs for a set of units with either per‑trial curves
+#           or trial‑average (mean ± SEM) curves.
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_psth_for_units(
+    source: Union[str, Path, xr.DataArray, xr.Dataset],
+    *,
+    unit_ids: Optional[Sequence[int]] = None,
+    trial_ids: Optional[Sequence[int]] = None,
+    time_window: Optional[Tuple[float, float]] = None,
+    plot_type: Literal["single", "mean"] = "single",
+    colors: Optional[Sequence[str]] = None,
+    sem_alpha: float = 0.3,
+    figsize: Tuple[float, float] = (6.0, 2.5),
+    sharey: bool = True,
+    save_path: Optional[Union[str, Path]] = None,
+    dpi: int = 300,
+):
+    """
+    Plot peri‑stimulus time histograms (PSTHs) for one or many units.
+
+    Parameters
+    ----------
+    source : str | Path | xr.DataArray | xr.Dataset
+        Location of the PSTHs.
+        * **str/Path** — path to a “*.zarr” folder written by
+          `extract_neuron_psth_to_zarr`.
+        * **xr.Dataset** — an already‑opened dataset; must contain the
+          variable ``"psth"``.
+        * **xr.DataArray** — the “psth” array itself.
+    unit_ids : Sequence[int] | None, default None
+        • Explicit list of *unit_index* values to plot.  
+        • **None** → plot **all** units present after filtering.
+    trial_ids : Sequence[int] | None, optional
+        Trial identifiers (values of the *trial_index* coordinate) to keep.
+        ``None`` keeps all trials.
+    time_window : (float, float) | None, optional
+        Slice of the time axis in seconds, e.g. ``(-1.0, 3.0)``.
+        ``None`` → use the full window stored in the PSTH.
+    plot_type : {"single", "mean"}, default "single"
+        • ``"single"`` — overlay every selected trial.  
+        • ``"mean"``   — plot the trial‑average curve and shade ± SEM.
+    colors : Sequence[str] | None, optional
+        Matplotlib colours.  If ``None`` the default colour cycle is used.
+        In ``"single"`` mode colours cycle over trials; in ``"mean"`` mode
+        the first colour is used for mean ± SEM.
+    sem_alpha : float, default 0.3
+        Alpha (transparency) for the SEM band when ``plot_type == "mean"``.
+    figsize : (float, float), default (6, 2.5)
+        Size *per subplot* in inches – ``(width, height)``.  The total
+        figure height scales with the number of units plotted.
+    sharey : bool, default True
+        Share the y‑axis among subplots.
+    save_path : str | Path | None, optional
+        If provided, save the figure to this path.  Extension determines
+        format (``.png``, ``.pdf``, ``.svg`` …).  When omitted, the plot is
+        not saved automatically.
+    dpi : int, default 300
+        Resolution of the saved figure (only used if *save_path* is given).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Handle to the created figure (handy for further tweaking).
+
+    Notes
+    -----
+    * Relies on ``load_psth_subset`` to slice the PSTH cube.
+    * Draws a vertical dashed line at *t = 0* (alignment marker) in every
+      subplot.
+    """
+    # ------------------------------------------------------------------ #
+    # 1) Obtain the desired PSTH slice (lazy)                            #
+    # ------------------------------------------------------------------ #
+    psth_da = load_psth_subset(
+        source,
+        trial_ids=trial_ids,
+        unit_ids=unit_ids,      # may be None → keep all units
+        time_window=time_window,
+    )
+    if psth_da.size == 0:
+        raise ValueError("Selected subset is empty – nothing to plot.")
+
+    n_units  = psth_da.sizes["unit"]
+    n_trials = psth_da.sizes["trial"]
+    times    = psth_da.coords["time"].values
+
+    # ------------------------------------------------------------------ #
+    # 2) Figure scaffolding                                              #
+    # ------------------------------------------------------------------ #
+    fig, axes = plt.subplots(
+        n_units,
+        1,
+        sharex=True,
+        sharey=sharey,
+        figsize=(figsize[0], figsize[1] * n_units),
+        squeeze=False,
+    )
+    axes = axes.ravel()
+
+    default_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    colors = colors or default_colors
+
+    # ------------------------------------------------------------------ #
+    # 3) Plot per‑unit panels                                            #
+    # ------------------------------------------------------------------ #
+    for idx, (ax, unit_da) in enumerate(zip(axes, psth_da)):
+        unit_idx = int(unit_da.coords["unit_index"])
+
+        if plot_type == "single":
+            # overlay every trial
+            for t_i in range(n_trials):
+                fr = unit_da.isel(trial=t_i).values
+                ax.plot(times, fr,
+                        color=colors[t_i % len(colors)],
+                        lw=1.0, alpha=0.7)
+        elif plot_type == "mean":
+            # mean ± SEM
+            fr_mat  = unit_da.values                     # trials × time
+            mean_fr = fr_mat.mean(axis=0)
+            sem_fr  = fr_mat.std(axis=0, ddof=1) / np.sqrt(n_trials)
+
+            ax.plot(times, mean_fr, color=colors[0], lw=1.5)
+            ax.fill_between(times, mean_fr - sem_fr, mean_fr + sem_fr,
+                            color=colors[0], alpha=sem_alpha)
+        else:
+            raise ValueError("plot_type must be 'single' or 'mean'")
+
+        # cosmetic tweaks
+        ax.axvline(0, color="k", lw=0.8, ls="--")
+        ax.set_ylabel(f"Unit {unit_idx}\nspk/s")
+        ax.margins(x=0)
+
+        if idx == 0:
+            title = "Per‑trial PSTH" if plot_type == "single" \
+                    else "Trial‑average PSTH (mean ± SEM)"
+            ax.set_title(title)
+        if idx == n_units - 1:
+            ax.set_xlabel("Time (s)")
+
+    plt.tight_layout()
+
+    # ------------------------------------------------------------------ #
+    # 4) Optional save                                                   #
+    # ------------------------------------------------------------------ #
+    if save_path is not None:
+        save_path = Path(save_path).expanduser()
+        if save_path.suffix == "":
+            save_path = save_path.with_suffix(".png")
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        print(f"Figure saved to: {save_path.resolve()}")
+
+    return fig
+
+
+
