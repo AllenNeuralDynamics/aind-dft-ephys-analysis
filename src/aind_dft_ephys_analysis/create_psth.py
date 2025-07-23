@@ -421,53 +421,83 @@ def load_psth_from_zarr(
 def mean_firing_rate_matrix(
     source: Union[str, Path, xr.Dataset, xr.DataArray],
     trial_ids: Optional[Sequence[int]] = None,
-    *,
     unit_ids: Optional[Sequence[int]] = None,
     time_window: Optional[Tuple[float, float]] = None,
+    align_to_event: Optional[str] = None,
+    standardize_names: bool = False,
+    consolidated: bool = True,
 ) -> xr.DataArray:
     """
-    Return a 2‑D matrix  (unit  ×  trial)  containing the mean firing rate
-    (spikes / s) **per unit, per trial** across the requested time window.
+    Compute a 2‑D matrix (unit × trial) of mean firing rates (spikes/s)
+    across a requested time window, for a chosen alignment event.
 
     Parameters
     ----------
     source : str | Path | xr.Dataset | xr.DataArray
-        Zarr folder path **or** an already‑loaded PSTH Dataset/DataArray.
-    trial_ids, unit_ids, time_window
-        Same semantics as in `load_psth_subset`.
-        • trial_ids   → list/array of trial indices to keep
-        • unit_ids    → list/array of unit indices to keep
-        • time_window → (start, end) in seconds.  None ⇒ full window.
+        Zarr path or already-loaded PSTH Dataset/DataArray.
+    trial_ids : Sequence[int] | None
+        Values of the *trial_index_<event>* coordinate to keep. None → all.
+    unit_ids : Sequence[int] | None
+        Values of the *unit_index* coordinate to keep. None → all.
+    time_window : (float, float) | None
+        (start, end) in seconds along the PSTH time axis. None → full range.
+    align_to_event : str | None
+        Event name (without "psth_") when multiple PSTHs exist in *source*.
+        Ignored if *source* is already a single PSTH DataArray.
+    standardize_names : bool, default False
+        If True, rename the trial dimension to "trial" and its index coord to
+        "trial_index" for downstream convenience.
+    consolidated : bool, default True
+        Passed through when opening a Zarr store.
 
     Returns
     -------
     xr.DataArray
-        Dimensions     :  ("unit", "trial")
-        Coordinates     :  *unit_index*, *trial_index*
-        Attributes      :  all attrs are preserved and copied.
+        Dimensions: ("unit", "<trial_dim>") or ("unit", "trial" if standardized)
+        Coordinates: *unit_index*, *<trial_index_coord>* (or *trial_index*)
+        Name: "mean_firing_rate"
+
+    Raises
+    ------
+    ValueError, KeyError, FileNotFoundError
+        See `load_psth_subset`.
     """
-    # 1) slice down to the desired subset (lazy view)
+    # 1) Reuse the slicer (now event-aware)
     da_sub = load_psth_subset(
         source,
         trial_ids=trial_ids,
         unit_ids=unit_ids,
         time_window=time_window,
+        align_to_event=align_to_event,
+        consolidated=consolidated,
     )
 
     if da_sub.size == 0:
         raise ValueError("Selected subset is empty – nothing to average.")
 
-    # 2) mean across the 'time' dimension → unit × trial matrix
-    mean_da = da_sub.mean("time")            # dims now ('unit', 'trial')
+    # Identify trial dim / coord (event-specific)
+    trial_dim_candidates = [d for d in da_sub.dims if d.startswith("trial_")] or [d for d in da_sub.dims if d == "trial"]
+    if len(trial_dim_candidates) != 1:
+        raise ValueError("Could not uniquely determine the trial dimension.")
+    trial_dim = trial_dim_candidates[0]
 
-    # 3) tidy up name & attrs
+    trial_coord_candidates = [c for c in da_sub.coords if c.startswith("trial_index_")] or [c for c in da_sub.coords if c == "trial_index"]
+    if len(trial_coord_candidates) != 1:
+        raise ValueError("Could not uniquely determine the trial_index coordinate.")
+    trial_coord = trial_coord_candidates[0]
+
+    # 2) Mean across time → unit × trial matrix
+    mean_da = da_sub.mean("time")  # dims now ('unit', trial_dim)
     mean_da = mean_da.rename("mean_firing_rate")
-    mean_da.attrs = {
-        **da_sub.attrs,
-        "computed_with": "mean_firing_rate_matrix",
-    }
+    mean_da.attrs = {**da_sub.attrs, "computed_with": "mean_firing_rate_matrix"}
+
+    # 3) Optional normalization of names
+    if standardize_names:
+        mean_da = mean_da.rename({trial_dim: "trial"})
+        mean_da = mean_da.rename({trial_coord: "trial_index"})
 
     return mean_da
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper ── plot PSTHs for a set of units with either per‑trial curves
