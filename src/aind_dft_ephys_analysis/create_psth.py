@@ -9,7 +9,7 @@ import xarray as xr
 from pathlib import Path
 from typing import Any, Iterable, Tuple, Optional, Union, Literal
 import matplotlib.pyplot as plt
-
+from matplotlib.figure import Figure
 
 def extract_neuron_psth_to_zarr(
     nwb_data: Any,
@@ -402,7 +402,7 @@ def load_psth_from_zarr(
             else:
                 raise ValueError(
                     "Multiple PSTH variables found "
-                    f"{psth_vars} – please specify `event=`."
+                    f"{psth_vars} – please specify `align_to_event=`."
                 )
         else:
             var_name = f"psth_{align_to_event}"
@@ -499,95 +499,171 @@ def mean_firing_rate_matrix(
     return mean_da
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper ── plot PSTHs for a set of units with either per‑trial curves
-#           or trial‑average (mean ± SEM) curves.
-# ─────────────────────────────────────────────────────────────────────────────
 def plot_psth_for_units(
     source: Union[str, Path, xr.DataArray, xr.Dataset],
     *,
     unit_ids: Optional[Sequence[int]] = None,
-    trial_ids: Optional[Sequence[int]] = None,
+    trial_ids: Optional[Union[Sequence[int], Sequence[Sequence[int]]]] = None,
+    trial_types: Optional[Sequence[str]] = None,
+    nwb_data: Optional[Any] = None,
+    align_to_event: Optional[str] = None,
     time_window: Optional[Tuple[float, float]] = None,
     plot_type: Literal["single", "mean"] = "single",
     colors: Optional[Sequence[str]] = None,
     sem_alpha: float = 0.3,
     figsize: Tuple[float, float] = (6.0, 2.5),
-    sharey: bool = True,
+    sharey: bool = False,
+    legend: bool = True,
     save_path: Optional[Union[str, Path]] = None,
     dpi: int = 300,
-):
+    consolidated: bool = True,
+    group_labels: Optional[Sequence[str]] = None,
+    y_mode: Literal["auto_per_unit", "auto_global", "none"] = "auto_per_unit",
+    y_pad: float = 0.05,
+) -> Figure:
     """
-    Plot peri‑stimulus time histograms (PSTHs) for one or many units.
+    Plot peri‑stimulus time histograms (PSTHs) for one or many units, with support for:
+    - Multiple alignment events (`align_to_event`)
+    - Explicit trial selection via `trial_ids` (flat or nested list)
+    - Trial grouping by behavioural labels (`trial_types`, using `find_trials`)
+    - Automatic y‑axis scaling (`y_mode`, `y_pad`)
 
     Parameters
     ----------
     source : str | Path | xr.DataArray | xr.Dataset
-        Location of the PSTHs.
-        * **str/Path** — path to a “*.zarr” folder written by
-          `extract_neuron_psth_to_zarr`.
-        * **xr.Dataset** — an already‑opened dataset; must contain the
-          variable ``"psth"``.
-        * **xr.DataArray** — the “psth” array itself.
-    unit_ids : Sequence[int] | None, default None
-        • Explicit list of *unit_index* values to plot.  
-        • **None** → plot **all** units present after filtering.
-    trial_ids : Sequence[int] | None, optional
-        Trial identifiers (values of the *trial_index* coordinate) to keep.
-        ``None`` keeps all trials.
-    time_window : (float, float) | None, optional
-        Slice of the time axis in seconds, e.g. ``(-1.0, 3.0)``.
-        ``None`` → use the full window stored in the PSTH.
-    plot_type : {"single", "mean"}, default "single"
-        • ``"single"`` — overlay every selected trial.  
-        • ``"mean"``   — plot the trial‑average curve and shade ± SEM.
-    colors : Sequence[str] | None, optional
-        Matplotlib colours.  If ``None`` the default colour cycle is used.
-        In ``"single"`` mode colours cycle over trials; in ``"mean"`` mode
-        the first colour is used for mean ± SEM.
-    sem_alpha : float, default 0.3
-        Alpha (transparency) for the SEM band when ``plot_type == "mean"``.
-    figsize : (float, float), default (6, 2.5)
-        Size *per subplot* in inches – ``(width, height)``.  The total
-        figure height scales with the number of units plotted.
-    sharey : bool, default True
-        Share the y‑axis among subplots.
-    save_path : str | Path | None, optional
-        If provided, save the figure to this path.  Extension determines
-        format (``.png``, ``.pdf``, ``.svg`` …).  When omitted, the plot is
-        not saved automatically.
-    dpi : int, default 300
-        Resolution of the saved figure (only used if *save_path* is given).
+        Zarr path, Dataset, or DataArray containing PSTHs produced by `extract_neuron_psth_to_zarr`.
+    unit_ids : Sequence[int] | None
+        Values of the *unit_index* coordinate to plot. ``None`` → all units.
+    trial_ids : list[int] | list[list[int]] | None
+        Explicit trial indices. If nested (list of lists), each sublist is treated as a separate group.
+        Empty sublists are allowed and skipped. If provided, `trial_types` is ignored.
+    trial_types : list[str] | None
+        Behavioural labels. If `trial_ids` is None, each label defines a trial group via `find_trials(nwb_data, tt)`.
+    nwb_data : Any | None
+        NWB handle needed when `trial_types` is used (to call `find_trials`).
+    align_to_event : str | None
+        Event name (without the "psth_" prefix) to select the PSTH variable when multiple exist.
+    time_window : (float, float) | None
+        Slice of the time axis in seconds, e.g. (-1.0, 3.0). ``None`` → full stored range.
+    plot_type : {"single", "mean"}
+        "single": overlay every trial curve; "mean": plot mean ± SEM per group.
+    colors : list[str] | None
+        Matplotlib colours. One colour per group (in "mean" mode) or reused per trial (in "single" mode).
+        Defaults to Matplotlib's current colour cycle.
+    sem_alpha : float
+        Transparency for the SEM band in "mean" mode.
+    figsize : (float, float)
+        Size per subplot (width, height). Total height scales with the number of units.
+    sharey : bool
+        Share the y-axis among subplots (Matplotlib's `sharey` in `plt.subplots`).
+    legend : bool
+        Show a legend (only meaningful in "mean" mode with multiple groups).
+    save_path : str | Path | None
+        If provided, the figure is saved to this path (extension determines format).
+    dpi : int
+        DPI used when saving the figure.
+    consolidated : bool
+        Passed through to `xr.open_zarr` when `source` is a path.
+    group_labels : list[str] | None
+        Optional custom labels for groups when `trial_ids` is nested. Length must match number of groups.
+    y_mode : {"auto_per_unit", "auto_global", "none"}
+        How to auto-set y-limits:
+          • "auto_per_unit"  → per-unit max (ignored if `sharey=True`; set `sharey=False` to differ).
+          • "auto_global"    → single global max for all subplots.
+          • "none"           → leave Matplotlib defaults.
+    y_pad : float
+        Fractional padding added to the max value when y autoscaling.
 
     Returns
     -------
     matplotlib.figure.Figure
-        Handle to the created figure (handy for further tweaking).
+        The created figure.
 
     Notes
     -----
-    * Relies on ``load_psth_subset`` to slice the PSTH cube.
-    * Draws a vertical dashed line at *t = 0* (alignment marker) in every
-      subplot.
+    • Uses `load_psth_subset` (event-aware) to obtain PSTH slices lazily.
+    • Automatically detects the event-specific trial dimension/coordinate names.
+    • Empty trial groups are silently skipped.
     """
     # ------------------------------------------------------------------ #
-    # 1) Obtain the desired PSTH slice (lazy)                            #
+    # Helpers to normalize trial grouping                                #
     # ------------------------------------------------------------------ #
-    psth_da = load_psth_subset(
+    def _group_from_trial_ids(tids: Union[Sequence[int], Sequence[Sequence[int]], None]
+                              ) -> dict[str, np.ndarray]:
+        if tids is None:
+            return {}
+        # nested?
+        if len(tids) > 0 and isinstance(tids[0], (list, tuple, np.ndarray)):
+            groups = [np.asarray(g, dtype=int) for g in tids]
+        else:
+            groups = [np.asarray(tids, dtype=int)]
+        groups = [g for g in groups if g.size > 0]  # drop empties
+        names = group_labels if group_labels is not None else [f"group_{i}" for i in range(len(groups))]
+        if len(names) != len(groups):
+            raise ValueError("`group_labels` length must match number of non-empty groups.")
+        return {n: g for n, g in zip(names, groups)}
+
+    def _group_from_trial_types(ttypes: Optional[Sequence[str]]) -> dict[str, np.ndarray]:
+        if ttypes is None:
+            return {}
+        if nwb_data is None:
+            raise ValueError("`nwb_data` is required when using `trial_types`.")
+        d = {str(tt): np.asarray(find_trials(nwb_data, tt), dtype=int) for tt in ttypes}
+        d = {k: v for k, v in d.items() if v.size > 0}
+        if not d:
+            raise ValueError("No trials found for the requested trial_types.")
+        return d
+
+    if trial_ids is not None:
+        trial_groups = _group_from_trial_ids(trial_ids)
+    elif trial_types is not None:
+        trial_groups = _group_from_trial_types(trial_types)
+    else:
+        trial_groups = {}
+
+    # ------------------------------------------------------------------ #
+    # 1) Load a base PSTH slice (no trial filter if we will split later) #
+    # ------------------------------------------------------------------ #
+    base_da = load_psth_subset(
         source,
-        trial_ids=trial_ids,
-        unit_ids=unit_ids,      # may be None → keep all units
+        trial_ids=None,                 # groups handled later
+        unit_ids=unit_ids,
         time_window=time_window,
+        align_to_event=align_to_event,
+        consolidated=consolidated,
     )
-    if psth_da.size == 0:
+    if base_da.size == 0:
         raise ValueError("Selected subset is empty – nothing to plot.")
 
-    n_units  = psth_da.sizes["unit"]
-    n_trials = psth_da.sizes["trial"]
-    times    = psth_da.coords["time"].values
+    # Identify trial dim/coord (event-specific)
+    trial_dim_candidates = [d for d in base_da.dims if d.startswith("trial_")] or [d for d in base_da.dims if d == "trial"]
+    if len(trial_dim_candidates) != 1:
+        raise ValueError("Could not determine the trial dimension name.")
+    trial_dim = trial_dim_candidates[0]
+
+    trial_coord_candidates = [c for c in base_da.coords if c.startswith("trial_index_")] or [c for c in base_da.coords if c == "trial_index"]
+    if len(trial_coord_candidates) != 1:
+        raise ValueError("Could not determine the trial_index coordinate name.")
+    trial_coord = trial_coord_candidates[0]
+
+    n_units = base_da.sizes["unit"]
+    times   = base_da.coords["time"].values
 
     # ------------------------------------------------------------------ #
-    # 2) Figure scaffolding                                              #
+    # 2) Colours                                                         #
+    # ------------------------------------------------------------------ #
+    default_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    colors = colors or default_cycle
+
+    if trial_groups:
+        group_names  = list(trial_groups.keys())
+        group_colors = {g: colors[i % len(colors)] for i, g in enumerate(group_names)}
+    else:
+        group_names  = ["all_trials"]
+        group_colors = {"all_trials": colors[0]}
+
+    # ------------------------------------------------------------------ #
+    # 3) Figure & axes                                                   #
     # ------------------------------------------------------------------ #
     fig, axes = plt.subplots(
         n_units,
@@ -599,51 +675,83 @@ def plot_psth_for_units(
     )
     axes = axes.ravel()
 
-    default_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    colors = colors or default_colors
+    global_max = 0.0  # for global autoscaling
 
     # ------------------------------------------------------------------ #
-    # 3) Plot per‑unit panels                                            #
+    # 4) Plot per unit                                                   #
     # ------------------------------------------------------------------ #
-    for idx, (ax, unit_da) in enumerate(zip(axes, psth_da)):
-        unit_idx = int(unit_da.coords["unit_index"])
+    for idx, (ax, unit_da_full) in enumerate(zip(axes, base_da)):
+        unit_idx_val = int(unit_da_full.coords["unit_index"])
+        unit_max = 0.0
 
-        if plot_type == "single":
-            # overlay every trial
-            for t_i in range(n_trials):
-                fr = unit_da.isel(trial=t_i).values
-                ax.plot(times, fr,
-                        color=colors[t_i % len(colors)],
-                        lw=1.0, alpha=0.7)
-        elif plot_type == "mean":
-            # mean ± SEM
-            fr_mat  = unit_da.values                     # trials × time
-            mean_fr = fr_mat.mean(axis=0)
-            sem_fr  = fr_mat.std(axis=0, ddof=1) / np.sqrt(n_trials)
+        active_groups = group_names if trial_groups else ["all_trials"]
 
-            ax.plot(times, mean_fr, color=colors[0], lw=1.5)
-            ax.fill_between(times, mean_fr - sem_fr, mean_fr + sem_fr,
-                            color=colors[0], alpha=sem_alpha)
-        else:
-            raise ValueError("plot_type must be 'single' or 'mean'")
+        for gname in active_groups:
+            if trial_groups:
+                da_grp = load_psth_subset(
+                    base_da,
+                    trial_ids=trial_groups[gname],
+                    unit_ids=[unit_idx_val],
+                    time_window=None,
+                    align_to_event=None,
+                ).squeeze("unit")
+            else:
+                da_grp = unit_da_full
 
-        # cosmetic tweaks
+            n_trials_grp = da_grp.sizes[trial_dim]
+
+            if plot_type == "single":
+                for t_i in range(n_trials_grp):
+                    fr = da_grp.isel({trial_dim: t_i}).values
+                    unit_max = max(unit_max, np.nanmax(fr))
+                    ax.plot(times, fr, color=group_colors[gname], lw=1.0, alpha=0.6)
+            elif plot_type == "mean":
+                fr_mat  = da_grp.values          # trials × time
+                mean_fr = fr_mat.mean(axis=0)
+                sem_fr  = fr_mat.std(axis=0, ddof=1) / np.sqrt(n_trials_grp)
+                unit_max = max(unit_max, np.nanmax(mean_fr + sem_fr))
+
+                ax.plot(times, mean_fr, color=group_colors[gname], lw=1.6, label=gname)
+                ax.fill_between(times,
+                                mean_fr - sem_fr,
+                                mean_fr + sem_fr,
+                                color=group_colors[gname],
+                                alpha=sem_alpha)
+            else:
+                raise ValueError("plot_type must be 'single' or 'mean'")
+
+        global_max = max(global_max, unit_max)
+
+        # Cosmetics
         ax.axvline(0, color="k", lw=0.8, ls="--")
-        ax.set_ylabel(f"Unit {unit_idx}\nspk/s")
+        ax.set_ylabel(f"Unit {unit_idx_val}\nspk/s")
         ax.margins(x=0)
 
+        # Per-unit ylim (effective only if sharey=False)
+        if y_mode == "auto_per_unit" and not sharey and unit_max > 0:
+            ax.set_ylim(0, unit_max * (1.0 + y_pad))
+
         if idx == 0:
-            title = "Per‑trial PSTH" if plot_type == "single" \
-                    else "Trial‑average PSTH (mean ± SEM)"
+            title = "Per‑trial PSTH" if plot_type == "single" else "Trial‑average PSTH (mean ± SEM)"
+            if align_to_event is not None:
+                title += f" • event={align_to_event}"
             ax.set_title(title)
+
         if idx == n_units - 1:
             ax.set_xlabel("Time (s)")
 
+    # Global ylim
+    if y_mode == "auto_global" and global_max > 0:
+        for ax in axes:
+            ax.set_ylim(0, global_max * (1.0 + y_pad))
+
+    # Legend
+    if legend and plot_type == "mean" and len(group_names) > 1:
+        axes[0].legend(frameon=False, loc="upper right", fontsize="small")
+
     plt.tight_layout()
 
-    # ------------------------------------------------------------------ #
-    # 4) Optional save                                                   #
-    # ------------------------------------------------------------------ #
+    # Save if requested
     if save_path is not None:
         save_path = Path(save_path).expanduser()
         if save_path.suffix == "":
@@ -652,6 +760,8 @@ def plot_psth_for_units(
         print(f"Figure saved to: {save_path.resolve()}")
 
     return fig
+
+
 
 
 
