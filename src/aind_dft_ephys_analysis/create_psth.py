@@ -14,7 +14,6 @@ import matplotlib.pyplot as plt
 def extract_neuron_psth_to_zarr(
     nwb_data: Any,
     units: Optional[Iterable[int]] = None,
-    *,
     align_to_event: Union[str, Sequence[str]] = "go_cue",
     time_window: Tuple[float, float] = (-3.0, 5.0),
     bin_size: float = 0.05,
@@ -175,85 +174,136 @@ def extract_neuron_psth_to_zarr(
     return ds
 
 
-
 def load_psth_subset(
     source: Union[str, Path, xr.DataArray, xr.Dataset],
     trial_ids: Optional[Sequence[int]] = None,
-    *,
     unit_ids: Optional[Sequence[int]] = None,
     time_window: Optional[Tuple[float, float]] = None,
+    align_to_event: Optional[str] = None,
+    consolidated: bool = True,
 ) -> xr.DataArray:
     """
     Return a view of the PSTH cube restricted to the requested trials,
-    units and/or time range.
+    units and/or time range, with explicit control of which alignment event
+    to use when multiple PSTHs are stored in the same Dataset.
 
     Parameters
     ----------
     source : str | Path | xr.DataArray | xr.Dataset
-        • Path / string  → Zarr folder produced by
-          ``extract_neuron_psth_to_zarr``.  
-        • ``xr.Dataset`` → already‑opened dataset (must contain “psth”).  
-        • ``xr.DataArray`` → the PSTH array itself.
+        • Path / string  → Zarr folder produced by `extract_neuron_psth_to_zarr`.  
+        • xr.Dataset     → already-opened dataset (must contain variables named "psth_<event>").  
+        • xr.DataArray   → the PSTH array itself.
     trial_ids : Sequence[int] | None
-        Trial **indices** (as stored in the *trial_index* coordinate) to keep.  
-        ``None`` → keep all trials.
-    unit_ids : Sequence[int] | None, keyword‑only
-        Unit **indices** (as stored in the *unit_index* coordinate) to keep.  
-        ``None`` → keep all units.
-    time_window : (float, float) | None, keyword‑only
-        `(start, end)` in seconds relative to alignment.  ``None`` → full range.
+        Trial indices (values of the *trial_index_<event>* coordinate) to keep.
+        None → keep all trials.
+    unit_ids : Sequence[int] | None
+        Unit indices (values of the *unit_index* coordinate) to keep.
+        None → keep all units.
+    time_window : (float, float) | None
+        (start, end) in seconds. None → full time range.
+    align_to_event : str | None
+        Event name (without the "psth_" prefix) selecting which PSTH to use
+        when `source` is a Dataset or Zarr path that contains multiple events.
+        Ignored if `source` is already a DataArray.
+    consolidated : bool, default True
+        Use consolidated metadata when opening Zarr.
 
     Returns
     -------
     xr.DataArray
-        A **lazy slice** of the PSTH array with attributes & coordinates intact.
+        Lazily-sliced PSTH array with attrs & coords preserved.
+
+    Raises
+    ------
+    FileNotFoundError
+        If a provided path does not exist.
+    ValueError
+        If multiple PSTHs are present but `align_to_event` is not given.
+    KeyError
+        If the requested PSTH variable is missing.
     """
-    # ──────────────────────────────────────────────────────────────────
-    # 1)  Resolve DataArray
-    # ──────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------ #
+    # 1) Resolve a single PSTH DataArray                                 #
+    # ------------------------------------------------------------------ #
     if isinstance(source, xr.DataArray):
         da = source
-    elif isinstance(source, xr.Dataset):
-        if "psth" not in source:
-            raise KeyError("'psth' variable not found in supplied Dataset.")
-        da = source["psth"]
-    else:  # assume path‑like
-        zarr_path = Path(source).expanduser()
-        if not zarr_path.exists():
-            raise FileNotFoundError(f"Zarr folder not found: {zarr_path}")
-        da = xr.open_zarr(zarr_path)["psth"]
-
-    # ──────────────────────────────────────────────────────────────────
-    # 2)  Trial subset  (use *trial_index* coordinate, not dimension name)
-    # ──────────────────────────────────────────────────────────────────
-    if trial_ids is not None:
-        if "trial_index" in da.coords and da.indexes.get("trial_index") is not None:
-            # trial_index is an indexed coordinate → fast label selection
-            da = da.sel(trial_index=list(trial_ids))
+    else:
+        # Open dataset if needed
+        if isinstance(source, (str, Path)):
+            zarr_path = Path(source).expanduser()
+            if not zarr_path.exists():
+                raise FileNotFoundError(f"Zarr folder not found: {zarr_path}")
+            ds = xr.open_zarr(zarr_path, consolidated=consolidated)
+        elif isinstance(source, xr.Dataset):
+            ds = source
         else:
-            # fall back: boolean mask along the “trial” dimension
-            mask = np.isin(da.coords["trial_index"].values, trial_ids)
-            da   = da.isel(trial=mask)
+            raise TypeError("Unsupported type for `source`.")
 
-    # ------------------------------------------------------------------
-    # 3) unit subset  (same idea for units)
-    # ------------------------------------------------------------------
+        # figure out which variable to use
+        psth_vars = [v for v in ds.data_vars if v.startswith("psth_")]
+        if not psth_vars:
+            raise KeyError("No variables beginning with 'psth_' found in the dataset.")
+
+        if align_to_event is None:
+            if len(psth_vars) == 1:
+                var_name = psth_vars[0]
+            else:
+                raise ValueError(
+                    f"Multiple PSTHs present {psth_vars}; please set `align_to_event=`."
+                )
+        else:
+            var_name = f"psth_{align_to_event}"
+            if var_name not in ds:
+                raise KeyError(f"PSTH variable '{var_name}' not found. Available: {psth_vars}")
+
+        da = ds[var_name]
+
+    # ------------------------------------------------------------------ #
+    # 2) Identify trial dim / coord names (event-specific)               #
+    # ------------------------------------------------------------------ #
+    # Expect dims: ("unit", "trial_<evt>", "time")
+    trial_dim_candidates = [d for d in da.dims if d.startswith("trial_")]
+    if len(trial_dim_candidates) != 1:
+        # fallback to a generic "trial" dim if present
+        trial_dim_candidates = [d for d in da.dims if d == "trial"]
+        if len(trial_dim_candidates) != 1:
+            raise ValueError("Could not determine the trial dimension name.")
+    trial_dim = trial_dim_candidates[0]
+
+    trial_coord_candidates = [c for c in da.coords if c.startswith("trial_index_")]
+    if len(trial_coord_candidates) != 1:
+        # fallback to generic
+        trial_coord_candidates = [c for c in da.coords if c == "trial_index"]
+        if len(trial_coord_candidates) != 1:
+            raise ValueError("Could not determine the trial_index coordinate name.")
+    trial_coord = trial_coord_candidates[0]
+
+    # ------------------------------------------------------------------ #
+    # 3) Apply trial / unit / time subsetting                            #
+    # ------------------------------------------------------------------ #
+    # Trial subset
+    if trial_ids is not None:
+        if trial_coord in da.coords and da.indexes.get(trial_coord) is not None:
+            da = da.sel({trial_coord: list(trial_ids)})
+        else:
+            mask = np.isin(da.coords[trial_coord].values, trial_ids)
+            da = da.isel({trial_dim: mask})
+
+    # Unit subset
     if unit_ids is not None:
         if "unit_index" in da.coords and da.indexes.get("unit_index") is not None:
             da = da.sel(unit_index=list(unit_ids))
         else:
             mask = np.isin(da.coords["unit_index"].values, unit_ids)
-            da   = da.isel(unit=mask)
+            da = da.isel(unit=mask)
 
-    # ──────────────────────────────────────────────────────────────────
-    # 4)  Time‑window slice  (the *time* coordinate is already along
-    #                         the "time" dimension)
-    # ──────────────────────────────────────────────────────────────────
+    # Time slice
     if time_window is not None:
         t0, t1 = time_window
         da = da.sel(time=slice(t0, t1))
 
     return da
+
 
 def load_zarr(
     zarr_path: Union[str, Path],
@@ -290,9 +340,8 @@ def load_zarr(
 
 def load_psth_from_zarr(
     zarr_path: Union[str, Path],
-    *,
     as_object: Literal["dataarray", "dataset"] = "dataarray",
-    event: Optional[str] = None,
+    align_to_event: Optional[str] = None,
     consolidated: bool = True,
 ) -> Union[xr.DataArray, xr.Dataset]:
     """
@@ -307,7 +356,7 @@ def load_psth_from_zarr(
         * "dataarray" → return a single PSTH DataArray.
             - Multi‑event case: you must specify *event*.
             - Single‑event case: the sole variable is returned automatically.
-    event : str or None, optional
+    align_to_event : str or None, optional
         Event name (without the ``psth_`` prefix) selecting which PSTH to
         return when ``as_object == "dataarray"``.  Ignored if
         ``as_object == "dataset"``.  If omitted and exactly one PSTH
@@ -347,7 +396,7 @@ def load_psth_from_zarr(
                 f"No variables starting with 'psth_' found in dataset at {zarr_path}."
             )
 
-        if event is None:
+        if align_to_event is None:
             if len(psth_vars) == 1:
                 var_name = psth_vars[0]
             else:
@@ -356,7 +405,7 @@ def load_psth_from_zarr(
                     f"{psth_vars} – please specify `event=`."
                 )
         else:
-            var_name = f"psth_{event}"
+            var_name = f"psth_{align_to_event}"
             if var_name not in ds:
                 raise KeyError(
                     f"PSTH variable '{var_name}' not found. "
