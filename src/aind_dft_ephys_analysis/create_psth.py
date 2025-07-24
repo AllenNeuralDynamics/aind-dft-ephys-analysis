@@ -23,64 +23,50 @@ def extract_neuron_psth_to_zarr(
     overwrite: bool = True,
 ) -> xr.Dataset:
     """
-    Compute per‑trial PSTHs for one or many alignment events and persist them as Zarr.
-
-    Each alignment event produces an independent PSTH cube stored as a separate
-    variable inside the returned Dataset. Because different events can have
-    different numbers of trials, each PSTH uses a **unique trial dimension**
-    name: ``trial_<event>`` and a matching coordinate ``trial_index_<event>``.
-
     Parameters
     ----------
     nwb_data : Any
-        NWB handle that provides:
-        * ``units['spike_times']`` – list‑of‑arrays (one array per unit)
-        * ``session_id`` – recording identifier (attribute)
-        * behavioural event data accessible through
-          :func:`extract_event_timestamps` and :func:`find_trials`.
-    units : Iterable[int] or None, optional
-        Explicit unit indices to include. ``None`` → automatically select all
-        units that pass QC via :func:`get_units_passed_default_qc`.
-    align_to_event : str or Sequence[str], default "go_cue"
-        Single event name or a sequence of event names. For each event a
-        variable named ``psth_<event>`` is created.
-    time_window : (float, float), default (-3.0, 5.0)
-        Time window relative to each event timestamp (seconds).
-        The first value is the start (negative allowed), the second the end.
+        NWB file handle. Must have:
+        - `nwb_data.units["spike_times"]`: list-of-arrays of spike timestamps per unit
+        - `nwb_data.session_id` attribute for naming output.
+    units : Optional[Iterable[int]], default None
+        Specific unit indices to include. If None, uses
+        `get_units_passed_default_qc(nwb_data)` to select all good units.
+    align_to_event : str or sequence of str, default "go_cue"
+        Name(s) of behavioral event(s) to align spike trains to. For each
+        event you get one `psth_<event>` and one `raster_<event>` variable.
+    time_window : tuple of (float, float), default (-3.0, 5.0)
+        Time window (in seconds) around each event timestamp. First value
+        is start (can be negative), second is end.
     bin_size : float, default 0.05
-        Histogram bin width in seconds. Firing rate is reported as
-        ``counts / bin_size`` (spikes per second).
-    trial_type : str or None, optional
-        Behavioural trial type label used to filter trials. ``None`` keeps all
-        trials for each event.
+        Bin width in seconds for PSTH computation. Firing rate is
+        `counts / bin_size` (spikes per second).
+    trial_type : Optional[str], default None
+        If provided, filters trials via `find_trials(nwb_data, trial_type)`.
+        Otherwise all trials for each event are kept.
     save_folder : str or Path, default "/root/capsule/results"
-        Directory where the Zarr folder will be written (created if missing).
-    save_name : str or None, optional
-        Output folder name. When ``None`` uses ``<session_id>.zarr``.
-        ``.zarr`` suffix is appended if absent.
+        Directory where the Zarr folder will be created (will be made if needed).
+    save_name : Optional[str], default None
+        Name of the output Zarr folder. If None, uses
+        `<session_id>.zarr`; “.zarr” is appended automatically otherwise.
     overwrite : bool, default True
-        If ``True`` and the destination folder already exists, it is deleted
-        before writing.
+        If True and the destination folder exists, it is deleted before writing.
 
     Returns
     -------
-    xarray.Dataset
-        Dataset containing one DataArray per event (variables
-        ``psth_<event>``). Each DataArray has dimensions
-        ``("unit", "trial_<event>", "time")`` and coordinates:
-        * ``unit_index`` – unit indices
-        * ``trial_index_<event>`` – integer trial indices for that event
-        * ``time`` – bin centres (seconds)
-
-        Dataset‑level attributes include ``align_to_events``,
-        ``n_trials_per_event``, and other metadata.
+    xr.Dataset
+        Contains, for each event in `align_to_event`:
+        - `psth_<event>` : DataArray of shape (unit × trial × time) with firing rates.
+        - `raster_<event>` : DataArray of shape (unit × trial × spike) with
+          raw spike-time offsets (s), padded with NaN.
 
     Raises
     ------
     ValueError
-        If ``align_to_event`` is empty or if no trials match the criteria for
-        a given event.
+        If `align_to_event` is empty or no trials match a given event.
     """
+
+    # 1. Determine units and events
     if units is None:
         units = get_units_passed_default_qc(nwb_data)
     units = list(units)
@@ -94,84 +80,116 @@ def extract_neuron_psth_to_zarr(
 
     start, end = time_window
     edges = np.arange(start, end + bin_size, bin_size)
-    centres = edges[:-1] + bin_size / 2.0
+    centers = edges[:-1] + bin_size / 2.0
 
     data_vars = {}
     n_trials_per_event = {}
 
     for evt in events:
-        all_event_times = np.asarray(extract_event_timestamps(nwb_data, evt), dtype=float)
+        # 2. Extract event times and trial indices
+        all_times = np.asarray(extract_event_timestamps(nwb_data, evt), dtype=float)
         if trial_type is not None:
-            trial_index = np.asarray(find_trials(nwb_data, trial_type), dtype=int)
-            event_times = all_event_times[trial_index]
+            trial_idx = np.asarray(find_trials(nwb_data, trial_type), dtype=int)
+            event_times = all_times[trial_idx]
         else:
-            event_times = all_event_times
-            trial_index = np.arange(len(event_times), dtype=int)
+            trial_idx = np.arange(len(all_times), dtype=int)
+            event_times = all_times
 
         if len(event_times) == 0:
-            raise ValueError(f"No trials matched criteria for event '{evt}'.")
+            raise ValueError(f"No trials matched for event '{evt}'.")
 
-        psth = np.zeros((len(units), len(event_times), len(centres)), dtype=np.float32)
+        n_u, n_t = len(units), len(event_times)
+
+        # 3. Compute PSTH
+        psth = np.zeros((n_u, n_t, len(centers)), dtype=np.float32)
+
+        # 4. Collect raw spike-time offsets per (unit, trial)
+        raster_lists = [[[] for _ in range(n_t)] for _ in range(n_u)]
         for ui, u in enumerate(units):
             spikes = np.asarray(nwb_data.units["spike_times"][u], dtype=float)
             for ti, t0 in enumerate(event_times):
                 rel = spikes - t0
+                # PSTH bin counts
                 counts, _ = np.histogram(rel, bins=edges)
                 psth[ui, ti, :] = counts / bin_size
+                # Raster: keep only offsets within [start, end]
+                mask = (rel >= start) & (rel <= end)
+                raster_lists[ui][ti] = rel[mask]
+
+        # 5. Pad raster lists into fixed-size array
+        max_spikes = max(len(raster_lists[ui][ti]) for ui in range(n_u) for ti in range(n_t))
+        raster = np.full((n_u, n_t, max_spikes), np.nan, dtype=np.float32)
+        for ui in range(n_u):
+            for ti in range(n_t):
+                sl = raster_lists[ui][ti]
+                raster[ui, ti, : len(sl)] = sl
 
         trial_dim = f"trial_{evt}"
-        da = xr.DataArray(
+        coord_trial = f"trial_index_{evt}"
+
+        # 6. Build DataArrays
+        da_psth = xr.DataArray(
             psth,
             dims=("unit", trial_dim, "time"),
             coords={
                 "unit_index": ("unit", units),
-                f"trial_index_{evt}": (trial_dim, trial_index),
-                "time": ("time", centres),
+                coord_trial: (trial_dim, trial_idx),
+                "time": ("time", centers),
             },
             name=f"psth_{evt}",
             attrs={
-                "session_id": getattr(nwb_data, "session_id", "unknown"),
                 "align_to_event": evt,
                 "time_window": time_window,
                 "bin_size": bin_size,
-                "trial_type": trial_type if trial_type else "all_trials",
-                "n_units": len(units),
-                "n_trials": len(event_times),
-                "created_with": "extract_neuron_psth_to_zarr",
+                "trial_type": trial_type or "all",
             },
         )
-        data_vars[f"psth_{evt}"] = da
-        n_trials_per_event[evt] = len(event_times)
+        da_raster = xr.DataArray(
+            raster,
+            dims=("unit", trial_dim, "spike"),
+            coords={
+                "unit_index": ("unit", units),
+                coord_trial: (trial_dim, trial_idx),
+                "spike": np.arange(max_spikes),
+            },
+            name=f"raster_{evt}",
+            attrs={
+                "align_to_event": evt,
+                "time_window": time_window,
+                "description": "relative spike times (s), padded with NaN",
+            },
+        )
 
+        data_vars[f"psth_{evt}"] = da_psth
+        data_vars[f"raster_{evt}"] = da_raster
+        n_trials_per_event[evt] = n_t
+
+    # 7. Assemble Dataset and save to Zarr
     ds = xr.Dataset(data_vars)
-    ds.attrs.update(
-        {
-            "session_id": getattr(nwb_data, "session_id", "unknown"),
-            "align_to_events": events,
-            "time_window": time_window,
-            "bin_size": bin_size,
-            "trial_type": trial_type if trial_type else "all_trials",
-            "n_units": len(units),
-            "n_trials_per_event": n_trials_per_event,
-            "created_with": "extract_neuron_psth_to_zarr",
-        }
-    )
+    ds.attrs.update({
+        "session_id": getattr(nwb_data, "session_id", "unknown"),
+        "align_to_events": events,
+        "bin_size": bin_size,
+        "n_units": len(units),
+        "n_trials_per_event": n_trials_per_event,
+        "created_with": "extract_neuron_psth_to_zarr",
+    })
 
-    session_id = getattr(nwb_data, "session_id", "unknown_session")
+    session_id = getattr(nwb_data, "session_id", "session")
     if save_name is None:
         save_name = f"{session_id}.zarr"
     elif not save_name.endswith(".zarr"):
         save_name += ".zarr"
 
-    save_folder = Path(save_folder).expanduser()
-    save_folder.mkdir(parents=True, exist_ok=True)
-    dest = save_folder / save_name
+    dest = Path(save_folder).expanduser() / save_name
     if dest.exists() and overwrite:
         import shutil
         shutil.rmtree(dest)
     ds.to_zarr(dest, mode="w", consolidated=True)
-    print(f"PSTHs saved to {dest}  [events={events}]")
+    print(f"PSTH and raster data saved to {dest} [events={events}]")
+
     return ds
+
 
 
 def load_psth_subset(
