@@ -356,46 +356,36 @@ def load_zarr(
     return xr.open_zarr(zarr_path, consolidated=consolidated)
 
 
-def load_psth_from_zarr(
+def load_psth_raster_from_zarr(
     zarr_path: Union[str, Path],
-    as_object: Literal["dataarray", "dataset"] = "dataarray",
+    load_type: Literal["psth", "raster", "both"] = "psth",
     align_to_event: Optional[str] = None,
     consolidated: bool = True,
 ) -> Union[xr.DataArray, xr.Dataset]:
     """
-    Load a Zarr folder created by `extract_neuron_psth_to_zarr`.
+    Load PSTH, raster, or both from a Zarr store created by extract_neuron_psth_to_zarr.
 
     Parameters
     ----------
     zarr_path : str or Path
-        Path to the “*.zarr” folder.
-    as_object : {"dataarray", "dataset"}, default "dataarray"
-        * "dataset"   → return the whole Dataset (all events).
-        * "dataarray" → return a single PSTH DataArray.
-            - Multi‑event case: you must specify *event*.
-            - Single‑event case: the sole variable is returned automatically.
+        Path to the “*.zarr” folder produced by `extract_neuron_psth_to_zarr`.
+    load_type : {"psth", "raster", "both"}, default "psth"
+        • "psth"   → return a single PSTH DataArray (psth_<event>).
+        • "raster" → return a single raster DataArray (raster_<event>).
+        • "both"   → return a Dataset containing all psth_* and raster_* variables.
     align_to_event : str or None, optional
-        Event name (without the ``psth_`` prefix) selecting which PSTH to
-        return when ``as_object == "dataarray"``.  Ignored if
-        ``as_object == "dataset"``.  If omitted and exactly one PSTH
-        variable exists, that one is used.
+        When loading a single DataArray ("psth" or "raster") and multiple events exist,
+        this selects which event (without prefix) to load. If omitted and only one
+        matching variable exists, that one is returned automatically.
     consolidated : bool, default True
-        Use consolidated metadata (faster when written with
-        ``consolidated=True``).
+        Whether to use consolidated metadata (faster when written with consolidated=True).
 
     Returns
     -------
-    xarray.Dataset or xarray.DataArray
-        Dataset with all PSTHs, or the selected single PSTH DataArray.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the Zarr path does not exist.
-    KeyError
-        If the requested event variable is missing.
-    ValueError
-        If multiple events exist but *event* is not provided.
+    xarray.DataArray or xarray.Dataset
+        Depending on `load_type`:
+        - DataArray for a single psth_ or raster_ variable.
+        - Dataset containing all psth_* and raster_* variables if `load_type=="both"`.
     """
     zarr_path = Path(zarr_path).expanduser()
     if not zarr_path.exists():
@@ -403,37 +393,38 @@ def load_psth_from_zarr(
 
     ds = xr.open_zarr(zarr_path, consolidated=consolidated)
 
-    if as_object == "dataset":
-        return ds
-    elif as_object == "dataarray":
-        # collect variables that follow the multi‑event naming scheme
-        psth_vars = [v for v in ds.data_vars if v.startswith("psth_")]
+    psth_vars   = [v for v in ds.data_vars if v.startswith("psth_")]
+    raster_vars = [v for v in ds.data_vars if v.startswith("raster_")]
 
-        if not psth_vars:
-            raise KeyError(
-                f"No variables starting with 'psth_' found in dataset at {zarr_path}."
-            )
+    # BOTH → return a Dataset with both sets of variables
+    if load_type == "both":
+        if not (psth_vars or raster_vars):
+            raise KeyError("No psth_ or raster_ variables found in dataset.")
+        return ds[psth_vars + raster_vars]
 
-        if align_to_event is None:
-            if len(psth_vars) == 1:
-                var_name = psth_vars[0]
-            else:
-                raise ValueError(
-                    "Multiple PSTH variables found "
-                    f"{psth_vars} – please specify `align_to_event=`."
-                )
-        else:
-            var_name = f"psth_{align_to_event}"
-            if var_name not in ds:
-                raise KeyError(
-                    f"PSTH variable '{var_name}' not found. "
-                    f"Available: {psth_vars}"
-                )
-
-        return ds[var_name]
+    # determine which set to pick
+    if load_type == "psth":
+        var_list, prefix = psth_vars, "psth_"
+    elif load_type == "raster":
+        var_list, prefix = raster_vars, "raster_"
     else:
-        raise ValueError("`as_object` must be 'dataarray' or 'dataset'")
+        raise ValueError("`load_type` must be 'psth', 'raster', or 'both'.")
 
+    if not var_list:
+        raise KeyError(f"No variables starting with '{prefix}' found in dataset.")
+
+    # select single variable
+    if align_to_event is None:
+        if len(var_list) == 1:
+            chosen = var_list[0]
+        else:
+            raise ValueError(f"Multiple variables found {var_list}; please specify `align_to_event=`.")
+    else:
+        chosen = f"{prefix}{align_to_event}"
+        if chosen not in ds:
+            raise KeyError(f"Variable '{chosen}' not found. Available: {var_list}")
+
+    return ds[chosen]
 
 
 def mean_firing_rate_matrix(
