@@ -493,7 +493,6 @@ def mean_firing_rate_matrix(
 
 def plot_psth_raster_for_units(
     source: Union[str, Path, xr.DataArray, xr.Dataset],
-    *,
     unit_ids: Optional[Sequence[int]] = None,
     trial_ids: Optional[Union[Sequence[int], Sequence[Sequence[int]]]] = None,
     trial_types: Optional[Sequence[str]] = None,
@@ -608,12 +607,14 @@ def plot_psth_raster_for_units(
         fig, (ax_rast, ax_psth) = plt.subplots(2, 1, figsize=figsize, sharex=True, sharey=sharey)
 
         # Raster plot
+        y_raster=0
         for label, tids in trial_groups.items():
             for ti, tval in enumerate(unit_raster.coords[trial_coord].values):
                 if tval in tids:
+                    y_raster = y_raster+1
                     spikes = unit_raster.isel({trial_dim: ti}).values
                     spikes = spikes[~np.isnan(spikes)]
-                    ax_rast.vlines(spikes, ti, ti + 1, color=group_colors[label], alpha=0.7)
+                    ax_rast.vlines(spikes, y_raster, y_raster + 1, color=group_colors[label], alpha=0.7)
         ax_rast.axvline(0, color='k', ls='--', lw=0.8)  # event line
         ax_rast.set_ylabel('Trial')
         ax_rast.set_title(f'Unit {unit}')
