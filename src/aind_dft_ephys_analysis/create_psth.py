@@ -300,7 +300,8 @@ def load_psth_raster_subset(
     if time_window is not None:
         t0, t1 = time_window
         psth_da = psth_da.sel(time=slice(t0, t1))
-
+        raster_da = raster_da.where((raster_da >= t0) & (raster_da <= t1), other=np.nan)
+        
     return psth_da, raster_da
 
 
