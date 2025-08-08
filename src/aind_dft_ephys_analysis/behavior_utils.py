@@ -497,8 +497,19 @@ def extract_fitted_data(
         # ----- choice probabilities -----
         if base_name in ('right_choice_probability', 'left_choice_probability'):
             cp = np.array(FL['choice_prob'][1]) if base_name == 'right_choice_probability' else np.array(FL['choice_prob'][0])
-            return _trim_series(cp, 'right_choice_probability or left_choice_probability', suffix)
-        
+            if suffix == '':
+                return cp
+            elif suffix == '-1':
+                # drop last valid trial, then append a 0 to the begining to keep length consistent
+                trimmed = cp[:-1]
+                return np.insert(trimmed, 0, 0)
+            elif suffix == '+1':
+                # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
+                trimmed = cp[1:]
+                return np.append(trimmed, 0)
+            else:
+                return None
+
         # ----- Reward Prediction Error (RPE) -----
         if base_name == 'RPE' and model_alias=='ForagingCompareThreshold':
             trials = nwb_behavior_data.trials
