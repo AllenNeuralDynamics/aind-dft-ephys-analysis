@@ -1,11 +1,12 @@
-from behavior_utils import extract_fitted_data
-import pandas as pd
-from typing import List, Any
-
+import os
 import numpy as np
 import pandas as pd
-from typing import List, Any
+from pathlib import Path
+from collections.abc import Iterable
+from typing import List, Any, Union, Optional
+
 from behavior_utils import extract_fitted_data
+from nwb_utils import NWBUtils
 
 def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
     """
@@ -118,33 +119,51 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
 
     return df
 
-
-
-def find_unique_combinations(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+def find_unique_combinations(
+    df: pd.DataFrame,
+    columns: List[str],
+    count_col: str = "n_trials",
+    include_na: bool = True,
+) -> pd.DataFrame:
     """
-    Find all unique value combinations in the given columns of a DataFrame.
-    
+    Find unique value combinations in the given columns and count trials per combo.
+
     Parameters
     ----------
     df : pd.DataFrame
-        DataFrame containing the data (e.g., from create_opto_data_frame).
+        Source DataFrame (e.g., from create_opto_data_frame).
     columns : list of str
         Column names to check for unique combinations.
-    
+    count_col : str, default "n_trials"
+        Name of the count column in the output.
+    include_na : bool, default True
+        If True, include groups where at least one column is NA/None.
+        If False, drop rows with NA in any of the specified columns before grouping.
+
     Returns
     -------
     pd.DataFrame
-        DataFrame containing unique combinations (no duplicates).
+        One row per unique combination with a '{count_col}' column.
     """
-    # Validate columns exist
-    missing_cols = [col for col in columns if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Columns not found in DataFrame: {missing_cols}")
-    
-    # Get unique combinations
-    unique_combinations = df[columns].drop_duplicates().reset_index(drop=True)
-    
-    return unique_combinations
+    # Validate columns
+    missing = [c for c in columns if c not in df.columns]
+    if missing:
+        raise ValueError(f"Columns not found in DataFrame: {missing}")
+
+    work = df[columns].copy()
+    if not include_na:
+        work = work.dropna(subset=columns)
+
+    # Group and count
+    out = (
+        work.groupby(columns, dropna=include_na)
+            .size()
+            .reset_index(name=count_col)
+            .sort_values(by=count_col, ascending=False, kind="stable")
+            .reset_index(drop=True)
+    )
+    return out
+
 
 
 def find_unique_stimulation(
@@ -191,3 +210,122 @@ def find_unique_stimulation(
     # Use your helper to get unique combos
     return find_unique_combinations(df, present)
 
+def _collect_nwb_files(sources: Union[str, Path, Iterable[Union[str, Path]]]) -> List[Path]:
+    """
+    Normalize input into a list of .nwb file Paths.
+    - If a folder is provided, collect all *.nwb in it.
+    - If a list/tuple is provided, accept file Paths (and optionally folders).
+    """
+    files: List[Path] = []
+
+    def _is_iterable_but_not_str(x):
+        return isinstance(x, Iterable) and not isinstance(x, (str, bytes, Path))
+
+    if _is_iterable_but_not_str(sources):
+        for item in sources:
+            p = Path(item)
+            if p.is_dir():
+                files.extend(sorted(p.glob("*.nwb")))
+            elif p.is_file() and p.suffix.lower() == ".nwb":
+                files.append(p)
+            else:
+                print(f"Warning: Skipping non-existent or non-NWB path: {p}")
+    else:
+        p = Path(sources)
+        if p.is_dir():
+            files = sorted(p.glob("*.nwb"))
+        elif p.is_file() and p.suffix.lower() == ".nwb":
+            files = [p]
+        else:
+            raise FileNotFoundError(f"Input is neither a folder nor a valid .nwb file: {p}")
+
+    # dedupe & ensure existence
+    files = sorted({f.resolve() for f in files if f.exists()})
+    if not files:
+        raise FileNotFoundError("No NWB files found to process.")
+    return files
+
+
+def create_opto_data_frame_combined(
+    sources: Union[str, Path, Iterable[Union[str, Path]]] = "/root/capsule/data/optogenetics_nwb",
+    save_path: Optional[Union[str, Path]] = None
+) -> pd.DataFrame:
+    """
+    Build and (optionally) save a combined per-trial DataFrame from one or more NWB files.
+
+    Parameters
+    ----------
+    sources : str | Path | Iterable[str|Path]
+        - A folder containing .nwb files, OR
+        - A single .nwb path, OR
+        - A list/tuple of .nwb paths (and/or folders).
+    save_path : str | Path, optional
+        If provided, write the combined CSV to this path.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Trials from all sessions concatenated (row-wise).
+    """
+    nwb_files = _collect_nwb_files(sources)
+
+    combined: List[pd.DataFrame] = []
+    for nwb_path in nwb_files:
+        print(f"Processing {nwb_path}...")
+        nwb_data = NWBUtils.read_behavior_nwb(nwb_full_path=str(nwb_path))
+        if nwb_data is None:
+            print(f"Warning: Could not read NWB file {nwb_path}, skipping.")
+            continue
+
+        try:
+            df = create_opto_data_frame(nwb_data)
+            combined.append(df)
+        except Exception as e:
+            print(f"Error processing {nwb_path}: {e}")
+        finally:
+            try:
+                nwb_data.io.close()
+            except Exception:
+                pass
+
+    if not combined:
+        raise ValueError("No valid DataFrames were created from the input NWB files.")
+
+    combined_df = pd.concat(combined, ignore_index=True)
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        combined_df.to_csv(save_path, index=False)
+        print(f"Combined DataFrame saved to {save_path}")
+
+    return combined_df
+
+def load_opto_data_frame(csv_path: Union[str, Path]) -> pd.DataFrame:
+    """
+    Load a saved optogenetics combined CSV file back into a DataFrame.
+
+    This restores None values in latent variable columns where NaN was saved,
+    so the DataFrame matches the output format of `create_opto_data_frame_combined`.
+
+    Parameters
+    ----------
+    csv_path : str | Path
+        Path to the saved CSV file from `create_opto_data_frame_combined`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame ready for downstream analysis.
+    """
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    # Read CSV (all as object so we can restore None where needed)
+    df = pd.read_csv(csv_path, dtype=object)
+
+    # Replace 'nan' strings or float NaN with None
+    df = df.where(pd.notna(df), None)
+
+    return df
