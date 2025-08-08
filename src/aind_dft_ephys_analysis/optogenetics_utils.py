@@ -248,45 +248,81 @@ def _collect_nwb_files(sources: Union[str, Path, Iterable[Union[str, Path]]]) ->
 
 def create_opto_data_frame_combined(
     sources: Union[str, Path, Iterable[Union[str, Path]]] = "/root/capsule/data/optogenetics_nwb",
-    save_path: Optional[Union[str, Path]] = None
+    save_path: Optional[Union[str, Path]] = None,
+    show_progress: bool = True
 ) -> pd.DataFrame:
     """
-    Build and (optionally) save a combined per-trial DataFrame from one or more NWB files.
+    Build and (optionally) save a combined per-trial DataFrame from one or more NWB files,
+    with progress output.
 
     Parameters
     ----------
-    sources : str | Path | Iterable[str|Path]
+    sources : str | Path | Iterable[str|Path], default "/root/capsule/data/optogenetics_nwb"
         - A folder containing .nwb files, OR
         - A single .nwb path, OR
         - A list/tuple of .nwb paths (and/or folders).
     save_path : str | Path, optional
-        If provided, write the combined CSV to this path.
+        If provided, write the combined CSV to this path. If a directory is given,
+        the file 'combined_opto_data_frame.csv' will be created inside it.
+    show_progress : bool, default True
+        If True, display a progress bar (tqdm if available) or simple prints.
 
     Returns
     -------
     pandas.DataFrame
         Trials from all sessions concatenated (row-wise).
     """
+    # Collect files
     nwb_files = _collect_nwb_files(sources)
+    total = len(nwb_files)
+
+    # Progress helper
+    pbar = None
+    use_tqdm = False
+    if show_progress:
+        try:
+            from tqdm.auto import tqdm
+            pbar = tqdm(total=total, desc="Processing NWB files", unit="file")
+            use_tqdm = True
+        except Exception:
+            print(f"Processing {total} NWB file(s)...")
 
     combined: List[pd.DataFrame] = []
-    for nwb_path in nwb_files:
-        print(f"Processing {nwb_path}...")
+    for i, nwb_path in enumerate(nwb_files, start=1):
+        if show_progress and not use_tqdm:
+            print(f"[{i}/{total}] {nwb_path}")
+
         nwb_data = NWBUtils.read_behavior_nwb(nwb_full_path=str(nwb_path))
         if nwb_data is None:
-            print(f"Warning: Could not read NWB file {nwb_path}, skipping.")
+            msg = f"Warning: Could not read NWB file {nwb_path}, skipping."
+            if use_tqdm:
+                pbar.write(msg)  # keep tqdm bar intact
+            else:
+                print(msg)
+            if use_tqdm:
+                pbar.update(1)
             continue
 
         try:
             df = create_opto_data_frame(nwb_data)
             combined.append(df)
         except Exception as e:
-            print(f"Error processing {nwb_path}: {e}")
+            msg = f"Error processing {nwb_path}: {e}"
+            if use_tqdm:
+                pbar.write(msg)
+            else:
+                print(msg)
         finally:
             try:
                 nwb_data.io.close()
             except Exception:
                 pass
+
+        if use_tqdm:
+            pbar.update(1)
+
+    if use_tqdm and pbar is not None:
+        pbar.close()
 
     if not combined:
         raise ValueError("No valid DataFrames were created from the input NWB files.")
@@ -295,11 +331,19 @@ def create_opto_data_frame_combined(
 
     if save_path is not None:
         save_path = Path(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
+        # If a directory is given, place default filename inside it
+        if save_path.suffix.lower() != ".csv":
+            save_path.mkdir(parents=True, exist_ok=True)
+            save_path = save_path / "combined_opto_data_frame.csv"
+        else:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+
         combined_df.to_csv(save_path, index=False)
-        print(f"Combined DataFrame saved to {save_path}")
+        if show_progress:
+            print(f"Combined DataFrame saved to {save_path}")
 
     return combined_df
+
 
 def load_opto_data_frame(
     csv_path: Union[str, Path] = "/root/capsule/results/combined_opto_data_frame.csv"
