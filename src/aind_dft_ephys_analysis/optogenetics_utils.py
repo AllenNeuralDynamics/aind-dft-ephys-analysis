@@ -301,7 +301,9 @@ def create_opto_data_frame_combined(
 
     return combined_df
 
-def load_opto_data_frame(csv_path: Union[str, Path]) -> pd.DataFrame:
+def load_opto_data_frame(
+    csv_path: Union[str, Path] = "/root/capsule/results/combined_opto_data_frame.csv"
+) -> pd.DataFrame:
     """
     Load a saved optogenetics combined CSV file back into a DataFrame.
 
