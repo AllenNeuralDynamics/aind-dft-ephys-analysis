@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from collections.abc import Iterable
-from typing import List, Any, Union, Optional
+from typing import List, Any, Union, Optional, Dict
 
 from behavior_utils import extract_fitted_data
 from nwb_utils import NWBUtils
@@ -375,3 +375,61 @@ def load_opto_data_frame(
     df = df.where(pd.notna(df), None)
 
     return df
+
+
+def find_unique_values_by_conditions(
+    df: pd.DataFrame,
+    conditions: Dict[str, Any],
+    output_column: str,
+    dropna: bool = True,
+) -> List[Any]:
+    """
+    Filter rows by a set of equality/isin conditions and return unique values
+    from `output_column`.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Source DataFrame (e.g., from create_opto_data_frame).
+    conditions : dict
+        Mapping of column -> value(s) to match. Each value can be:
+          - a single value (== comparison),
+          - an iterable of values (isin comparison),
+          - None (match NA/None in that column).
+        Example: {"laser_start": "Go cue", "laser_end": "Trial start"}
+    output_column : str
+        Column whose unique values to return from the matched rows.
+    dropna : bool, default True
+        Whether to drop NA/None in the output before taking uniques.
+
+    Returns
+    -------
+    list
+        List of unique values in `output_column` among rows that satisfy all conditions.
+
+    Raises
+    ------
+    ValueError
+        If any referenced column does not exist.
+    """
+    # Validate columns
+    cols_needed = set(conditions.keys()) | {output_column}
+    missing = [c for c in cols_needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Columns not found in DataFrame: {missing}")
+
+    # Build boolean mask
+    mask = pd.Series(True, index=df.index)
+    for col, val in conditions.items():
+        if val is None:
+            mask &= df[col].isna()
+        elif isinstance(val, (list, tuple, set)):
+            mask &= df[col].isin(list(val))
+        else:
+            mask &= (df[col] == val)
+
+    series = df.loc[mask, output_column]
+    if dropna:
+        series = series.dropna()
+
+    return series.drop_duplicates().tolist()
