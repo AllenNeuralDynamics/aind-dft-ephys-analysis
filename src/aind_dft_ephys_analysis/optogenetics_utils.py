@@ -349,32 +349,39 @@ def load_opto_data_frame(
     csv_path: Union[str, Path] = "/root/capsule/results/combined_opto_data_frame.csv"
 ) -> pd.DataFrame:
     """
-    Load a saved optogenetics combined CSV file back into a DataFrame.
-
-    This restores None values in latent variable columns where NaN was saved,
-    so the DataFrame matches the output format of `create_opto_data_frame_combined`.
+    Load a saved optogenetics combined CSV and normalize missing values so they
+    match the in-memory representation from `create_opto_data_frame_combined`
+    (i.e., use Python `None` in object columns instead of 'nan'/'None' strings).
 
     Parameters
     ----------
     csv_path : str | Path
-        Path to the saved CSV file from `create_opto_data_frame_combined`.
+        Path to the saved CSV file.
 
     Returns
     -------
     pandas.DataFrame
-        DataFrame ready for downstream analysis.
     """
     csv_path = Path(csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
-    # Read CSV (all as object so we can restore None where needed)
-    df = pd.read_csv(csv_path, dtype=object)
+    # Read as strings; don't auto-convert to NaN so we can normalize ourselves
+    df = pd.read_csv(
+        csv_path,
+        dtype=str,
+        keep_default_na=False,   # don't treat 'NA', 'NaN', etc. as NaN automatically
+        na_values=[]             # disable built-in NA parsing
+    )
 
-    # Replace 'nan' strings or float NaN with None
-    df = df.where(pd.notna(df), None)
+    NULL_STRINGS = {"", "None", "none", "NULL", "null", "NaN", "nan", "NAN", "<NA>", "<na>"}
+
+    # Normalize null-like entries to actual None
+    for col in df.columns:
+        df[col] = df[col].map(lambda x: None if x in NULL_STRINGS else x)
 
     return df
+
 
 
 def find_unique_values_by_conditions(
