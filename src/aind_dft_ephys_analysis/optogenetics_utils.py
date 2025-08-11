@@ -15,6 +15,14 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
     `QLearning_L1F1_CK1_softmax` **only to trials with a response** (animal_response != 2).
     For no-response trials, latent columns are set to `None`.
 
+    Additionally, add four boolean columns describing stay/switch patterns:
+      - stay:        current choice equals previous choice (both trials are responses)
+      - switch:      current choice differs from previous choice (both trials are responses)
+      - win_stay:    previous trial rewarded AND stay
+      - lose_switch: previous trial unrewarded AND switch
+
+    If the previous trial is a no-response, all four flags are False for the current trial.
+
     Parameters
     ----------
     nwb_data : object
@@ -30,6 +38,7 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
         - all trial fields from the NWB `trials` table,
         - `session` (cleaned from `nwb_data.session_id`),
         - all columns from `nwb_data.scratch['metadata']`,
+        - `stay`, `switch`, `win_stay`, `lose_switch` (booleans),
         - latent-variable columns named like
           `QLearning_L1F1_CK1_softmax-<latent_name>` for each requested latent,
           where rows with no response contain `None`.
@@ -49,8 +58,8 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
     so each latent series must have length equal to the number of response trials.
     """
     # --- trials table ---
-    trials = nwb_data.intervals['trials']
-    df = trials.to_dataframe().copy()
+    trials_tbl = nwb_data.intervals['trials']
+    df = trials_tbl.to_dataframe().copy()
     df.index.name = 'trial_id'
     n_trials = len(df)
 
@@ -67,7 +76,38 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
     for k, v in meta_df.iloc[0].to_dict().items():
         df[k] = v
 
-    # --- response mask (valid trials) ---
+    # --- response & reward arrays from the NWB trials table ---
+    # 0=left, 1=right, 2=no-response
+    resp = nwb_data.trials['animal_response'][:]
+    # reward status for each trial (True if either side rewarded)
+    rewardedL = nwb_data.trials['rewarded_historyL'][:]
+    rewardedR = nwb_data.trials['rewarded_historyR'][:]
+    rewarded = np.logical_or(rewardedL, rewardedR).astype(bool)
+
+    # --- compute stay/switch and win_stay/lose_switch ---
+    # previous-trial arrays (roll by 1; set first entry to invalid defaults)
+    prev_resp = np.roll(resp, 1)
+    prev_resp[0] = 2  # mark as no-response for t=0 so all flags become False
+
+    prev_rew = np.roll(rewarded, 1)
+    prev_rew[0] = False
+
+    valid_prev = (prev_resp != 2)     # previous trial must be a response
+    valid_curr = (resp != 2)          # current trial must be a response
+
+    stay_arr = (resp == prev_resp) & valid_prev & valid_curr
+    switch_arr = (resp != prev_resp) & valid_prev & valid_curr
+
+    win_stay_arr = prev_rew & stay_arr
+    lose_switch_arr = (~prev_rew) & switch_arr & valid_prev  # valid_prev already in switch_arr
+
+    # attach columns (bool dtype)
+    df['stay'] = stay_arr
+    df['switch'] = switch_arr
+    df['win_stay'] = win_stay_arr
+    df['lose_switch'] = lose_switch_arr
+
+    # --- response mask (valid trials) for latent placement ---
     responses = nwb_data.trials['animal_response'][:]
     valid_mask = (responses != 2)
     valid_idx = np.where(valid_mask)[0]
@@ -109,7 +149,6 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
 
         # Build column: None for no-response, values for valid trials
         col = [None] * n_trials
-        # Ensure list-like
         values = arr.tolist() if hasattr(arr, "tolist") else list(arr)
         for pos, trial_i in enumerate(valid_idx):
             col[trial_i] = values[pos]
@@ -118,6 +157,7 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
         df[f'{model_alias}-{ln}'] = pd.Series(col, dtype=object)
 
     return df
+
 
 def find_unique_combinations(
     df: pd.DataFrame,
