@@ -5,13 +5,17 @@ from typing import List, Dict, Any, Tuple, Optional, Union
 
 def plot_stay_switch_over_window(
     combined_dataframe: pd.DataFrame,
-    vis_types: List[str] = ("stay", "switch", "win_stay", "lose_switch","response"),
+    vis_types: List[str] = ("stay", "switch", "win_stay", "lose_switch", "response"),
     window: Union[int, Tuple[int, int]] = (-2, 2),
     criteria: Optional[Dict[str, Any]] = None,
     session_col: str = "session",
     subject_col: str = "subject_id",
     laser_col: str = "laser_on_trial",
     time_col: str = "trial_num",
+    line_by: str = "session",  # {"session", "subject"}
+    # (optional) narrow the dataset
+    subject: Optional[str] = None,
+    session: Optional[str] = None,
     share_y: bool = True,
     return_table: bool = False,
     figsize: Tuple[float, float] = (6.0, 4.5),
@@ -24,57 +28,59 @@ def plot_stay_switch_over_window(
       - offset = 0   → the selected **opto** trials themselves (anchors)
       - offset = ±k  → **non-opto** trials at k trials before/after each anchor (within the same session)
 
-    Each session is drawn as a line. Sessions from the same subject (mouse) share the same color.
+    Each line represents either a **session** or a **subject**, controlled by `line_by`.
+      - line_by="session"  → one line per session (default behavior)
+      - line_by="subject"  → sessions are pooled within subject using a weighted mean by `n_trials`
 
     Parameters
     ----------
     combined_dataframe : pandas.DataFrame
-        The per-trial, concatenated DataFrame (e.g., from `create_opto_data_frame_combined` or
-        `load_opto_data_frame`). Must include:
-          - boolean-like metric columns: 'stay', 'switch', 'win_stay', 'lose_switch'
-          - a session identifier column (default: 'session')
-          - a subject identifier column (default: 'subject_id')
-          - an opto flag column (default: 'laser_on_trial') that may be 1/0, '1'/'0', True/False, etc.
-          - an order key per session (default: 'trial_num'); if missing, function will fall back to
-            'start_time' (if present) or row order.
+        Per-trial DataFrame (e.g., from `create_opto_data_frame_combined` or `load_opto_data_frame`).
+        Must include:
+          - boolean-like metrics: 'stay', 'switch', 'win_stay', 'lose_switch' (and optionally 'response')
+          - session id column (default: 'session')
+          - subject id column (default: 'subject_id')
+          - opto flag column (default: 'laser_on_trial'): accepts 1/0, '1'/'0', True/False, etc.
+          - within-session order column (default: 'trial_num'); if missing, falls back to 'start_time' or row order.
 
-    vis_types : list[str], default ("stay", "switch", "win_stay", "lose_switch")
-        Which metrics to plot. Any subset of:
-        ['stay', 'switch', 'win_stay', 'lose_switch'].
+    vis_types : list[str], default ("stay", "switch", "win_stay", "lose_switch", "response")
+        Which metrics to plot.
 
     window : int | tuple[int, int], default (-2, 2)
-        Inclusive range of integer offsets around opto anchors to evaluate.
-        - If an int n is provided → offsets = [-n, ..., -1, 0, 1, ..., n].
-        - If a (lo, hi) tuple is provided → offsets = [lo, ..., hi].
-        Offset 0 is always included and represents anchor opto trials.
+        Inclusive offset range around anchors. If int n → offsets = [-n..n]. If (lo, hi) → [lo..hi].
 
     criteria : dict | None, default None
-        Additional filters to **select opto anchors**. Keys are column names; values may be:
-          - None → require NA/None in that column,
-          - list/tuple/set → require value ∈ given set (via .isin),
-          - anything else → require equality (==).
-        If `None`, all opto trials are used as anchors.
+        Extra filters to **select opto anchors** (applied after opto=True).
+        Values: None → isna; list/tuple/set → isin; else → equality.
 
     session_col : str, default "session"
-        Column name for session identifier. Trials are grouped and offset-calculated within sessions.
+        Column name for session identifier.
 
     subject_col : str, default "subject_id"
-        Column name for subject (mouse) identifier. Sessions from the same subject share a color.
+        Column name for subject (mouse) identifier.
 
     laser_col : str, default "laser_on_trial"
-        Column indicating opto vs non-opto. May be 1/0, '1'/'0', True/False, 'true'/'false', etc.
-        Internally normalized to boolean.
+        Column indicating opto vs non-opto. Internally normalized to boolean.
 
     time_col : str, default "trial_num"
-        Column defining within-session order. If missing, the function falls back to 'start_time'
-        (if present), else to the existing row order. The function assigns a per-session integer index
-        '_trial_idx' and computes offsets on that index.
+        Column defining within-session order (used for sorting only).
+        A fresh per-session index '_trial_idx' is created for offset math.
+
+    line_by : {"session","subject"}, default "session"
+        - "session": draw one line per session.
+        - "subject": pool sessions within each subject (weighted by `n_trials`) and draw one line per subject.
+
+    subject : str | None, default None
+        Optional: restrict to a single subject before plotting.
+
+    session : str | None, default None
+        Optional: restrict to a single session before plotting.
 
     share_y : bool, default True
-        If True, all figures use y-limits [0, 1] to keep rate scale consistent.
+        If True, fix y-limits to [0, 1] for all figures.
 
     return_table : bool, default False
-        If True, also returns the tidy summary table used to make the plots.
+        If True, also return the tidy summary table used to make the plots.
 
     figsize : tuple[float, float], default (6.0, 4.5)
         Figure size for each metric plot.
@@ -85,24 +91,14 @@ def plot_stay_switch_over_window(
         Mapping from metric name to its matplotlib Figure.
 
     summary_df : pandas.DataFrame, optional
-        Only returned when `return_table=True`. Tidy table with columns:
-          ['session', 'subject_id', 'metric', 'offset', 'rate', 'n_trials']
-        where 'rate' is the fraction of True values among valid trials at that offset and
-        'n_trials' is the number of non-NA metric entries used at that point.
+        Returned when `return_table=True`. Columns:
+        ['session', 'subject_id', 'metric', 'offset', 'rate', 'n_trials'] (pre-aggregation).
 
     Raises
     ------
     ValueError
-        If required columns are missing or if no data can be plotted (e.g., no anchors found).
-
-    Notes
-    -----
-    - Metric columns are robustly coerced to boolean with NA support, so strings like "False" will
-      be parsed as False (not truthy).
-    - When multiple anchors map to the same control trial at a given offset, that control trial is
-      deduplicated (counted once).
+        If required columns are missing or if no data remains after filtering.
     """
-
     df = combined_dataframe.copy()
 
     # ---------- validation ----------
@@ -111,7 +107,7 @@ def plot_stay_switch_over_window(
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    valid_metrics = {"stay", "switch", "win_stay", "lose_switch","response"}
+    valid_metrics = {"stay", "switch", "win_stay", "lose_switch", "response"}
     vis_types = list(vis_types)
     bad = sorted(set(vis_types) - valid_metrics)
     if bad:
@@ -120,9 +116,19 @@ def plot_stay_switch_over_window(
     if miss_metrics:
         raise ValueError(f"Missing metric columns: {miss_metrics}")
 
+    if line_by not in {"session", "subject"}:
+        raise ValueError("line_by must be 'session' or 'subject'.")
+
+    # ---------- optional narrowing ----------
+    if subject is not None:
+        df = df[df[subject_col].astype(str) == str(subject)]
+    if session is not None:
+        df = df[df[session_col].astype(str) == str(session)]
+    if df.empty:
+        raise ValueError("No data left after applying subject/session filters.")
+
     # ---------- helpers: robust coercions ----------
     def _as_opto_bool(s: pd.Series) -> pd.Series:
-        """Coerce laser flag to boolean. Accepts 1/0, '1'/'0', True/False, 'true'/'false', 'yes'/'no', 'on'/'off'."""
         if pd.api.types.is_bool_dtype(s):
             return s.fillna(False)
         truthy = {"1", "true", "yes", "on", "y", "t"}
@@ -145,7 +151,6 @@ def plot_stay_switch_over_window(
         return s.map(parse)
 
     def _as_bool_series(s: pd.Series) -> pd.Series:
-        """Coerce metric column to pandas 'boolean' dtype (with NA)."""
         if pd.api.types.is_bool_dtype(s):
             return s.astype("boolean")
         truthy = {"1", "true", "yes", "on", "y", "t"}
@@ -170,7 +175,6 @@ def plot_stay_switch_over_window(
     # ---------- normalize flags & ordering ----------
     df["_is_opto"] = _as_opto_bool(df[laser_col])
 
-    # sort within session by time_col (or 'start_time' or row order)
     order_cols = [session_col]
     if time_col in df.columns:
         order_cols.append(time_col)
@@ -179,7 +183,6 @@ def plot_stay_switch_over_window(
     df = df.sort_values(order_cols).reset_index(drop=True)
     df["_trial_idx"] = df.groupby(session_col).cumcount()
 
-    # ensure metric columns are boolean (with NA)
     for m in vis_types:
         df[m] = _as_bool_series(df[m])
 
@@ -190,13 +193,9 @@ def plot_stay_switch_over_window(
         lo, hi = window
         if lo > hi:
             lo, hi = hi, lo
-    offsets = list(range(lo, hi + 1))  # includes 0
+    offsets = list(range(lo, hi + 1))
 
-    # ---------- compute rates ----------
-    sessions = df[session_col].dropna().astype(str).unique().tolist()
-    rows = []
-
-    # criteria → opto anchor filter
+    # ---------- criteria helper ----------
     def _apply_criteria(x: pd.DataFrame, crit: Optional[Dict[str, Any]]) -> pd.DataFrame:
         if not crit:
             return x
@@ -212,15 +211,18 @@ def plot_stay_switch_over_window(
                 mask &= (x[k] == v)
         return x[mask]
 
-    for sess in sessions:
-        g = df[df[session_col] == sess].copy()
+    # ---------- compute per-session rates table ----------
+    session_ids = df[session_col].dropna().astype(str).unique().tolist()
+    rows = []
+
+    for sess_id in session_ids:
+        g = df[df[session_col] == sess_id].copy()
         if g.empty:
             continue
 
-        subj = str(g[subject_col].iloc[0])
+        subj_id = str(g[subject_col].iloc[0])
         n_trials = len(g)
 
-        # anchors: all opto trials if criteria None; otherwise filtered opto
         anchors = _apply_criteria(g[g["_is_opto"]], criteria)
         if anchors.empty:
             continue
@@ -237,16 +239,15 @@ def plot_stay_switch_over_window(
                     cand_df = g.iloc[[]]
                 else:
                     hit = g[g["_trial_idx"].isin(tgt)]
-                    # control must be non-opto; dedupe by trial index
                     cand_df = hit[~hit["_is_opto"]].drop_duplicates(subset=["_trial_idx"])
 
             for metric in vis_types:
                 vals = cand_df[metric].dropna()
                 n_used = int(vals.shape[0])
-                rate = float(vals.mean()) if n_used > 0 else np.nan  # True=1, False=0
+                rate = float(vals.mean()) if n_used > 0 else np.nan
                 rows.append({
-                    "session": sess,
-                    "subject_id": subj,
+                    "session": sess_id,
+                    "subject_id": subj_id,
                     "metric": metric,
                     "offset": off,
                     "rate": rate,
@@ -255,33 +256,56 @@ def plot_stay_switch_over_window(
 
     summary_df = pd.DataFrame(rows)
     if summary_df.empty:
-        raise ValueError("No data to plot. Check your window/criteria and that opto trials exist.")
+        raise ValueError("No data to plot. Check filters/window/criteria and that opto trials exist.")
+
+    # ---------- optionally aggregate to per-subject lines ----------
+    if line_by == "subject":
+        # Weighted mean across sessions per subject/metric/offset (weight = n_trials)
+        subdf = summary_df.copy()
+        subdf = subdf[subdf["n_trials"] > 0]
+        if subdf.empty:
+            raise ValueError("No non-empty bins to aggregate for subjects.")
+        agg = (
+            subdf
+            .groupby(["subject_id", "metric", "offset"], as_index=False)
+            .apply(lambda g: pd.Series({
+                "rate": np.average(g["rate"].fillna(0), weights=g["n_trials"]) if g["n_trials"].sum() > 0 else np.nan,
+                "n_trials": int(g["n_trials"].sum())
+            }))
+        )
+        # For plotting consistency, fabricate a 'session' label equal to subject_id
+        agg = agg.rename(columns={"subject_id": "label"})
+        agg["subject_id"] = agg["label"]
+        agg["session"] = agg["label"]
+        plot_table = agg[["session", "subject_id", "metric", "offset", "rate", "n_trials"]].copy()
+        line_labels = sorted(plot_table["session"].unique().tolist())  # equals subjects
+    else:
+        # per-session lines (as before)
+        plot_table = summary_df.copy()
+        plot_table = plot_table.rename(columns={"session": "session"})
+        line_labels = sorted(plot_table["session"].unique().tolist())
 
     # ---------- plot ----------
-    # Color by subject (consistent across figures)
-    subjects = sorted(summary_df["subject_id"].dropna().astype(str).unique().tolist())
-    cmap = plt.get_cmap("tab20", max(1, len(subjects)))
-    subject_to_color = {s: cmap(i % cmap.N) for i, s in enumerate(subjects)}
+    subjects_present = sorted(plot_table["subject_id"].dropna().astype(str).unique().tolist())
+    cmap = plt.get_cmap("tab20", max(1, len(subjects_present)))
+    subject_to_color = {s: cmap(i % cmap.N) for i, s in enumerate(subjects_present)}
 
-    all_sessions = sorted(summary_df["session"].dropna().astype(str).unique().tolist())
-    xticks = sorted(summary_df["offset"].dropna().unique().tolist())
-
+    xticks = sorted(plot_table["offset"].dropna().unique().tolist())
     figs = {}
+
     for metric in vis_types:
-        sub = summary_df[summary_df["metric"] == metric]
+        sub = plot_table[plot_table["metric"] == metric]
         if sub.empty:
             continue
 
         fig, ax = plt.subplots(figsize=figsize)
 
-        # one line per session
-        for sess in all_sessions:
-            s_df = sub[sub["session"] == sess].sort_values("offset")
+        for label in line_labels:
+            s_df = sub[sub["session"] == label].sort_values("offset")
             if s_df.empty:
                 continue
             subj = s_df["subject_id"].iloc[0]
             color = subject_to_color.get(subj, None)
-
             ax.plot(
                 s_df["offset"].values,
                 s_df["rate"].values,
@@ -291,7 +315,8 @@ def plot_stay_switch_over_window(
                 color=color,
             )
 
-        ax.set_title(f"{metric.replace('_',' ').title()} rate vs. offset")
+        title_prefix = "Subject-pooled" if line_by == "subject" else "Per-session"
+        ax.set_title(f"{title_prefix}: {metric.replace('_',' ').title()} rate vs. offset")
         ax.set_xlabel("Offset (trials) relative to opto anchors (0 = opto)")
         ax.set_ylabel("Rate")
         if share_y:
@@ -301,8 +326,10 @@ def plot_stay_switch_over_window(
 
         # legend by subject
         from matplotlib.lines import Line2D
-        present_subjects = sorted(sub["subject_id"].dropna().astype(str).unique())
-        handles = [Line2D([0], [0], color=subject_to_color[s], lw=2, label=s) for s in present_subjects]
+        handles = [
+            Line2D([0], [0], color=subject_to_color[s], lw=2, label=s)
+            for s in subjects_present
+        ]
         if handles:
             ax.legend(handles=handles, title="Subject", bbox_to_anchor=(1.02, 1), loc="upper left")
 
