@@ -63,6 +63,9 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
     df.index.name = 'trial_id'
     n_trials = len(df)
 
+    # explicit 0-based trial counter as a column
+    df['trial_num'] = np.arange(n_trials, dtype=int)
+
     # --- session name ---
     session = getattr(nwb_data, 'session_id', '')
     if isinstance(session, str) and session.endswith('.json'):
