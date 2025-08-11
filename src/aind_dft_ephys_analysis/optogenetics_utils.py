@@ -69,6 +69,9 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
         session = session[:-5]
     df['session'] = session
 
+    # --- animal ID ---
+    subject_id=nwb_data.subject.subject_id
+    df['subject_id'] = subject_id
     # --- metadata ---
     meta_df = nwb_data.scratch['metadata'].to_dataframe().copy()
     if len(meta_df) != 1:
