@@ -85,6 +85,8 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
     # --- response & reward arrays from the NWB trials table ---
     # 0=left, 1=right, 2=no-response
     resp = nwb_data.trials['animal_response'][:]
+    # Boolean flag: True if the trial has a response (0/1), False if no-response (2)
+    df['response'] = (resp != 2).astype(bool)
     # reward status for each trial (True if either side rewarded)
     rewardedL = nwb_data.trials['rewarded_historyL'][:]
     rewardedR = nwb_data.trials['rewarded_historyR'][:]

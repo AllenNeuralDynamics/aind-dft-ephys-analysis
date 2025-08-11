@@ -111,7 +111,7 @@ def plot_stay_switch_over_window(
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    valid_metrics = {"stay", "switch", "win_stay", "lose_switch"}
+    valid_metrics = {"stay", "switch", "win_stay", "lose_switch","response"}
     vis_types = list(vis_types)
     bad = sorted(set(vis_types) - valid_metrics)
     if bad:
