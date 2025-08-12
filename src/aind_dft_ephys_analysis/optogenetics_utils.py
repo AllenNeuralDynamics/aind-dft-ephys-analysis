@@ -148,6 +148,9 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
         'choice', 'choice-1', 'choice+1',
     ]
 
+    # --- other parameters ---
+    df['ITI_delay_sum'] = nwb_data.trials['goCue_start_time'][:]-nwb_data.trials['start_time'][:]
+
     full_session_name = getattr(nwb_data, 'session_id', None)
 
     for ln in latent_names:
