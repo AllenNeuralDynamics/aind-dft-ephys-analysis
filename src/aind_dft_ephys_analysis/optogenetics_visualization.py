@@ -134,8 +134,8 @@ def plot_stay_switch_over_window(
     def _as_opto_bool(s: pd.Series) -> pd.Series:
         if pd.api.types.is_bool_dtype(s):
             return s.fillna(False)
-        truthy = {"1", "true", "yes", "on", "y", "t"}
-        falsy  = {"0", "false", "no", "off", "n", "f", ""}
+        truthy = {"1", "true", "yes", "on", "y", "t",1}
+        falsy  = {"0", "false", "no", "off", "n", "f", "",0}
         def parse(x):
             if x is None or (isinstance(x, float) and pd.isna(x)) or pd.isna(x):
                 return False

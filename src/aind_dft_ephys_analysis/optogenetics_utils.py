@@ -115,6 +115,17 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
     df['win_stay'] = win_stay_arr
     df['lose_switch'] = lose_switch_arr
 
+    # valid only when both previous and current trials are responses
+    valid_pair = (prev_resp != 2) & (resp != 2)
+    valid_pair_win_prev = valid_pair & prev_rew
+    valid_pair_lose_prev = valid_pair & (~prev_rew)
+
+    df['stay']        = pd.Series(stay_arr, index=df.index).where(valid_pair, pd.NA).astype('boolean')
+    df['switch']      = pd.Series(switch_arr, index=df.index).where(valid_pair, pd.NA).astype('boolean')
+    df['win_stay']    = pd.Series(win_stay_arr, index=df.index).where(valid_pair_win_prev, pd.NA).astype('boolean')
+    df['lose_switch'] = pd.Series(lose_switch_arr, index=df.index).where(valid_pair_lose_prev, pd.NA).astype('boolean')
+
+
     # --- response mask (valid trials) for latent placement ---
     responses = nwb_data.trials['animal_response'][:]
     valid_mask = (responses != 2)
