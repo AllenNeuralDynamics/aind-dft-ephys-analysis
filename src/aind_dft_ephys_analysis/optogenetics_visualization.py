@@ -336,6 +336,7 @@ def plot_rates_vs_latent(
     window: Union[int, Tuple[int, int]] = (-2, 2),
     bins: int = 12,
     binning: str = "quantile",  # {"quantile","uniform"}
+    latent_range: Optional[Tuple[float, float]] = None,
     criteria: Optional[Dict[str, Any]] = None,
     session_col: str = "session",
     subject_col: str = "subject_id",
@@ -379,6 +380,9 @@ def plot_rates_vs_latent(
         - "quantile": equal-count bins via `np.quantile`; falls back if edges collapse
         - "uniform": equal-width bins from min to max
         Bins are right-closed; bin centers are (left+right)/2.
+    latent_range : tuple, optional
+        Tuple (min, max) to filter latent values within a specified range.
+        If not provided, out-of-range values will be treated as min/max.
     criteria : dict or None, optional
         Extra filters applied **only** to opto anchors, after `laser_col` is True.
         For each key/value:
@@ -538,6 +542,17 @@ def plot_rates_vs_latent(
 
     # Latent numeric
     df[latent_col] = pd.to_numeric(df[latent_col], errors="coerce")
+   
+    # ---------- Handle latent range (if provided) ----------
+    if latent_range is not None:
+        # Apply latent range if provided
+        df[latent_col] = df[latent_col].clip(lower=latent_range[0], upper=latent_range[1])
+    else:
+        # If latent_range is not provided, treat out-of-range values as min or max
+        min_latent = df[latent_col].min()
+        max_latent = df[latent_col].max()
+        df[latent_col] = df[latent_col].clip(lower=min_latent, upper=max_latent)
+
 
     # Build a filled-latent specifically for the 'response' metric (per session)
     if response_latent_fill.lower() in {"ffill", "bfill", "nearest"}:

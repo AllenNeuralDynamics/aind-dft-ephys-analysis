@@ -188,12 +188,14 @@ def find_unique_combinations(
     include_na: bool = True,
 ) -> pd.DataFrame:
     """
-    Find unique value combinations in the given columns and count trials per combo.
+    Find unique value combinations in the given columns and count trials per combo,
+    plus the number of unique sessions and unique mice contributing to each combo.
 
     Parameters
     ----------
     df : pd.DataFrame
         Source DataFrame (e.g., from create_opto_data_frame).
+        Should contain 'session' and 'subject_id' to populate n_session and n_mice.
     columns : list of str
         Column names to check for unique combinations.
     count_col : str, default "n_trials"
@@ -205,7 +207,10 @@ def find_unique_combinations(
     Returns
     -------
     pd.DataFrame
-        One row per unique combination with a '{count_col}' column.
+        One row per unique combination with:
+          - '{count_col}': total rows in the group
+          - 'n_session'  : number of unique sessions contributing to the group
+          - 'n_mice'     : number of unique subject_id values contributing to the group
     """
     # Validate columns
     missing = [c for c in columns if c not in df.columns]
@@ -216,15 +221,42 @@ def find_unique_combinations(
     if not include_na:
         work = work.dropna(subset=columns)
 
-    # Group and count
+    # We'll need session/subject_id to compute n_session/n_mice if available
+    have_session = 'session' in df.columns
+    have_subject = 'subject_id' in df.columns
+
+    # Build a working frame that includes grouping cols and optional keys
+    extra_keys = []
+    if have_session:
+        work = work.join(df['session'])
+        extra_keys.append('session')
+    if have_subject:
+        work = work.join(df['subject_id'])
+        extra_keys.append('subject_id')
+
+    # Group and aggregate
+    gb = work.groupby(columns, dropna=include_na)
+
+    counts = gb.size().rename(count_col)
+
+    if have_session:
+        n_session = gb['session'].nunique(dropna=True).rename('n_session')
+    else:
+        n_session = pd.Series(pd.NA, index=counts.index, dtype='Int64', name='n_session')
+
+    if have_subject:
+        n_mice = gb['subject_id'].nunique(dropna=True).rename('n_mice')
+    else:
+        n_mice = pd.Series(pd.NA, index=counts.index, dtype='Int64', name='n_mice')
+
     out = (
-        work.groupby(columns, dropna=include_na)
-            .size()
-            .reset_index(name=count_col)
-            .sort_values(by=count_col, ascending=False, kind="stable")
-            .reset_index(drop=True)
+        pd.concat([counts, n_session, n_mice], axis=1)
+          .reset_index()
+          .sort_values(by=count_col, ascending=False, kind="stable")
+          .reset_index(drop=True)
     )
     return out
+
 
 
 
