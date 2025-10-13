@@ -491,6 +491,8 @@ def mean_firing_rate_matrix(
 
     return mean_da
 
+
+
 def plot_psth_raster_for_units(
     source: Union[str, Path, xr.DataArray, xr.Dataset],
     unit_ids: Optional[Sequence[int]] = None,
@@ -518,157 +520,246 @@ def plot_psth_raster_for_units(
     Parameters
     ----------
     source : str | Path | xr.Dataset | xr.DataArray
-        Path to Zarr folder or loaded PSTH Dataset/DataArray.
+        Path to a Zarr folder produced by ``extract_neuron_psth_to_zarr``
+        or an already loaded PSTH Dataset/DataArray.
     unit_ids : sequence of int, optional
-        Unit indices to plot. If None, plots all available units.
+        Indices of units (neurons) to plot. If None, all units are plotted.
     trial_ids : sequence or nested sequences of int, optional
-        Specific trial_index values to include, or list of lists for groups.
+        Specific trial index values to include. Can be a flat list for one group
+        or a list of lists for multiple groups to be plotted with different colors.
     trial_types : sequence of str, optional
-        Trial type names used to select trials via find_trials if trial_ids not provided.
+        Behavioral trial type names used to select trials via ``find_trials``
+        if ``trial_ids`` is not provided.
     nwb_data : Any, optional
-        NWB file handle required if trial_types is used.
+        NWB file handle required if ``trial_types`` is used to look up trial indices.
     align_to_event : str, optional
-        Event name (without prefix) when multiple PSTHs exist.
+        Event name (without the ``psth_`` prefix) when multiple PSTHs exist.
+        Ignored if only one event is present.
     time_window : (float, float), optional
-        Time window slice along the PSTH time axis; also sets x-axis limits.
+        Time window slice along the PSTH time axis, also sets x-axis limits.
     plot_type : {'single', 'mean'}, default 'single'
-        'single' -> plot each trial separately; 'mean' -> plot mean and SEM.
+        'single' → plot each trial separately;
+        'mean' → plot mean firing rate per group with SEM shading.
     colors : sequence of str, optional
-        Colors for each trial group. Defaults to matplotlib cycle.
+        Colors for each trial group. Defaults to Matplotlib’s color cycle.
     sem_alpha : float, default 0.3
-        Transparency for SEM shading when plot_type='mean'.
+        Transparency for SEM shading when ``plot_type='mean'``.
     figsize : (float, float), default (6.0, 4.0)
         Figure size in inches (width, height) per unit.
     sharey : bool, default False
-        Whether to share y-axis limits between PSTH and raster.
+        Whether to share y-axis limits between PSTH and raster axes.
     legend : bool, default True
-        Show legend for mean plots when multiple groups.
+        Show legend for mean plots when multiple groups are present.
     save_path : str | Path, optional
-        Path to save each unit's figure (PNG). If None, figures are not saved.
+        Path to save each unit’s figure (PNG). If a directory is given,
+        saves as ``unit_<id>.png`` inside it. If None, figures are not saved.
     dpi : int, default 300
-        Resolution of saved figure.
+        Resolution of saved figures.
     consolidated : bool, default True
-        Passed to Zarr loader for metadata.
+        Passed to the Zarr loader for faster metadata reading.
     group_labels : sequence of str, optional
-        Custom labels for trial groups when nested trial_ids given.
+        Custom labels for trial groups when ``trial_ids`` or ``trial_types``
+        define multiple groups. Must match the number of groups.
     y_mode : {'auto_per_unit', 'auto_global', 'none'}, default 'auto_per_unit'
-        Y-axis scaling mode for PSTH.
+        Y-axis scaling mode for PSTH:
+        - 'auto_per_unit': auto-scale individually for each unit.
+        - 'auto_global': compute a global maximum across all units and use it.
+        - 'none': leave Matplotlib’s default y-limits.
     y_pad : float, default 0.05
-        Fractional padding added above max firing rate for autoscaling.
+        Fractional padding added above the maximum firing rate when auto-scaling.
     """
-    # Load PSTH and raster
+    # -----------------------------
+    # 0) Helpers
+    # -----------------------------
+    def _to_1d_int(a) -> np.ndarray:
+        """Convert input to a 1-D int array (handles (n,1), lists, scalars)."""
+        if a is None:
+            return np.array([], dtype=int)
+        arr = np.asarray(a)
+        if arr.ndim > 1:
+            arr = arr.reshape(-1)   # ravel but ensures 1-D even for (n,1)
+        return arr.astype(int)
+
+    if trial_ids is not None and trial_types is not None:
+        raise ValueError("Provide either trial_ids or trial_types, not both.")
+
+    trial_groups: Optional[dict[str, np.ndarray]] = None
+
+    # -----------------------------
+    # A) Build trial groups dict
+    # -----------------------------
+    if trial_ids is not None:
+        # Nested groups: [[ids_g1], [ids_g2], ...] OR flat: [ids]
+        if len(trial_ids) > 0 and isinstance(trial_ids[0], (list, tuple, np.ndarray)):
+            group_list = [_to_1d_int(g) for g in trial_ids]
+            labels = group_labels or [f"group_{i}" for i in range(len(group_list))]
+            if group_labels is not None and len(group_labels) != len(group_list):
+                raise ValueError("Length of group_labels must match the number of trial groups.")
+            trial_groups = dict(zip(labels, group_list))
+        else:
+            arr = _to_1d_int(trial_ids)
+            trial_groups = {"all_trials": arr}
+
+    elif trial_types is not None:
+        if nwb_data is None:
+            raise ValueError("nwb_data is required when using trial_types.")
+        group_list = [_to_1d_int(find_trials(nwb_data, tt)) for tt in trial_types]
+        labels = group_labels or list(trial_types)
+        if group_labels is not None and len(group_labels) != len(group_list):
+            raise ValueError("Length of group_labels must match the number of trial types.")
+        trial_groups = dict(zip(labels, group_list))
+
+    # -----------------------------
+    # B) Union of all requested trials for subsetting during load
+    # -----------------------------
+    if trial_groups is not None and len(trial_groups) > 0:
+        safe_lists = [v for v in trial_groups.values() if v is not None and v.size > 0]
+        union_trials = np.unique(np.concatenate([_to_1d_int(v) for v in safe_lists])) if len(safe_lists) > 0 else None
+    else:
+        union_trials = None  # Load all trials
+
+    # -----------------------------
+    # 1) Load subset (using union for selection)
+    # -----------------------------
     psth_da, raster_da = load_psth_raster_subset(
         source,
-        trial_ids=trial_ids,
+        trial_ids=union_trials,
         unit_ids=unit_ids,
         align_to_event=align_to_event,
         time_window=time_window,
         consolidated=consolidated,
     )
 
-    # Determine dims
+    # Identify dim/coord names
     trial_dim = next(d for d in psth_da.dims if d.startswith("trial_"))
     trial_coord = next(c for c in psth_da.coords if c.startswith("trial_index_"))
     times = psth_da.coords["time"].values
     unit_indices = psth_da.coords["unit_index"].values
 
-    # Prepare trial groups
-    def _group_ids_by_type():
-        if trial_ids is not None:
-            lists = trial_ids if isinstance(trial_ids[0], (list, tuple, np.ndarray)) else [trial_ids]
-            lists = [np.asarray(lst, dtype=int) for lst in lists]
-            labels = group_labels or [f"group_{i}" for i in range(len(lists))]
-            return dict(zip(labels, lists))
-        if trial_types is not None:
-            if nwb_data is None:
-                raise ValueError("nwb_data is required for trial_types.")
-            return {tt: np.asarray(find_trials(nwb_data, tt), dtype=int) for tt in trial_types}
-        return {"all_trials": psth_da.coords[trial_coord].values}
+    # If unit_ids was None, plot all units
+    if unit_ids is None:
+        unit_ids = list(unit_indices)
 
-    trial_groups = _group_ids_by_type()
+    # Intersect each group's ids with available ids to avoid KeyErrors; ensure 1-D int again
+    available_trial_ids = _to_1d_int(psth_da.coords[trial_coord].values)
+    if trial_groups is None:
+        trial_groups = {"all_trials": available_trial_ids}
+    else:
+        for k in list(trial_groups.keys()):
+            trial_groups[k] = np.intersect1d(_to_1d_int(trial_groups[k]), available_trial_ids, assume_unique=False)
+
+    # Drop empty groups (no matching trials)
+    trial_groups = {k: v for k, v in trial_groups.items() if v.size > 0}
+    if len(trial_groups) == 0:
+        raise ValueError("After loading, none of the requested trial groups have matching trials.")
+
+    # Colors
     cmap = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     colors = colors or cmap
     group_colors = {g: colors[i % len(colors)] for i, g in enumerate(trial_groups)}
 
-    # For autoscaling global PSTH
+    # -----------------------------
+    # 2) Global autoscale (optional)
+    # -----------------------------
     global_max = 0.0
     if y_mode == "auto_global":
-        for unit in unit_indices:
+        for unit in unit_ids:
             da = psth_da.sel(unit_index=unit)
-            data = da.mean(trial_dim).values if plot_type == 'mean' else da.values
-            global_max = max(global_max, np.nanmax(data))
+            data = da.mean(trial_dim).values if plot_type == "mean" else da.values
+            if np.size(data) > 0 and np.isfinite(data).any():
+                global_max = max(global_max, float(np.nanmax(data)))
 
-    # Plot each unit in its own figure
-    for unit in unit_indices:
-        pos = int(np.where(psth_da.coords["unit_index"].values == unit)[0][0])
+    # -----------------------------
+    # 3) Plot per unit
+    # -----------------------------
+    for unit in unit_ids:
+        # Positional index for this unit
+        try:
+            pos = int(np.where(psth_da.coords["unit_index"].values == unit)[0][0])
+        except IndexError:
+            # Skip units not present in the dataset
+            continue
+
         unit_psth = psth_da.isel(unit=pos)
         unit_raster = raster_da.isel(unit=pos)
 
         fig, (ax_rast, ax_psth) = plt.subplots(2, 1, figsize=figsize, sharex=True, sharey=sharey)
 
-        # Raster plot
-        y_raster=0
+        # Raster (stack trials; keep color by group)
+        y_raster = 0
         for label, tids in trial_groups.items():
+            tids_set = set(map(int, _to_1d_int(tids)))  # ensure hashable ints
             for ti, tval in enumerate(unit_raster.coords[trial_coord].values):
-                if tval in tids:
-                    y_raster = y_raster+1
+                if int(tval) in tids_set:
+                    y_raster += 1
                     spikes = unit_raster.isel({trial_dim: ti}).values
                     spikes = spikes[~np.isnan(spikes)]
                     ax_rast.vlines(spikes, y_raster, y_raster + 1, color=group_colors[label], alpha=0.7)
-        ax_rast.axvline(0, color='k', ls='--', lw=0.8)  # event line
-        ax_rast.set_ylabel('Trial')
-        ax_rast.set_title(f'Unit {unit}')
+        ax_rast.axvline(0, color="k", ls="--", lw=0.8)
+        ax_rast.set_ylabel("Trial")
+        ax_rast.set_title(f"Unit {unit}")
 
-        # PSTH plot
+        # PSTH (single-trial or mean ± SEM)
         unit_max = 0.0
         for label, tids in trial_groups.items():
-            idxs = [i for i, tv in enumerate(unit_psth.coords[trial_coord].values) if tv in tids]
-            data = unit_psth.isel({trial_dim: idxs}).values
-            if plot_type == 'single':
+            tids_set = set(map(int, _to_1d_int(tids)))
+            trial_vals = unit_psth.coords[trial_coord].values
+            idxs = [i for i, tv in enumerate(trial_vals) if int(tv) in tids_set]
+            if len(idxs) == 0:
+                continue
+
+            data = unit_psth.isel({trial_dim: idxs}).values  # shape: (n_trials, n_time)
+            if data.ndim == 1:
+                data = data[np.newaxis, :]
+
+            if plot_type == "single":
                 for trial_vec in data:
                     ax_psth.plot(times, trial_vec, color=group_colors[label], alpha=0.6)
-                    unit_max = max(unit_max, np.nanmax(trial_vec))
+                    if np.isfinite(trial_vec).any():
+                        unit_max = max(unit_max, float(np.nanmax(trial_vec)))
             else:
                 mean_f = np.nanmean(data, axis=0)
-                sem_f = np.nanstd(data, axis=0, ddof=1) / np.sqrt(data.shape[0])
+                ntr = max(data.shape[0], 1)
+                sem_f = (np.nanstd(data, axis=0, ddof=1) / np.sqrt(ntr)) if ntr > 1 else np.zeros_like(mean_f)
                 ax_psth.plot(times, mean_f, color=group_colors[label], label=label)
                 ax_psth.fill_between(times, mean_f - sem_f, mean_f + sem_f, alpha=sem_alpha)
-                unit_max = max(unit_max, np.nanmax(mean_f + sem_f))
+                if np.isfinite(mean_f + sem_f).any():
+                    unit_max = max(unit_max, float(np.nanmax(mean_f + sem_f)))
 
-        ax_psth.axvline(0, color='k', ls='--', lw=0.8)
-        ax_psth.set_ylabel('Firing rate (spk/s)')
-        ax_psth.set_xlabel('Time (s)')
+        ax_psth.axvline(0, color="k", ls="--", lw=0.8)
+        ax_psth.set_ylabel("Firing rate (spk/s)")
+        ax_psth.set_xlabel("Time (s)")
 
-        # Set x-limits to requested window
+        # X-limits from requested window (if any)
         if time_window is not None:
             ax_rast.set_xlim(*time_window)
             ax_psth.set_xlim(*time_window)
 
-        # Set y-limits
-        if y_mode == 'auto_per_unit' and unit_max > 0:
+        # Y-limits strategy
+        if y_mode == "auto_per_unit" and unit_max > 0:
             ax_psth.set_ylim(0, unit_max * (1 + y_pad))
-        elif y_mode == 'auto_global' and global_max > 0:
+        elif y_mode == "auto_global" and global_max > 0:
             ax_psth.set_ylim(0, global_max * (1 + y_pad))
 
-        if plot_type == 'mean' and legend and len(trial_groups) > 1:
+        if plot_type == "mean" and legend and len(trial_groups) > 1:
             ax_psth.legend(frameon=False)
 
         plt.tight_layout()
 
         if save_path:
             save_target = Path(save_path)
-            # If save_path is a directory, create and save under unit-specific filename
-            if save_target.suffix == '' or save_target.is_dir():
+            if save_target.suffix == "" or save_target.is_dir():
                 save_target.mkdir(parents=True, exist_ok=True)
                 fp = save_target / f"unit_{unit}.png"
             else:
-                # Treat save_path as base filename, append unit ID
-                base = save_target.with_suffix('')
+                base = save_target.with_suffix("")
                 fp = base.parent / f"{base.name}_unit_{unit}.png"
-            fig.savefig(fp, dpi=dpi, bbox_inches='tight')
+            fig.savefig(fp, dpi=dpi, bbox_inches="tight")
             print(f"Saved Unit {unit} figure to {fp}")
 
         plt.show()
+
+
 
 
 

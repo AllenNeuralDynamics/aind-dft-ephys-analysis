@@ -9,12 +9,14 @@ from pathlib import Path
 import xarray as xr
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib import rcParams
+from matplotlib.lines import Line2D
 import pandas as pd
 
 from general_utils import smart_read_csv
 from behavior_utils   import extract_fitted_data       
 from behavior_utils import extract_event_timestamps   # your helper that returns per-trial timestamps
-
+from ephys_behavior import get_units_passed_default_qc
 
 def plot_raster_graph(
     nwb_data: Any,
@@ -857,21 +859,20 @@ def fit_and_plot_all_sessions(
 
     return fit_results
 
-
 def plot_diagonal_significance(
-    ds,
+    ds: pd.DataFrame,
     filter_region: str,
     time_window: str,
     col_x: str,
     col_y: str,
     col_pval_x: str,
     col_pval_y: str,
-    diagonal: str = 'negative',  # 'both', 'negative', or 'positive'
+    diagonal: str = 'negative',           # default aligned with docstring
     angle_tolerance_deg: float = 10.0,
     xlim: tuple = (-30, 30),
     ylim: tuple = (-30, 30),
     point_size: float = 5.0,
-    p_value: float = 0.05
+    alpha_level: float = 0.05         
 ):
     """
     Filter a DataFrame by region and time window, compute significance masks
@@ -890,7 +891,7 @@ def plot_diagonal_significance(
     col_pval_x, col_pval_y : str
         Column names for the corresponding p-values.
     diagonal : str, optional
-        Which diagonal to plot: 'both', 'negative', or 'positive'. Default is 'both'.
+        Which diagonal to plot: 'both', 'negative', or 'positive'. Default is 'negative'.
     angle_tolerance_deg : float, optional
         Tolerance around the diagonal in degrees (default=10°).
     xlim : tuple, optional
@@ -899,89 +900,99 @@ def plot_diagonal_significance(
         Y-axis limits (default=(-30, 30)).
     point_size : float, optional
         Marker size for all scatter points (default=5).
-    p_value : float, optional
+    alpha_level: float, optional
         The p value used to determine the signficant neuron.
     """
-    # 1) Filter dataset by region and time window
+    # Backward-compatibility shim if caller still passes p_value via keywords
+    if 'p_value' in locals():
+        alpha_level = locals().get('p_value', alpha_level)
+
+    # 1) Region + time window filter
     if filter_region == '':
-        filtered = ds[ds['time_window'] == time_window]
+        filtered = ds[ds['time_window'] == time_window].copy()
         region_label = 'all regions'
     elif filter_region == '!MD':
-        filtered = ds[
-            (ds['brain_region'] != 'MD') &
-            (ds['time_window'] == time_window)
-        ]
+        filtered = ds[(ds['brain_region'] != 'MD') & (ds['time_window'] == time_window)].copy()
         region_label = 'non-MD regions'
     else:
-        filtered = ds[
-            (ds['brain_region'] == filter_region) &
-            (ds['time_window'] == time_window)
-        ]
+        filtered = ds[(ds['brain_region'] == filter_region) & (ds['time_window'] == time_window)].copy()
         region_label = filter_region
 
-    # 2) Compute significance masks
-    mask_x    = filtered[col_pval_x] < p_value
-    mask_y    = filtered[col_pval_y] < p_value
-    mask_none = ~(mask_x | mask_y)
-    mask_both = mask_x & mask_y
+    # 2) Drop rows with NaNs in any required columns
+    needed = [col_x, col_y, col_pval_x, col_pval_y]
+    filtered = filtered.dropna(subset=needed)
+    if filtered.empty:
+        print("No rows after filtering / NaN removal.")
+        return None, None
 
-    # 3) Diagonal-band masks
+    # 3) Significance masks (use <=)
+    mask_x    = filtered[col_pval_x] <= alpha_level
+    mask_y    = filtered[col_pval_y] <= alpha_level
+    mask_both = mask_x & mask_y
+    mask_none = ~(mask_x | mask_y)
+
+    total = len(filtered)
+
+    # 4) Angle-based banding
     angle_tol = np.deg2rad(angle_tolerance_deg)
-    angles    = np.arctan2(filtered[col_y], filtered[col_x])
+    # Ensure tolerance < 45° to avoid tan() singularities
+    max_tol = np.deg2rad(44.9)
+    if angle_tol >= max_tol:
+        angle_tol = max_tol
+
+    angles = np.arctan2(filtered[col_y].values, filtered[col_x].values)
 
     def in_band(center):
-        delta = np.abs(np.arctan2(np.sin(angles - center),
-                                  np.cos(angles - center)))
+        # Smallest circular distance to the center angle
+        delta = np.abs(np.arctan2(np.sin(angles - center), np.cos(angles - center)))
         return delta < angle_tol
 
     band_neg = mask_both & (in_band(-np.pi/4) | in_band(3*np.pi/4))
     band_pos = mask_both & (in_band( np.pi/4) | in_band(-3*np.pi/4))
 
-    # 4) Totals and counts
-    total           = len(filtered)
-    count_none      = mask_none.sum()
-    count_x         = mask_x.sum()
-    count_y         = mask_y.sum()
-    count_both      = mask_both.sum()
-    count_neg_band  = band_neg.sum()
-    count_pos_band  = band_pos.sum()
+    # 5) Counts/fractions
+    count_none = int(mask_none.sum())
+    count_x    = int(mask_x.sum())
+    count_y    = int(mask_y.sum())
+    count_both = int(mask_both.sum())
+    count_neg_band = int(band_neg.sum())
+    count_pos_band = int(band_pos.sum())
 
-    # 5) Fractions for X-sig and Y-sig by sign
-    cnt_x_pos = (mask_x & (filtered[col_x] > 0)).sum()
-    cnt_x_neg = (mask_x & (filtered[col_x] < 0)).sum()
-    frac_x_pos = cnt_x_pos / count_x if count_x else 0
-    frac_x_neg = cnt_x_neg / count_x if count_x else 0
+    # Sign fractions by sign
+    cnt_x_pos = int((mask_x & (filtered[col_x] > 0)).sum())
+    cnt_x_neg = int((mask_x & (filtered[col_x] < 0)).sum())
+    frac_x_pos = cnt_x_pos / count_x if count_x else 0.0
+    frac_x_neg = cnt_x_neg / count_x if count_x else 0.0
 
-    cnt_y_pos = (mask_y & (filtered[col_y] > 0)).sum()
-    cnt_y_neg = (mask_y & (filtered[col_y] < 0)).sum()
-    frac_y_pos = cnt_y_pos / count_y if count_y else 0
-    frac_y_neg = cnt_y_neg / count_y if count_y else 0
+    cnt_y_pos = int((mask_y & (filtered[col_y] > 0)).sum())
+    cnt_y_neg = int((mask_y & (filtered[col_y] < 0)).sum())
+    frac_y_pos = cnt_y_pos / count_y if count_y else 0.0
+    frac_y_neg = cnt_y_neg / count_y if count_y else 0.0
 
-    # 6) Quadrant fractions for each band
-    cnt_neg_q2 = (band_neg & (filtered[col_x] < 0) & (filtered[col_y] > 0)).sum()
-    cnt_neg_q4 = (band_neg & (filtered[col_x] > 0) & (filtered[col_y] < 0)).sum()
-    frac_neg_q2 = cnt_neg_q2 / count_neg_band if count_neg_band else 0
-    frac_neg_q4 = cnt_neg_q4 / count_neg_band if count_neg_band else 0
+    # Quadrant splits for each band
+    cnt_neg_q2 = int((band_neg & (filtered[col_x] < 0) & (filtered[col_y] > 0)).sum())
+    cnt_neg_q4 = int((band_neg & (filtered[col_x] > 0) & (filtered[col_y] < 0)).sum())
+    frac_neg_q2 = cnt_neg_q2 / count_neg_band if count_neg_band else 0.0
+    frac_neg_q4 = cnt_neg_q4 / count_neg_band if count_neg_band else 0.0
 
-    cnt_pos_q1 = (band_pos & (filtered[col_x] > 0) & (filtered[col_y] > 0)).sum()
-    cnt_pos_q3 = (band_pos & (filtered[col_x] < 0) & (filtered[col_y] < 0)).sum()
-    frac_pos_q1 = cnt_pos_q1 / count_pos_band if count_pos_band else 0
-    frac_pos_q3 = cnt_pos_q3 / count_pos_band if count_pos_band else 0
+    cnt_pos_q1 = int((band_pos & (filtered[col_x] > 0) & (filtered[col_y] > 0)).sum())
+    cnt_pos_q3 = int((band_pos & (filtered[col_x] < 0) & (filtered[col_y] < 0)).sum())
+    frac_pos_q1 = cnt_pos_q1 / count_pos_band if count_pos_band else 0.0
+    frac_pos_q3 = cnt_pos_q3 / count_pos_band if count_pos_band else 0.0
 
-    # Determine which panels to draw
+    # 6) Which panels to draw
     draw_neg = diagonal in ('both', 'negative')
     draw_pos = diagonal in ('both', 'positive')
     n_panels = int(draw_neg) + int(draw_pos)
 
-    # 7) Plot setup
     fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 6), sharex=True, sharey=True)
     if n_panels == 1:
         axes = [axes]
     ax_idx = 0
     x_vals = np.linspace(*xlim, 200)
 
-    def draw_panel(ax, negative: bool):
-        # Plot all points
+    def draw_panel(ax: plt.Axes, negative: bool):
+        # Scatter layers
         ax.scatter(filtered[col_x], filtered[col_y], color='lightgray', s=point_size,
                    label=f'Non-sig (n={count_none}; {count_none/total:.1%})')
         ax.scatter(filtered.loc[mask_x, col_x], filtered.loc[mask_x, col_y],
@@ -994,22 +1005,23 @@ def plot_diagonal_significance(
                    color='red', s=point_size,
                    label=f'Both-sig (n={count_both}; {count_both/total:.1%})')
 
-        # Overlay diagonal band
+        # Diagonal band overlay
         band_mask = band_neg if negative else band_pos
-        cnt_band = count_neg_band if negative else count_pos_band
+        cnt_band  = count_neg_band if negative else count_pos_band
         ax.scatter(filtered.loc[band_mask, col_x], filtered.loc[band_mask, col_y],
                    color='purple', s=point_size,
                    label=f'Diag band (n={cnt_band}; {cnt_band/total:.1%})')
 
-        # Plot diagonal and boundaries
-        center    = -np.pi/4 if negative else np.pi/4
-        diag_line = -x_vals if negative else x_vals
-        label_line = 'y = -x' if negative else 'y = +x'
-        ax.plot(x_vals, diag_line, '--', color='k', label=label_line)
-        ax.plot(x_vals, np.tan(center + angle_tol) * x_vals, ':', color='k')
-        ax.plot(x_vals, np.tan(center - angle_tol) * x_vals, ':', color='k')
+        # Diagonal line and tolerance boundaries
+        center = -np.pi/4 if negative else np.pi/4
+        diag_y = -x_vals if negative else x_vals
+        ax.plot(x_vals, diag_y, '--', color='k', label='y = -x' if negative else 'y = +x')
+        b_hi = np.tan(center + angle_tol) * x_vals
+        b_lo = np.tan(center - angle_tol) * x_vals
+        ax.plot(x_vals, b_hi, ':', color='k')
+        ax.plot(x_vals, b_lo, ':', color='k')
 
-        # Annotation text
+        # Panel-specific annotation
         if negative:
             quad_text = f"Band Q2: {cnt_neg_q2} ({frac_neg_q2:.1%}), Q4: {cnt_neg_q4} ({frac_neg_q4:.1%})"
             title = f"Negative Diagonal (±{angle_tolerance_deg}°)"
@@ -1028,11 +1040,10 @@ def plot_diagonal_significance(
         ax.set_ylim(*ylim)
         ax.set_xlabel(col_x)
         ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
-                verticalalignment='top', fontsize='small',
+                va='top', fontsize='small',
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray"))
         ax.legend(loc='upper right', fontsize='small')
 
-    # Draw panels according to selection
     if draw_neg:
         draw_panel(axes[ax_idx], negative=True)
         axes[ax_idx].set_ylabel(col_y)
@@ -1040,15 +1051,14 @@ def plot_diagonal_significance(
     if draw_pos:
         draw_panel(axes[ax_idx], negative=False)
 
-    # Supertitle & layout
     plt.suptitle(
         f"{region_label}, time_window = {time_window}\n"
-        "Gray=non-sig, Blue=X-sig, Green=Y-sig, Red=both-sig;\n"
-        "Purple=diagonal band & both-sig",
+        "Gray=non-sig, Blue=X-sig, Green=Y-sig, Red=both-sig; Purple=diagonal band & both-sig",
         fontsize=14
     )
     plt.tight_layout(rect=[0, 0, 1, 0.94])
     plt.show()
+    return fig, axes
 
 
 def plot_projection(
@@ -1147,3 +1157,260 @@ def plot_projection(
     return ax
 
 
+def plot_session_spike_raster(
+    nwb_data: Any,
+    *,
+    time_window: Tuple[float, float],
+    probes: Optional[Sequence[Union[int, str]]] = None,  # match values in units['device_name']
+    unit_indices: Optional[Sequence[int]] = None,
+    max_units: Optional[int] = 200000,
+    events: Optional[Dict[str, Union[str, Sequence[float], np.ndarray]]] = None,
+    event_styles: Optional[Dict[str, Dict[str, Any]]] = None,
+    line_length: float = 0.8,
+    linewidth: float = 0.9,
+    figsize: Tuple[int, int] = (12, 8),
+    dpi: int = 300,
+    save_figure: bool = False,
+    save_folder: str = "/root/capsule/results",
+    filename: Optional[str] = None,
+) -> List[int]:
+    """
+    Plot a session-wide spike raster for **QC-passed** units within an absolute
+    session time window. Uses `units['device_name']` as the probe label.
+
+    Behavior with `probes`:
+      • If `probes` is provided with **multiple** values → units are **sorted by probe**
+        (in the order given), spikes are colored **per-probe**, and a legend is shown.
+      • If `probes` has a single value → only that probe is shown (single color).
+      • If `probes` is None → all QC units are shown (single color).
+
+    Parameters
+    ----------
+    nwb_data : Any
+        NWB object with a `units` DynamicTable having 'spike_times' and ideally 'device_name'.
+    time_window : (float, float)
+        Absolute session-time window in seconds to visualize.
+    probes : sequence[int|str] | None
+        Optional filter. Exact matches against `units['device_name']` (compared as strings).
+        If multiple provided, also controls group order and colors.
+    unit_indices : sequence[int] | None
+        Optional extra subset of units to intersect with the QC set.
+    max_units : int | None
+        If provided and >0, limit the number of plotted units after filtering/sorting.
+    events : dict[str, str | arraylike] | None
+        Event label → either behavior event name (string) or array of absolute times (seconds).
+    event_styles : dict[str, dict] | None
+        Matplotlib kwargs per event label.
+    line_length : float
+        Vertical tick length for each spike (y-axis units).
+    linewidth : float
+        Tick line width.
+    figsize : (int, int)
+        Figure size.
+    dpi : int
+        Figure DPI.
+    save_figure : bool
+        Save the figure if True.
+    save_folder : str
+        Output folder to save figure.
+    filename : str | None
+        Base filename (without extension). Auto-generated if None.
+
+    Returns
+    -------
+    list[int]
+        Ordered list of plotted unit indices (after QC, probe filtering, and sorting).
+    """
+    # --- basic checks ---
+    if not hasattr(nwb_data, "units"):
+        raise ValueError("`nwb_data` must have a `units` table.")
+    tbl = nwb_data.units
+    if "spike_times" not in getattr(tbl, "colnames", []):
+        raise ValueError("`nwb_data.units` must contain a 'spike_times' column.")
+
+    t_start, t_end = float(time_window[0]), float(time_window[1])
+    if t_end <= t_start:
+        raise ValueError("`time_window` must have end > start.")
+
+    # --- QC filter (and optional explicit subset) ---
+    qc_pass: set[int] = set(map(int, get_units_passed_default_qc(nwb_data)))
+    if unit_indices is not None:
+        qc_pass &= set(map(int, unit_indices))
+    if not qc_pass:
+        print("No units pass QC (and filters).")
+        return []
+
+    # --- Build metadata: (unit_index, device_name) for QC units ---
+    def _devname(i: int) -> Optional[str]:
+        if "device_name" in tbl.colnames:
+            try:
+                v = tbl["device_name"][i]
+                return None if v is None else str(v)
+            except Exception:
+                return None
+        return None
+
+    meta: List[Tuple[int, Optional[str]]] = [(i, _devname(i)) for i in qc_pass]
+
+    # --- Optional filter to provided probes ---
+    probe_order: List[str] = []
+    if probes:
+        probe_order = [str(p) for p in probes]
+        keep = set(probe_order)
+        meta = [m for m in meta if (m[1] is not None and m[1] in keep)]
+
+    if not meta:
+        print("No QC-passed units left after probe filter.")
+        return []
+
+    # --- Sorting & coloring by probe if multiple probes provided ---
+    multi_probe = probes is not None and len(probe_order) > 1
+    if multi_probe:
+        order_index = {p: k for k, p in enumerate(probe_order)}
+        meta.sort(key=lambda m: (order_index.get(m[1], 1_000_000), m[0]))
+        default_cycle = list(rcParams['axes.prop_cycle'].by_key().get('color', [])) or [
+            "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+            "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+            "#bcbd22", "#17becf"
+        ]
+        probe_colors: Dict[str, str] = {p: default_cycle[i % len(default_cycle)] for i, p in enumerate(probe_order)}
+    else:
+        meta.sort(key=lambda m: m[0])  # single probe / no filter → order by unit index
+        probe_colors = {}
+
+    # --- Truncate if requested ---
+    candidates: List[int] = [m[0] for m in meta]
+    devnames:   List[Optional[str]] = [m[1] for m in meta]
+    if isinstance(max_units, int) and max_units > 0:
+        candidates = candidates[:max_units]
+        devnames   = devnames[:max_units]
+
+    # --- Gather spikes within window ---
+    unit_spike_lists: List[np.ndarray] = []
+    for i in candidates:
+        try:
+            st = np.asarray(tbl["spike_times"][i], dtype=float)
+        except Exception:
+            st = np.asarray([])
+        mask = (st >= t_start) & (st <= t_end)
+        unit_spike_lists.append(st[mask])
+
+    # --- Events (absolute times) ---
+    if events is None:
+        events = {}
+    styles_default: Dict[str, Any] = {"color": "red", "ls": "--", "lw": 1.0, "alpha": 0.9, "zorder": 1}
+    event_styles = event_styles or {}
+    event_times_map: Dict[str, np.ndarray] = {}
+    for name, spec in events.items():
+        if isinstance(spec, str):
+            try:
+                arr = np.asarray(extract_event_timestamps(nwb_data, spec), dtype=float)
+            except Exception:
+                arr = np.asarray([], dtype=float)
+        else:
+            arr = np.asarray(spec, dtype=float)
+        event_times_map[name] = arr[(arr >= t_start) & (arr <= t_end)]
+
+    # --- Draw ---
+    fig, ax = plt.subplots(1, 1, figsize=figsize, dpi=dpi)
+    y_base = np.arange(1, len(candidates) + 1)
+
+    # Draw spikes as colored vertical ticks; color by probe if multi-probe
+    for y0, spikes, dn in zip(y_base, unit_spike_lists, devnames):
+        if spikes.size == 0:
+            continue
+        tick_color = probe_colors.get(dn, "black") if multi_probe else "black"
+        for t in spikes:
+            ax.vlines(t, y0 - line_length / 2, y0 + line_length / 2,
+                      linewidth=linewidth, color=tick_color)
+
+    # Draw group separators if multiple probes
+    if multi_probe:
+        for i in range(1, len(devnames)):
+            if devnames[i] != devnames[i-1]:
+                ax.axhline(i + 0.5, color="gray", ls=":", lw=0.8, alpha=0.7)
+
+    # Draw events
+    for name, times in event_times_map.items():
+        if times.size == 0:
+            continue
+        style = styles_default.copy()
+        style.update(event_styles.get(name, {}))
+        for t in times:
+            ax.axvline(t, **style)
+
+    # Axes labels/limits
+    ax.set_xlim(t_start, t_end)
+    ax.set_ylim(0.5, len(candidates) + 0.5)
+    ax.set_xlabel("Time (s, absolute session)")
+    ax.set_ylabel("Units (QC-passed)")
+
+    # Y tick labels (unit index + device_name)
+    labels = [f"{u}" + (f" · {dn}" if dn else "") for u, dn in zip(candidates, devnames)]
+    step = max(1, len(labels) // 25)
+    ax.set_yticks(y_base[::step])
+    ax.set_yticklabels(labels[::step], fontsize=8)
+
+    title_bits = [
+        f"Session raster [{t_start:.3f}, {t_end:.3f}] s",
+        f"QC units={len(candidates)}"
+    ]
+    if probes:
+        title_bits.append(f"device_name ∈ {list(map(str, probes))}")
+    ax.set_title(" · ".join(title_bits))
+
+    ax.grid(axis="x", linestyle=":", alpha=0.4)
+
+    # ======================
+    # Legend OUTSIDE figure
+    # ======================
+    legend_handles: List[Line2D] = []
+
+    # Probe legend (if multiple probes)
+    if multi_probe:
+        for p in probe_order:
+            legend_handles.append(Line2D([0], [0], color=probe_colors[p], lw=2, label=str(p)))
+
+    # Event legend proxies (use same style as drawn)
+    for name, style_src in event_times_map.items():
+        # Only add if the event exists in window
+        if style_src.size == 0:
+            continue
+        style = styles_default.copy()
+        style.update(event_styles.get(name, {}))
+        legend_handles.append(
+            Line2D([0], [0],
+                   color=style.get("color", "red"),
+                   linestyle=style.get("ls", "--"),
+                   linewidth=style.get("lw", 1.0),
+                   alpha=style.get("alpha", 0.9),
+                   label=name)
+        )
+
+    if legend_handles:
+        # Place legend outside on the right
+        fig.legend(
+            handles=legend_handles,
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            frameon=True,
+            title="Legend",
+            fontsize=9
+        )
+        # Leave some room on the right for the legend
+        plt.tight_layout(rect=[0, 0, 0.82, 1])
+    else:
+        plt.tight_layout()
+
+    # Save (ensure external legend is included)
+    if save_figure:
+        os.makedirs(save_folder, exist_ok=True)
+        if filename is None:
+            sess = getattr(nwb_data, "session_id", "session")
+            filename = f"session_raster_QC_{sess}_{t_start:.2f}_{t_end:.2f}"
+        out_path = os.path.join(save_folder, f"{filename}.png")
+        fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+        print(f"Figure saved: {out_path}")
+
+    plt.show()
+    return candidates

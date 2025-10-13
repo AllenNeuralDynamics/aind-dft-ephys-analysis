@@ -68,7 +68,7 @@ def get_the_mean_firing_rate(
     nwb_data: Any,
     unit_index: Union[int, List[int], None] = None,
     align_to_event: str = 'go_cue',
-    time_windows: List[List[float]] = [[-1, 0],[0,2]],
+    time_windows: List[List[float]] = [[-1, 0], [0, 2]],
     z_score: Union[bool, List[bool]] = False
 ) -> pd.DataFrame:
     """
@@ -85,7 +85,12 @@ def get_the_mean_firing_rate(
     align_to_event : str
         Event name to align spikes to (default 'go_cue').
     time_windows : list of [start, end]
-        Windows (seconds relative to event) for computing firing rates; e.g., [[-2,1],[1,2]].
+        List of time windows (in seconds relative to event) for computing firing rates.
+        For example, `[[−2, 1], [1, 2], [0.2, 3, −1, 0]]` specifies three time windows.
+        If a window contains four elements, like `[0.2, 3, −1, 0]`, it means that two separate mean firing rates will be calculated:
+        - The mean for the first range `[0.2, 3]` and
+        - The mean for the second range `[-1, 0]`.
+        The first mean is then subtracted by the second mean.
     z_score : bool
         If True, normalize each unit's firing rates (per window) across trials to z-scores.
 
@@ -98,11 +103,10 @@ def get_the_mean_firing_rate(
           - time_window: string label of the form "start_end"
           - rates: list of mean firing rates (spikes/sec) per trial
     """
-    # appen units locations to nwb_data
+    # append units locations to nwb_data
     session_id = extract_session_name_core(getattr(nwb_data, 'session_id', None))
-    nwb_data=append_units_locations(nwb_data,session_id)
+    nwb_data = append_units_locations(nwb_data, session_id)
 
-    
     all_times = np.array(extract_event_timestamps(nwb_data, align_to_event))
     n_trials = len(all_times)
 
@@ -119,15 +123,35 @@ def get_the_mean_firing_rate(
     rows = []
     for u in units_to_process:
         spikes = np.array(nwb_data.units['spike_times'][u])
-        loc    = nwb_data.units["ccf_location"][u] or {}
+        loc = nwb_data.units["ccf_location"][u] or {}
         region = loc.get("brain_region", "")
 
-        for start_offset, end_offset in time_windows:
-            duration = end_offset - start_offset
-            rates = []
-            for t0 in all_times:
-                cnt = np.sum((spikes >= t0 + start_offset) & (spikes <= t0 + end_offset))
-                rates.append(cnt / duration if duration > 0 else np.nan)
+        for time_window in time_windows:
+            if len(time_window) == 4:
+                # Handle four-element time window
+                first_window = [time_window[0], time_window[1]]
+                second_window = [time_window[2], time_window[3]]
+                duration_1 = first_window[1] - first_window[0]
+                duration_2 = second_window[1] - second_window[0]
+
+                rates_1 = []
+                rates_2 = []
+                for t0 in all_times:
+                    cnt1 = np.sum((spikes >= t0 + first_window[0]) & (spikes <= t0 + first_window[1]))
+                    cnt2 = np.sum((spikes >= t0 + second_window[0]) & (spikes <= t0 + second_window[1]))
+                    rates_1.append(cnt1 / duration_1 if duration_1 > 0 else np.nan)
+                    rates_2.append(cnt2 / duration_2 if duration_2 > 0 else np.nan)
+
+                rates = np.array(rates_1) - np.array(rates_2)
+            else:
+                # Handle normal two-element time windows
+                start_offset, end_offset = time_window
+                duration = end_offset - start_offset
+                rates = []
+                for t0 in all_times:
+                    cnt = np.sum((spikes >= t0 + start_offset) & (spikes <= t0 + end_offset))
+                    rates.append(cnt / duration if duration > 0 else np.nan)
+
             orig_rates = np.array(rates)
             for flag in z_score:
                 rates_to_store = orig_rates.copy()
@@ -139,7 +163,7 @@ def get_the_mean_firing_rate(
                     'session_id': session_id,
                     'unit_index': u,
                     "align_to_event": align_to_event,
-                    'time_window': f"{start_offset}_{end_offset}",
+                    'time_window': f"{time_window[0]}_{time_window[1]}" if len(time_window) == 2 else f"{time_window[0]}_{time_window[1]}_{time_window[2]}_{time_window[3]}",
                     'z_score': flag,
                     "brain_region": region,
                     "ccf_location": loc,
@@ -161,10 +185,11 @@ def get_the_mean_firing_rate(
     )
     return firing_rate_df
 
+
 def get_the_mean_firing_rate_combined(
     session_names: List[str],
     align_to_event: str = 'go_cue',
-    time_windows: List[List[float]] = [[-1, 0], [0.3, 2]],
+    time_windows: List[List[float]] = [[-1, 0], [0.3, 2],[0.3,2,-1,0]],
     z_score: Union[bool, List[bool]] = [True,False],
     save_folder: str = '/root/capsule/results',
     save_name: str = 'combined_firing_rates.csv',
@@ -181,7 +206,12 @@ def get_the_mean_firing_rate_combined(
     align_to_event : str
         Event name to align spikes to (default 'go_cue').
     time_windows : list of [start, end]
-        Windows (seconds relative to event) for computing firing rates.
+        List of time windows (in seconds relative to event) for computing firing rates.
+        For example, `[[−2, 1], [1, 2], [0.2, 3, −1, 0]]` specifies three time windows.
+        If a window contains four elements, like `[0.2, 3, −1, 0]`, it means that two separate mean firing rates will be calculated:
+        - The mean for the first range `[0.2, 3]` and
+        - The mean for the second range `[-1, 0]`.
+        The first mean is then subtracted by the second mean.
     z_score : bool or list of bool
         Whether to normalize firing rates per window across trials within each session.
     save_folder : str
@@ -744,7 +774,7 @@ def correlate_firing_latent_multiple_variable(
         p_rpe = fit["pvalues"].get("RPE", np.nan)
 
     """
-        # ──────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────
     # 0) NORMALISE  – model list  &  variable-group list
     # ──────────────────────────────────────────────────────────────────
 
