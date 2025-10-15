@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from matplotlib import rcParams
 from matplotlib.lines import Line2D
 import pandas as pd
+from sklearn.decomposition import PCA
 
 from general_utils import smart_read_csv
 from behavior_utils   import extract_fitted_data       
@@ -859,6 +860,214 @@ def fit_and_plot_all_sessions(
 
     return fit_results
 
+
+def plot_angle_fraction_polar(
+    ds: pd.DataFrame,
+    *,
+    filter_region: str,
+    time_window: str,
+    col_x: str,
+    col_y: str,
+    col_pval_x: str,
+    col_pval_y: str,
+    alpha_level: float = 0.05,
+    include: str = "both",
+    # one of {"both", "x", "y", "any", "none", "all"}
+    # "both" = X- and Y-significant; "x" = X-significant only; "y" = Y-significant only
+    # "any"  = X or Y significant;  "none" = neither significant; "all" = all points (ignores p-values)
+    angle_bin_deg: float = 15.0,
+    normalize: str = "selected",
+    # one of {"selected","overall"}:
+    #   "selected" → fraction within the selected subset (denominator = #points that pass masks)
+    #   "overall"  → fraction out of all filtered points before the p-value mask
+    start_angle_deg: float = 0.0,    # rotate binning origin if desired
+    show_reference_diagonals: bool = True,
+    figsize: tuple[float,float] = (6.5, 6.5),
+    dpi: int = 120,
+) -> tuple[plt.Figure, plt.Axes, pd.DataFrame]:
+    """
+    Make a circular (polar) bar plot of the fraction of neurons by polar angle
+    in the (col_x, col_y) space.
+
+    Filtering and significance semantics mirror `plot_diagonal_significance`.
+
+    Parameters
+    ----------
+    ds
+        Full DataFrame containing at least col_x, col_y, p-value columns, 'time_window', and 'brain_region'.
+    filter_region
+        '' for all regions, '!MD' for non-MD, or an exact region code to include.
+    time_window
+        Exact time window value to include (e.g., '-1_0').
+    col_x, col_y
+        Names of the X and Y statistic columns (e.g., t-values).
+    col_pval_x, col_pval_y
+        Column names for the corresponding p-values.
+    alpha_level
+        P-value threshold for significance.
+    include
+        Which set of units to include based on significance ("both","x","y","any","none","all").
+    angle_bin_deg
+        Angular bin width in degrees (e.g., 15 → 24 bins).
+    normalize
+        "selected": bar heights sum to 1 over the selected subset.
+        "overall" : bar heights sum to (selected / overall) over the full filtered set.
+    start_angle_deg
+        Rotate the 0° direction for binning (useful if you want bins centered on 45°, etc.).
+    show_reference_diagonals
+        If True, draw reference rays at ±45° and 180° offsets.
+    figsize, dpi
+        Figure size / resolution.
+
+    Returns
+    -------
+    fig, ax, table
+        Matplotlib figure/axes, and a table with counts/fractions per angular bin.
+    """
+    # ------------------------
+    # 1) Region / window filter and basic cleaning
+    # ------------------------
+    if filter_region == '':
+        filtered = ds[ds['time_window'] == time_window].copy()
+        region_label = 'all regions'
+    elif filter_region == '!MD':
+        filtered = ds[(ds['brain_region'] != 'MD') & (ds['time_window'] == time_window)].copy()
+        region_label = 'non-MD regions'
+    else:
+        filtered = ds[(ds['brain_region'] == filter_region) & (ds['time_window'] == time_window)].copy()
+        region_label = filter_region
+
+    needed = [col_x, col_y, col_pval_x, col_pval_y]
+    filtered = filtered.dropna(subset=needed)
+    if filtered.empty:
+        raise ValueError("No rows remain after filtering or NaN removal.")
+
+    # ------------------------
+    # 2) Significance masks
+    # ------------------------
+    mask_x    = filtered[col_pval_x] <= alpha_level
+    mask_y    = filtered[col_pval_y] <= alpha_level
+    mask_both = mask_x & mask_y
+    mask_any  = mask_x | mask_y
+    mask_none = ~(mask_x | mask_y)
+
+    if include == "both":
+        sel_mask = mask_both
+        sel_name = "Both-sig"
+    elif include == "x":
+        sel_mask = mask_x & ~mask_y
+        sel_name = "X-only-sig"
+    elif include == "y":
+        sel_mask = mask_y & ~mask_x
+        sel_name = "Y-only-sig"
+    elif include == "any":
+        sel_mask = mask_any
+        sel_name = "Any-sig"
+    elif include == "none":
+        sel_mask = mask_none
+        sel_name = "Non-sig"
+    elif include == "all":
+        sel_mask = np.ones(len(filtered), dtype=bool)
+        sel_name = "All"
+    else:
+        raise ValueError("`include` must be one of {'both','x','y','any','none','all'}")
+
+    selected = filtered[sel_mask]
+    if selected.empty:
+        raise ValueError("Selection mask resulted in zero rows.")
+
+    # ------------------------
+    # 3) Angles (0..2π)
+    # ------------------------
+    x = filtered[col_x].to_numpy(dtype=float)
+    y = filtered[col_y].to_numpy(dtype=float)
+    theta_all = np.arctan2(y, x)               # (-π, π]
+    theta_all = np.mod(theta_all, 2*np.pi)     # [0, 2π)
+
+    xs = selected[col_x].to_numpy(dtype=float)
+    ys = selected[col_y].to_numpy(dtype=float)
+    theta_sel = np.arctan2(ys, xs)
+    theta_sel = np.mod(theta_sel, 2*np.pi)
+
+    # Rotate angles if requested
+    rot = np.deg2rad(start_angle_deg)
+    theta_all = np.mod(theta_all - rot, 2*np.pi)
+    theta_sel = np.mod(theta_sel - rot, 2*np.pi)
+
+    # ------------------------
+    # 4) Bin edges and counts
+    # ------------------------
+    if angle_bin_deg <= 0 or angle_bin_deg > 360:
+        raise ValueError("`angle_bin_deg` must be in (0, 360].")
+    n_bins = int(np.ceil(360.0 / angle_bin_deg))
+    bin_edges = np.linspace(0.0, 2*np.pi, n_bins + 1)
+    bin_width = bin_edges[1] - bin_edges[0]
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+
+    counts_sel, _ = np.histogram(theta_sel, bins=bin_edges)
+    denom = counts_sel.sum() if normalize == "selected" else len(theta_all)  # selected vs overall
+    fractions = counts_sel.astype(float) / max(denom, 1)
+
+    # Build results table
+    table = pd.DataFrame({
+        "bin_start_deg": np.rad2deg(bin_edges[:-1]),
+        "bin_end_deg":   np.rad2deg(bin_edges[1:]),
+        "bin_center_deg": np.rad2deg(bin_centers),
+        "count": counts_sel,
+        "fraction": fractions
+    })
+
+    # ------------------------
+    # 5) Plot (polar bar plot)
+    # ------------------------
+    fig = plt.figure(figsize=figsize, dpi=dpi)
+    ax = fig.add_subplot(111, projection="polar")
+
+    bars = ax.bar(
+        bin_centers, fractions,
+        width=bin_width,
+        align="center",
+        edgecolor="k",
+        linewidth=0.8,
+        alpha=0.85
+    )
+
+    # Style tweaks
+    ax.set_theta_direction(1)          # clockwise increases
+    ax.set_theta_zero_location("E")     # 0° (bin start_angle) to the right
+    ax.set_title(
+        f"{region_label}, time_window = {time_window}\n"
+        f"{sel_name} • bins={n_bins} (Δ={angle_bin_deg:.1f}°) • "
+        f"normalize={normalize}",
+        va="bottom"
+    )
+
+    # Optional reference diagonals at ±45° (and opposite)
+    if show_reference_diagonals:
+        ref_degs = np.array([45, 135, 225, 315], dtype=float) - start_angle_deg
+        for d in ref_degs:
+            th = np.deg2rad(d % 360)
+            ax.plot([th, th], [0, ax.get_rmax()], ls="--", lw=1.0, color="gray", alpha=0.8)
+
+    # Radial grid and label percentages at peaks
+    ax.set_rlabel_position(90)  # put radial labels on top
+    ax.grid(alpha=0.3, ls=":")
+    # Annotate a few highest bins
+    if fractions.size:
+        top_idx = np.argsort(fractions)[-min(5, len(fractions)):]
+        for i in top_idx:
+            if fractions[i] <= 0:
+                continue
+            th = bin_centers[i]
+            r  = fractions[i]
+            ax.text(th, r + 0.02 * (ax.get_rmax() or 1), f"{100*r:.1f}%", ha="center", va="bottom", fontsize=8)
+
+    plt.tight_layout()
+    plt.show()
+    return fig, ax, table
+
+
+
 def plot_diagonal_significance(
     ds: pd.DataFrame,
     filter_region: str,
@@ -872,7 +1081,9 @@ def plot_diagonal_significance(
     xlim: tuple = (-30, 30),
     ylim: tuple = (-30, 30),
     point_size: float = 5.0,
-    alpha_level: float = 0.05         
+    alpha_level: float = 0.05,
+    fit_oval: bool = True,               # New parameter to fit an oval to the data
+    fit_oval_only_both_sig: bool = True  # New parameter to fit oval only on Both-sig points
 ):
     """
     Filter a DataFrame by region and time window, compute significance masks
@@ -901,7 +1112,11 @@ def plot_diagonal_significance(
     point_size : float, optional
         Marker size for all scatter points (default=5).
     alpha_level: float, optional
-        The p value used to determine the signficant neuron.
+        The p value used to determine the significant neuron.
+    fit_oval : bool, optional
+        If True, fit and plot an oval (ellipse) to the scatter plot (default=False).
+    fit_oval_only_both_sig : bool, optional
+        If True, fit the oval using only the Both-sig points (default=False).
     """
     # Backward-compatibility shim if caller still passes p_value via keywords
     if 'p_value' in locals():
@@ -935,7 +1150,6 @@ def plot_diagonal_significance(
 
     # 4) Angle-based banding
     angle_tol = np.deg2rad(angle_tolerance_deg)
-    # Ensure tolerance < 45° to avoid tan() singularities
     max_tol = np.deg2rad(44.9)
     if angle_tol >= max_tol:
         angle_tol = max_tol
@@ -943,12 +1157,11 @@ def plot_diagonal_significance(
     angles = np.arctan2(filtered[col_y].values, filtered[col_x].values)
 
     def in_band(center):
-        # Smallest circular distance to the center angle
         delta = np.abs(np.arctan2(np.sin(angles - center), np.cos(angles - center)))
         return delta < angle_tol
 
     band_neg = mask_both & (in_band(-np.pi/4) | in_band(3*np.pi/4))
-    band_pos = mask_both & (in_band( np.pi/4) | in_band(-3*np.pi/4))
+    band_pos = mask_both & (in_band(np.pi/4) | in_band(-3*np.pi/4))
 
     # 5) Counts/fractions
     count_none = int(mask_none.sum())
@@ -969,17 +1182,6 @@ def plot_diagonal_significance(
     frac_y_pos = cnt_y_pos / count_y if count_y else 0.0
     frac_y_neg = cnt_y_neg / count_y if count_y else 0.0
 
-    # Quadrant splits for each band
-    cnt_neg_q2 = int((band_neg & (filtered[col_x] < 0) & (filtered[col_y] > 0)).sum())
-    cnt_neg_q4 = int((band_neg & (filtered[col_x] > 0) & (filtered[col_y] < 0)).sum())
-    frac_neg_q2 = cnt_neg_q2 / count_neg_band if count_neg_band else 0.0
-    frac_neg_q4 = cnt_neg_q4 / count_neg_band if count_neg_band else 0.0
-
-    cnt_pos_q1 = int((band_pos & (filtered[col_x] > 0) & (filtered[col_y] > 0)).sum())
-    cnt_pos_q3 = int((band_pos & (filtered[col_x] < 0) & (filtered[col_y] < 0)).sum())
-    frac_pos_q1 = cnt_pos_q1 / count_pos_band if count_pos_band else 0.0
-    frac_pos_q3 = cnt_pos_q3 / count_pos_band if count_pos_band else 0.0
-
     # 6) Which panels to draw
     draw_neg = diagonal in ('both', 'negative')
     draw_pos = diagonal in ('both', 'positive')
@@ -990,6 +1192,41 @@ def plot_diagonal_significance(
         axes = [axes]
     ax_idx = 0
     x_vals = np.linspace(*xlim, 200)
+
+    def fit_ellipse(x, y):
+        # Center the data before applying PCA
+        data = np.column_stack((x, y))
+        center = np.mean(data, axis=0)
+        data_centered = data - center  # Center the data by subtracting the mean
+        
+        # Fit an ellipse to the centered data using PCA
+        pca = PCA(n_components=2)
+        pca.fit(data_centered)
+        eigenvalues = pca.explained_variance_
+        eigenvectors = pca.components_
+
+        # The angle of rotation
+        angle = np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0])
+
+        # Ellipse parameters
+        t = np.linspace(0, 2 * np.pi, 100)
+        ellipse = np.array([np.cos(t), np.sin(t)])
+        ellipse[0, :] *= np.sqrt(eigenvalues[0])
+        ellipse[1, :] *= np.sqrt(eigenvalues[1])
+
+        # Rotate the ellipse based on the eigenvectors
+        ellipse_rot = np.dot(eigenvectors.T, ellipse)
+
+        # Correcting axis vectors to ensure they are 2D
+        major_axis = eigenvectors[:, 0] * np.sqrt(eigenvalues[0]) * 2  # Major axis along the first eigenvector
+        minor_axis = eigenvectors[:, 1] * np.sqrt(eigenvalues[1]) * 2  # Minor axis along the second eigenvector
+
+        # Ensure that major_axis and minor_axis are treated as 2D vectors, not scalars
+        major_axis = np.array([major_axis[0], major_axis[1]])  # Create a 2D vector for major axis
+        minor_axis = np.array([minor_axis[0], minor_axis[1]])  # Create a 2D vector for minor axis
+
+        return ellipse_rot + center[:, None], major_axis + center, minor_axis + center, angle, center
+
 
     def draw_panel(ax: plt.Axes, negative: bool):
         # Scatter layers
@@ -1023,16 +1260,13 @@ def plot_diagonal_significance(
 
         # Panel-specific annotation
         if negative:
-            quad_text = f"Band Q2: {cnt_neg_q2} ({frac_neg_q2:.1%}), Q4: {cnt_neg_q4} ({frac_neg_q4:.1%})"
             title = f"Negative Diagonal (±{angle_tolerance_deg}°)"
         else:
-            quad_text = f"Band Q1: {cnt_pos_q1} ({frac_pos_q1:.1%}), Q3: {cnt_pos_q3} ({frac_pos_q3:.1%})"
             title = f"Positive Diagonal (±{angle_tolerance_deg}°)"
 
         stats_text = (
             f"X-sig: + {cnt_x_pos} ({frac_x_pos:.1%}), − {cnt_x_neg} ({frac_x_neg:.1%})\n"
-            f"Y-sig: + {cnt_y_pos} ({frac_y_pos:.1%}), − {cnt_y_neg} ({frac_y_neg:.1%})\n\n"
-            f"{quad_text}"
+            f"Y-sig: + {cnt_y_pos} ({frac_y_pos:.1%}), − {cnt_y_neg} ({frac_y_neg:.1%})\n"
         )
 
         ax.set_title(title)
@@ -1043,6 +1277,22 @@ def plot_diagonal_significance(
                 va='top', fontsize='small',
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray"))
         ax.legend(loc='upper right', fontsize='small')
+
+        # Fit and plot ellipse if requested
+        if fit_oval:
+            data_for_ellipse = filtered
+            if fit_oval_only_both_sig:
+                data_for_ellipse = filtered.loc[mask_both]  # Only use Both-sig points
+            ellipse_rot, major_axis, minor_axis, angle, center = fit_ellipse(data_for_ellipse[col_x], data_for_ellipse[col_y])
+            ax.plot(ellipse_rot[0, :], ellipse_rot[1, :], color='orange', lw=2, label="Fitted Ellipse")
+            
+            # Plot Major and Minor Axes
+            ax.quiver(center[0], center[1], major_axis[0], major_axis[1], angles='xy', scale_units='xy', scale=1, color='blue', label="Major Axis")
+            ax.quiver(center[0], center[1], minor_axis[0], minor_axis[1], angles='xy', scale_units='xy', scale=1, color='green', label="Minor Axis")
+
+            # Add angle of rotation to the legend
+            ax.legend(loc='upper left', fontsize='small', title=f"Rotation: {np.degrees(angle):.1f}°")
+            ax.set_aspect('equal', adjustable='box')
 
     if draw_neg:
         draw_panel(axes[ax_idx], negative=True)
@@ -1056,9 +1306,11 @@ def plot_diagonal_significance(
         "Gray=non-sig, Blue=X-sig, Green=Y-sig, Red=both-sig; Purple=diagonal band & both-sig",
         fontsize=14
     )
+    
     plt.tight_layout(rect=[0, 0, 1, 0.94])
     plt.show()
     return fig, axes
+
 
 
 def plot_projection(
