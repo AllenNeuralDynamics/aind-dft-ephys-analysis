@@ -1,11 +1,9 @@
-# hash:sha256:0e84905421733d7777bf10c3f31f839ac0999a8843315de0a563e3ac820806e7
+# hash:sha256:d39892ac016258bb2031bd687142f449a67813e4f637a41d0b138e008bf5c028
 ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/c1-vscode:4.20.0-pylint2023.10.1-copilot1.143.601
 
 ARG DEBIAN_FRONTEND=noninteractive
-
 ARG GIT_ASKPASS
-ARG GIT_ACCESS_TOKEN
 COPY git-askpass /
 
 RUN apt-get update \
@@ -18,7 +16,9 @@ RUN apt-get update \
         software-properties-common=0.99.22.9 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install -U --no-cache-dir \
+RUN --mount=type=secret,id=git-access-token \
+    GIT_ACCESS_TOKEN="$(cat /run/secrets/git-access-token)" \
+    pip3 install -U --no-cache-dir \
     aind-analysis-arch-result-access==0.7.0 \
     aind-mri-utils==0.3.0 \
     aind-spurious-correlation==0.0.6 \

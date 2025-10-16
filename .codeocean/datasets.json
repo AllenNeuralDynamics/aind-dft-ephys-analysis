@@ -126,6 +126,10 @@
 			"mount": "SmartSPIM_764791_2025-02-13_10-49-11_stitched_2025-03-07_07-20-38"
 		},
 		{
+			"id": "2ff811ea-10de-4d86-aecd-2ff831156188",
+			"mount": "regression_result"
+		},
+		{
 			"id": "30c3a8f3-93ad-441b-b59a-f4f27303f99b",
 			"mount": "behavior_770528_2025-02-13_16-54-06_processed_2025-02-14_05-26-45"
 		},
