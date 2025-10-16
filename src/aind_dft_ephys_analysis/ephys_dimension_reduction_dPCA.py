@@ -449,6 +449,64 @@ def _mask_from_trial_ids(
     return mask
 
 # ---------------------------- High-level API -------------------------
+from pathlib import Path
+import json
+
+def _package_tdr_to_xr(
+    projection_trace: np.ndarray,
+    projection_fit: np.ndarray,
+    w_final: np.ndarray,
+    t: np.ndarray,
+    trial_ids_used: np.ndarray,
+    unit_ids: np.ndarray,
+    meta: Dict
+) -> xr.Dataset:
+    """
+    Build an xarray.Dataset container for saving TDR outputs.
+
+    Parameters
+    ----------
+    projection_trace : (T_used, Tt_proj) array
+        Time-resolved projection per included trial.
+    projection_fit : (T_used,) array
+        Scalar projection in the fit window per trial.
+    w_final : (N_units,) array
+        Neuronal axis (unit loadings).
+    t : (Tt_proj,) array
+        Time vector for projection_trace.
+    trial_ids_used : (T_used,) array
+        Trial IDs used (dataset order).
+    unit_ids : (N_units,) array
+        Unit IDs.
+    meta : dict
+        Free-form metadata (fit window, alignment, CV stats, etc.)
+
+    Returns
+    -------
+    xr.Dataset
+        Dataset with data vars:
+          - projection_trace(trial, time)
+          - projection(trial)
+          - axis_w(unit)
+        coords: trial_id, time, unit_id
+        attrs: meta
+    """
+    ds = xr.Dataset(
+        data_vars=dict(
+            projection_trace=(("trial", "time"), projection_trace),
+            projection=(("trial",), projection_fit),
+            axis_w=(("unit",), w_final),
+        ),
+        coords=dict(
+            trial_id=("trial", np.asarray(trial_ids_used, dtype=int)),
+            time=("time", np.asarray(t, dtype=float)),
+            unit_id=("unit", np.asarray(unit_ids, dtype=int)),
+        ),
+        attrs={k: v for k, v in meta.items()},
+    )
+    return ds
+
+
 
 def tdr_from_psth(
     psth_da: xr.Dataset,
@@ -461,90 +519,57 @@ def tdr_from_psth(
     n_splits: int = 5,
     include_trials: Optional[Union[np.ndarray, List[int]]] = None,
     require_all_ids: bool = True,
-    projection_time_window: Optional[Tuple[float, float]] = None
+    projection_time_window: Optional[Tuple[float, float]] = None,
+    *,
+    save_path: Optional[Union[str, Path]] = None,
+    save_format: str = "zarr",         # {"npz", "nc", "zarr"}
+    overwrite: bool = True
 ) -> Dict:
     """
-    Fit TDR on a chosen analysis window and return a per-trial time-resolved
-    projection trace using the same neuronal axis.
+    Fit TDR on a chosen analysis window and return (and optionally SAVE) a
+    per-trial time-resolved projection trace using the same neuronal axis.
 
     Parameters
     ----------
     psth_da : xr.Dataset
-        Input PSTH dataset as described above.
+        PSTH dataset (see module docstring).
     latent : array-like
-        Either:
-          (a) full-length vector for ALL trials in this alignment (length T_full),
-              in which case it is internally subset by `include_trials`, or
-          (b) already subset to the included trials (length == #included).
-        The latent is z-scored inside the design matrix builder.
+        Full-length latent (T_full) or subset latent (T_used); auto-subset if full-length.
     align : {"go_cue", "reward_go_cue_start"}
-        Which alignment/event to use for both the fit and (by default) projection.
+        Alignment/event for fit (and projection unless projection_time_window is set).
     time_window : (float, float)
-        Time window (seconds) used to compute mean firing rates for fitting the TDR axis.
-        The window is applied as t0 <= t < t1 on psth_da['time'].
-    continuous_covs : dict[str, array-like], optional
-        Additional continuous covariates (e.g., pupil, speed). Each array can be either
-        full length (T_full) or already subset (T_used); full-length covariates are
-        internally subset by `include_trials`. They are z-scored by default.
-    categorical_covs : dict[str, array-like], optional
-        Additional categorical covariates (strings/ints) of length T_full or T_used.
-        Each is one-hot encoded with a base level dropped.
-    orth_names : list[str], optional
-        Names of regressors (keys present in the design matrix) to orthogonalize
-        the latent axis against (e.g., ["choice", "outcome"] or expanded names such
-        as "choice[1]" if you want to target a specific column). When a block name is
-        given (e.g., "choice") the block is collapsed to its leading singular vector.
-    n_splits : int
-        Number of splits for K-fold cross-validation (see `tdr_cv`).
-    include_trials : array-like of int, required
-        Trial IDs to keep from the chosen alignment. These define which trials are used
-        to fit the axis and for the returned projection traces. Order in the dataset is
-        preserved; duplicates are ignored.
+        Fit window in seconds (t0 <= t < t1).
+    continuous_covs, categorical_covs, orth_names, n_splits
+        See previous docstring (unchanged behavior).
+    include_trials : array-like of int
+        Trial IDs to keep (REQUIRED).
     require_all_ids : bool
-        If True, raise an error if any requested ID in `include_trials` is not present
-        in the dataset.
+        Error if any requested ID is missing.
     projection_time_window : (float, float) or None
-        Time window (seconds) over which to build the returned time-resolved
-        projection traces. If None, uses the full available time axis.
+        Window for time-resolved projection; None → full time.
+    save_path : str | Path | None, default None
+        If provided, results are saved to this path.
+        - If save_format="npz": a single .npz file is written.
+        - If save_format="nc": a NetCDF .nc file is written.
+        - If save_format="zarr": a Zarr directory is written.
+    save_format : {"npz", "nc", "zarr"}
+        Output format when save_path is set.
+    overwrite : bool, default True
+        Overwrite existing file/dir if it exists (for zarr: rmdir first).
 
     Returns
     -------
     dict
-        axis_w : np.ndarray
-            (N_units,) unit weights defining the neuronal dimension (unit-norm).
-        projection : np.ndarray
-            (T_used,) scalar per-trial projection computed in the fit window
-            (identical to `final['y']` from `tdr_cv` on z-scored data).
-        projection_trace : np.ndarray
-            (T_used × Tt_proj) time-resolved projection per included trial.
-            Built by standardizing the time cube using the fit-window mean/std
-            and projecting onto `axis_w`.
-        time_for_projection : np.ndarray
-            (Tt_proj,) time vector corresponding to columns of `projection_trace`.
-        trial_ids : np.ndarray
-            (T_used,) trial IDs actually used (dataset order).
-        unit_ids : np.ndarray
-            (N_units,) unit indices from the dataset.
-        time_mask_fit : np.ndarray (bool)
-            Mask over psth_da['time'] indicating the window used to fit.
-        align : str
-            Alignment used.
-        time_window_fit : tuple
-            The fit window (copy of `time_window`).
-        projection_time_window : tuple or None
-            The projection window (copy of input).
-        n_trials_used : int
-            Number of trials used (after masking).
-        n_trials_total : int
-            Total number of trials for this alignment in the dataset.
-        zscore_mu : np.ndarray
-            (1 × N_units) unit means computed on the fit window for included trials.
-        zscore_sigma : np.ndarray
-            (1 × N_units) unit stds computed on the fit window for included trials.
-        cv_corr, cv_r2, y_cv, z_cv, final
-            Cross-validation outputs from `tdr_cv`.
+        Same return dict as before, with keys:
+        axis_w, projection, projection_trace, time_for_projection, trial_ids,
+        unit_ids, time_mask_fit, align, time_window_fit, projection_time_window,
+        n_trials_used, n_trials_total, zscore_mu, zscore_sigma,
+        and CV outputs (cv_corr, cv_r2, y_cv, z_cv, final).
+        If saved, the dict additionally contains:
+        - "saved_to": str path that was written.
+        - "saved_format": str format used.
     """
-    # 1) Extract fit-window trial × unit (no z-score here; we’ll standardize once)
+    # 1) Extract fit-window (no z-score here)
     fit_ext = extract_trial_unit_rates(
         psth_da, align=align, time_window=time_window, zscore_units=False
     )
@@ -555,16 +580,15 @@ def tdr_from_psth(
     if include_trials is None:
         raise ValueError("include_trials (trial IDs) must be provided.")
 
-    # 2) Build mask from trial IDs and subset
+    # 2) Mask and subset
     mask = _mask_from_trial_ids(trial_ids_full, include_trials, require_all=require_all_ids)
     if mask.sum() == 0:
         raise ValueError("include_trials matched 0 trials in psth_da for this alignment.")
-
     R_fit = R_fit_full[mask]
     trial_ids_used = trial_ids_full[mask]
     T_used = R_fit.shape[0]
 
-    # 3) Handle latent size: accept either full length (T_full) or included length (T_used)
+    # 3) Latent length handling
     latent = np.asarray(latent).reshape(-1)
     if len(latent) == T_full:
         latent = latent[mask]
@@ -573,12 +597,12 @@ def tdr_from_psth(
             f"'latent' length must be either T_full={T_full} or #included={T_used}, got {len(latent)}"
         )
 
-    # 4) Standardize units using mean/std from the fit window (included trials only)
-    mu = R_fit.mean(axis=0, keepdims=True)               # (1 × N_units)
+    # 4) Standardize units on fit window (included trials only)
+    mu = R_fit.mean(axis=0, keepdims=True)
     sigma = R_fit.std(axis=0, keepdims=True) + 1e-9
     R_fit_z = (R_fit - mu) / sigma
 
-    # 5) Build design for these SAME trials (auto-subset covariates if full-length)
+    # 5) Subset/standardize covariates if provided
     def _auto_subset(vec):
         arr = np.asarray(vec)
         if len(arr) == T_full:
@@ -603,7 +627,7 @@ def tdr_from_psth(
         zscore_continuous=True,
     )
 
-    # 6) Fit TDR (CV + final) on standardized fit-window data
+    # 6) Fit with CV
     cv = tdr_cv(
         R=R_fit_z,
         X_wo_intercept=X_wo,
@@ -613,21 +637,20 @@ def tdr_from_psth(
         n_splits=n_splits,
     )
 
-    w_final = cv["final"]["w"]                # (N_units,)
-    projection_fit = R_fit_z @ w_final        # (T_used,)
+    w_final = cv["final"]["w"]
+    projection_fit = R_fit_z @ w_final
 
-    # 7) Build time-resolved projection for included trials (using SAME scaling)
+    # 7) Time-resolved projection (same scaling)
     cube_ext = extract_trial_unit_timecube(
         psth_da, align=align, time_window=projection_time_window
     )
-    cube_full = cube_ext["cube"]              # (T_full × N_units × Tt_proj)
-    time_proj = cube_ext["time"]              # (Tt_proj,)
-    cube_used = cube_full[mask]               # (T_used × N_units × Tt_proj)
-
+    cube_full = cube_ext["cube"]
+    time_proj = cube_ext["time"]
+    cube_used = cube_full[mask]
     cube_z = (cube_used - mu[:, :, None]) / sigma[:, :, None]
-    projection_trace = np.tensordot(cube_z, w_final, axes=([1],[0]))   # (T_used × Tt_proj)
+    projection_trace = np.tensordot(cube_z, w_final, axes=([1], [0]))
 
-    # 8) Package results
+    # 8) Package return
     cv.update({
         "axis_w": w_final,
         "projection": projection_fit,
@@ -644,7 +667,74 @@ def tdr_from_psth(
         "zscore_mu": mu,
         "zscore_sigma": sigma,
     })
+
+    # 9) Optional save
+    if save_path is not None:
+        path = Path(save_path)
+        fmt = save_format.lower()
+        if fmt not in {"npz", "nc", "zarr"}:
+            raise ValueError("save_format must be one of {'npz','nc','zarr'}")
+
+        if fmt == "npz":
+            # Minimal, portable archive + JSON meta sidecar inside attrs_str
+            np.savez_compressed(
+                path,
+                projection_trace=projection_trace,
+                projection=projection_fit,
+                axis_w=w_final,
+                time=time_proj,
+                trial_ids=trial_ids_used,
+                unit_ids=fit_ext["unit_ids"],
+                zscore_mu=mu,
+                zscore_sigma=sigma,
+                # store small metadata as json string
+                attrs_str=json.dumps({
+                    "align": align,
+                    "time_window_fit": time_window,
+                    "projection_time_window": projection_time_window,
+                    "n_trials_used": int(T_used),
+                    "n_trials_total": int(T_full),
+                    "cv_corr": np.asarray(cv["cv_corr"]).tolist(),
+                    "cv_r2": np.asarray(cv["cv_r2"]).tolist(),
+                })
+            )
+        else:
+            # Build an xarray Dataset
+            meta = {
+                "align": align,
+                "time_window_fit": time_window,
+                "projection_time_window": projection_time_window,
+                "n_trials_used": int(T_used),
+                "n_trials_total": int(T_full),
+                "cv_corr": np.asarray(cv["cv_corr"]),
+                "cv_r2": np.asarray(cv["cv_r2"]),
+            }
+            ds = _package_tdr_to_xr(
+                projection_trace=projection_trace,
+                projection_fit=projection_fit,
+                w_final=w_final,
+                t=time_proj,
+                trial_ids_used=trial_ids_used,
+                unit_ids=fit_ext["unit_ids"],
+                meta=meta,
+            )
+
+            if fmt == "nc":
+                if path.exists() and not overwrite:
+                    raise FileExistsError(f"{path} exists and overwrite=False")
+                ds.to_netcdf(path)
+            elif fmt == "zarr":
+                if path.exists() and overwrite:
+                    # remove existing zarr store safely
+                    import shutil
+                    shutil.rmtree(path)
+                ds.to_zarr(path, mode="w")
+
+        cv["saved_to"] = str(path)
+        cv["saved_format"] = fmt
+
     return cv
+
 
 # ------------------------------- Example -----------------------------
 # Usage:
