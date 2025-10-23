@@ -320,37 +320,6 @@ def _compute_cd_axis(R_z: np.ndarray, labels_pm1: np.ndarray) -> np.ndarray:
     mu_neg = neg.mean(axis=0) if len(neg) > 0 else np.zeros(R_z.shape[1], float)
     return _unit_norm(mu_pos - mu_neg)
 
-
-def _rankdata_average(x: np.ndarray) -> np.ndarray:
-    """
-    Average-rank implementation (1-based), tie-aware, pure NumPy.
-
-    Parameters
-    ----------
-    x : np.ndarray
-        Scores to rank.
-
-    Returns
-    -------
-    np.ndarray
-        Average ranks (1-based) with ties receiving the mean of their rank positions.
-    """
-    x = np.asarray(x)
-    order = np.argsort(x, kind="mergesort")
-    ranks = np.empty_like(order, dtype=float)
-    xs = x[order]
-    n = len(x)
-    i = 0
-    while i < n:
-        j = i
-        while (j + 1 < n) and (xs[j + 1] == xs[i]):
-            j += 1
-        avg_rank = 0.5 * (i + j) + 1.0  # average of 1-based ranks for the tie block
-        ranks[order[i : j + 1]] = avg_rank
-        i = j + 1
-    return ranks
-
-
 def _roc_auc_binary(y_true_pm1: np.ndarray, y_score: np.ndarray) -> float:
     """
     Pure-NumPy ROC-AUC for binary labels in {+1, -1}.
@@ -378,7 +347,7 @@ def _roc_auc_binary(y_true_pm1: np.ndarray, y_score: np.ndarray) -> float:
     n_neg = int((~pos).sum())
     if n_pos == 0 or n_neg == 0:
         return np.nan
-    ranks = _rankdata_average(y_score)  # 1-based avg ranks
+    ranks = np.argsort(y_score, kind="mergesort")  # 1-based avg ranks
     sum_pos_ranks = ranks[pos].sum()
     U = sum_pos_ranks - n_pos * (n_pos + 1) / 2.0
     auc = U / (n_pos * n_neg)
@@ -422,17 +391,17 @@ def _apply_norm(y_fit: np.ndarray, Y_trace: np.ndarray, mode: str, N_units: int)
     y_mean = float(np.nanmean(y_fit))
     y_std  = float(np.nanstd(y_fit) + 1e-12)
 
-    if mode_in == "divide_sqrtN":
+    if mode == "divide_sqrtN":
         factor = float(np.sqrt(N_units))
-        return y_fit / factor, Y_trace / factor, mode_in, factor, y_mean, y_std
-    elif mode_in == "unit_variance_fit":
+        return y_fit / factor, Y_trace / factor, mode, factor, y_mean, y_std
+    elif mode == "unit_variance_fit":
         factor = y_std
-        return y_fit / factor, Y_trace / factor, mode_in, factor, y_mean, y_std
-    elif mode_in == "zscore_fit":
+        return y_fit / factor, Y_trace / factor, mode, factor, y_mean, y_std
+    elif mode == "zscore_fit":
         factor = y_std
-        return (y_fit - y_mean) / factor, (Y_trace - y_mean) / factor, mode_in, factor, y_mean, y_std
+        return (y_fit - y_mean) / factor, (Y_trace - y_mean) / factor, mode, factor, y_mean, y_std
     else:
-        return y_fit.copy(), Y_trace.copy(), mode_in, 1.0, y_mean, y_std
+        return y_fit.copy(), Y_trace.copy(), mode, 1.0, y_mean, y_std
 
 
 # ---------------------------------------------------------------------------
