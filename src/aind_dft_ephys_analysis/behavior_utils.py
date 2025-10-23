@@ -681,6 +681,8 @@ def find_trials(
         - 'unrewarded'       : trials where no reward and response != 2
         - 'left_rewarded'    : trials where left side was rewarded
         - 'right_rewarded'   : trials where right side was rewarded
+        - 'left_choice'      : left choice trials
+        - 'right_choice'     : right choice trials
 
         **Switch-based types**
         - 'switch_trial'             : any switch between consecutive trials
@@ -760,6 +762,10 @@ def find_trials(
     # Standard trial types
     if trial_type == 'no_response':
         return np.where(resp == 2)[0].tolist()
+    if trial_type == 'left_choice':
+        return np.where(resp == 0)[0].tolist()
+    if trial_type == 'right_choice':
+        return np.where(resp == 1)[0].tolist()
     elif trial_type == 'response':
         return np.where(resp != 2)[0].tolist()
     elif trial_type == 'rewarded':
@@ -853,6 +859,8 @@ def generate_behavior_summary(
             'switch_RL',                
             'switch_RL_reward',        
             'switch_RL_noreward',
+            'left_choice',
+            'right_choice'
         ]
 
     # ------------------------------------------------------------------
