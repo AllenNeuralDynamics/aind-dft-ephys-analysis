@@ -507,10 +507,15 @@ def coding_direction_from_psth(
 
     # 4) Per-fold train/test computation
     for fd in folds:
-        tr_idx = fd["train"]
-        te_idx = fd["test"]
-        y_tr_labels = fd["train_labels"].astype(float)
-        y_te_labels = fd["test_labels"].astype(float)
+        train_order = np.argsort(fd["train"])
+        test_order  = np.argsort(fd["test"])
+
+        tr_idx = fd["train"][train_order]  # Sorted training indices
+        te_idx = fd["test"][test_order]    # Sorted testing indices
+
+        y_tr_labels = fd["train_labels"].astype(float)[train_order]  # Labels aligned with sorted training indices
+        y_te_labels = fd["test_labels"].astype(float)[test_order]    # Labels aligned with sorted testing indices
+
 
         # Z-score using TRAIN trials only (fit window)
         R_tr = R_fit_full[tr_idx]
@@ -525,6 +530,7 @@ def coding_direction_from_psth(
 
         # ---- Training projections (fit-window & time-resolved) ----
         y_tr = R_tr_z @ w  # (T_tr,)
+
         cube_tr   = cube_full[tr_idx]                   # (T_tr, N, Tt)
         cube_tr_z = (cube_tr - mu[:, :, None]) / sigma[:, :, None]
         Yt_tr = np.tensordot(cube_tr_z, w, axes=([1], [0]))  # (T_tr, Tt)
@@ -541,20 +547,20 @@ def coding_direction_from_psth(
         # Metrics on held-out
         y_pos = y_te[y_te_labels == +1]
         y_neg = y_te[y_te_labels == -1]
-        dprime = float((np.nanmean(y_pos) - np.nanmean(y_neg)) /
-                       (np.sqrt(0.5*(np.nanvar(y_pos)+np.nanvar(y_neg))) + 1e-12))
+        dprime = float((np.nanmean(y_pos) - np.nanmean(y_neg)) / 
+                    (np.sqrt(0.5*(np.nanvar(y_pos)+np.nanvar(y_neg))) + 1e-12))
         auc = _roc_auc_binary(y_te_labels, y_te)
         per_fold_stats.append({"n_train": int(len(tr_idx)), "n_test": int(len(te_idx)), "dprime": dprime, "auc": auc})
 
         # Accumulate
         y_train_all.append(y_tr)
         lab_train_all.append(y_tr_labels)
-        id_train_all.append(trial_ids_full[tr_idx])
+        id_train_all.append(trial_ids_full[tr_idx])  # Correct trial IDs for training set
         Yt_train_all.append(Yt_tr)
 
         y_test_all.append(y_te)
         lab_test_all.append(y_te_labels)
-        id_test_all.append(trial_ids_full[te_idx])
+        id_test_all.append(trial_ids_full[te_idx])  # Correct trial IDs for testing set
         Yt_test_all.append(Yt_te)
 
     # 5) Concatenate across folds
@@ -568,7 +574,7 @@ def coding_direction_from_psth(
     id_test_all = np.concatenate(id_test_all, axis=0)
     Yt_test_all = np.concatenate(Yt_test_all, axis=0)
 
-    # 6) Normalize using TEST stats (keeps train/test directly comparable)
+    # ---- Normalize using TEST stats (keeps train/test directly comparable) ----
     y_test_norm, Yt_test_norm, norm_mode_used, norm_factor, y_mean, y_std = _apply_norm(
         y_test_all, Yt_test_all, norm_mode, N_units=len(unit_ids)
     )
@@ -606,6 +612,8 @@ def coding_direction_from_psth(
     projection_test_B        = y_test_norm[teB_mask]
     projection_trace_test_B  = Yt_test_norm[teB_mask]
     trial_ids_test_B         = id_test_all[teB_mask].astype(int)
+
+
 
     # 7) Provide a "final" CD using ALL provided A & B trials (z-scored on all A∪B)
     idx_all_inc = np.sort(np.concatenate([idx_a_all, idx_b_all]))
