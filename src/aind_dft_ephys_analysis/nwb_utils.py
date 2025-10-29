@@ -1,9 +1,19 @@
 import os
 import glob
-from typing import Optional, Any
+from typing import Optional, Any, Union, Iterable, List
 from hdmf_zarr import NWBZarrIO
 from pynwb import NWBHDF5IO
 from general_utils import extract_session_name_core
+
+
+def _as_paths_list(folder_path: Union[str, Iterable[str]]) -> List[str]:
+    """
+    Normalize a folder_path argument to a list of valid base directories.
+    """
+    if isinstance(folder_path, str):
+        return [folder_path]
+    return list(folder_path)
+
 
 class NWBUtils:
     """
@@ -12,7 +22,7 @@ class NWBUtils:
 
     @staticmethod
     def read_ephys_nwb(
-        folder_path: str = '/root/capsule/data/',
+        folder_path: Union[str, Iterable[str]] = '/root/capsule/data/',
         nwb_full_path: Optional[str] = None,
         session_name: Optional[str] = None
     ) -> Optional[Any]:
@@ -27,7 +37,7 @@ class NWBUtils:
         If multiple matching folders or files are found, warn and return None.
 
         Args:
-            folder_path: Base path containing ephys sessions.
+            folder_path: Base path or list of base paths containing ephys sessions.
             nwb_full_path: Direct path to the NWB file (optional).
             session_name: Identifier for the ephys session (optional).
 
@@ -48,15 +58,20 @@ class NWBUtils:
             print("Warning: session_name is required when nwb_full_path is not provided.")
             return None
         core = extract_session_name_core(session_name)
-        pattern = os.path.join(folder_path, f"ecephys_{core}_*sorted*")
-        folders = glob.glob(pattern)
-        if not folders:
-            print(f"Warning: No folder matching '{pattern}' found.")
+
+        bases = _as_paths_list(folder_path)
+        matched_folders = []
+        for base in bases:
+            pattern = os.path.join(base, f"ecephys_{core}_*sorted*")
+            matched_folders.extend(glob.glob(pattern))
+
+        if not matched_folders:
+            print(f"Warning: No folder matching 'ecephys_{core}_*sorted*' found under {bases}.")
             return None
-        if len(folders) > 1:
-            print(f"Warning: Multiple ephys folders found for session '{core}': {folders}.")
+        if len(matched_folders) > 1:
+            print(f"Warning: Multiple ephys folders found for session '{core}': {matched_folders}.")
             return None
-        nwb_folder = folders[0]
+        nwb_folder = matched_folders[0]
 
         exp_pattern = os.path.join(nwb_folder, 'nwb', '*experiment1_recording1.nwb')
         files = glob.glob(exp_pattern)
@@ -80,7 +95,10 @@ class NWBUtils:
 
     @staticmethod
     def read_behavior_nwb(
-        folder_path: str = '/root/capsule/data/behavior_nwb',
+        folder_path: Union[str, Iterable[str]] = [
+            '/root/capsule/data/behavior_nwb',
+            '/root/capsule/data/optogenetics_nwb'
+        ],
         nwb_full_path: Optional[str] = None,
         session_name: Optional[str] = None
     ) -> Optional[Any]:
@@ -90,12 +108,12 @@ class NWBUtils:
         Priority:
         1. Use `nwb_full_path` if provided.
         2. Otherwise, constructs the expected filename from `session_name` under
-           `folder_path/behavior_nwb/`, optionally prefixed with 'behavior_'.
+           each base in `folder_path`, optionally prefixed with 'behavior_'.
 
         If multiple matching files are found, warn and return None.
 
         Args:
-            folder_path: Base path containing 'behavior_nwb' directory.
+            folder_path: Base path or list of base paths containing 'behavior_nwb' or 'optogenetics_nwb' files.
             nwb_full_path: Direct path to the NWB file (optional).
             session_name: Identifier for the behavior session (optional).
 
@@ -113,16 +131,24 @@ class NWBUtils:
                 print("Warning: session_name is required when nwb_full_path is not provided.")
                 return None
             core = extract_session_name_core(session_name)
-            candidates = [os.path.join(folder_path, f"{core}.nwb"),
-                          os.path.join(folder_path, f"behavior_{core}.nwb")]
-            files = [p for p in candidates if os.path.exists(p)]
-            if not files:
-                print(f"Warning: No behavior NWB files found for session '{core}'.")
+            bases = _as_paths_list(folder_path)
+
+            found_files = []
+            for base in bases:
+                candidates = [
+                    os.path.join(base, f"{core}.nwb"),
+                    os.path.join(base, f"behavior_{core}.nwb"),
+                ]
+                found_files.extend([p for p in candidates if os.path.exists(p)])
+
+            if not found_files:
+                print(f"Warning: No behavior NWB files found for session '{core}' under {bases}.")
                 return None
-            if len(files) > 1:
-                print(f"Warning: Multiple behavior NWB files found: {files}.")
+            if len(found_files) > 1:
+                print(f"Warning: Multiple behavior NWB files found: {found_files}.")
                 return None
-            path = files[0]
+            path = found_files[0]
+
         print(f"Found behavior NWB: {path}")
         # Read file (HDF5 first, then Zarr)
         try:
@@ -144,7 +170,7 @@ class NWBUtils:
 
     @staticmethod
     def read_ophys_nwb(
-        folder_path: str = '/root/capsule/data/',
+        folder_path: Union[str, Iterable[str]] = '/root/capsule/data/',
         nwb_full_path: Optional[str] = None,
         session_name: Optional[str] = None
     ) -> Optional[Any]:
@@ -154,12 +180,12 @@ class NWBUtils:
         Priority:
         1. Use `nwb_full_path` if provided.
         2. Otherwise, searches for a folder matching '*<session_name>_*processed*'
-           under `folder_path`, then any '*.nwb' file inside its 'nwb/' subfolder.
+           under each base in `folder_path`, then any '*.nwb' file inside its 'nwb/' subfolder.
 
         If multiple matching folders or files are found, warn and return None.
 
         Args:
-            folder_path: Base path containing processed ophys session folders.
+            folder_path: Base path or list of base paths containing processed ophys session folders.
             nwb_full_path: Direct path to the NWB file (optional).
             session_name: Identifier for the ophys session (optional).
 
@@ -180,10 +206,15 @@ class NWBUtils:
             print("Warning: session_name is required when nwb_full_path is not provided.")
             return None
         core = extract_session_name_core(session_name)
-        folder_pattern = os.path.join(folder_path, f"*{core}_*processed*")
-        proc_folders = glob.glob(folder_pattern)
+
+        bases = _as_paths_list(folder_path)
+        proc_folders = []
+        for base in bases:
+            folder_pattern = os.path.join(base, f"*{core}_*processed*")
+            proc_folders.extend(glob.glob(folder_pattern))
+
         if not proc_folders:
-            print(f"Warning: No folder matching '{folder_pattern}' found.")
+            print(f"Warning: No folder matching '*{core}_*processed*' found under {bases}.")
             return None
         if len(proc_folders) > 1:
             print(f"Warning: Multiple ophys folders found: {proc_folders}.")
@@ -209,11 +240,14 @@ class NWBUtils:
         except Exception as e:
             print(f"Error reading ophys NWB file '{file_path}': {e}")
             return None
-            
+
     @staticmethod
     def read_ophys_or_behavior_nwb(
-        ophys_folder_path: str = '/root/capsule/data/',
-        behavior_folder_path: str = '/root/capsule/data/behavior_nwb',
+        ophys_folder_path: Union[str, Iterable[str]] = '/root/capsule/data/',
+        behavior_folder_path: Union[str, Iterable[str]] = [
+            '/root/capsule/data/behavior_nwb',
+            '/root/capsule/data/optogenetics_nwb'
+        ],
         ophys_nwb_full_path: Optional[str] = None,
         behavior_nwb_full_path: Optional[str] = None,
         session_name: Optional[str] = None
@@ -241,8 +275,11 @@ class NWBUtils:
 
     @staticmethod
     def combine_nwb(
-        ephys_folder_path: str = '/root/capsule/data/',
-        behavior_folder_path: str = '/root/capsule/data/behavior_nwb',
+        ephys_folder_path: Union[str, Iterable[str]] = '/root/capsule/data/',
+        behavior_folder_path: Union[str, Iterable[str]] = [
+            '/root/capsule/data/behavior_nwb',
+            '/root/capsule/data/optogenetics_nwb'
+        ],
         session_name: Optional[str] = None,
         ephys_nwb_full_path: Optional[str] = None,
         behavior_nwb_full_path: Optional[str] = None
