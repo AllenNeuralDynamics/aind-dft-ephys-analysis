@@ -217,22 +217,21 @@ def find_unique_combinations(
     if missing:
         raise ValueError(f"Columns not found in DataFrame: {missing}")
 
+    # De-duplicate requested columns to avoid accidental repeats
+    columns = list(dict.fromkeys(columns))
+
     work = df[columns].copy()
     if not include_na:
         work = work.dropna(subset=columns)
 
-    # We'll need session/subject_id to compute n_session/n_mice if available
+    # Attach optional keys only if not already present
     have_session = 'session' in df.columns
     have_subject = 'subject_id' in df.columns
 
-    # Build a working frame that includes grouping cols and optional keys
-    extra_keys = []
-    if have_session:
-        work = work.join(df['session'])
-        extra_keys.append('session')
-    if have_subject:
-        work = work.join(df['subject_id'])
-        extra_keys.append('subject_id')
+    if have_session and 'session' not in work.columns:
+        work['session'] = df['session'].values
+    if have_subject and 'subject_id' not in work.columns:
+        work['subject_id'] = df['subject_id'].values
 
     # Group and aggregate
     gb = work.groupby(columns, dropna=include_na)

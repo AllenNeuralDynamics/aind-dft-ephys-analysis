@@ -3,8 +3,7 @@
 	"base_image": "codeocean/c1-vscode:4.20.0-pylint2023.10.1-copilot1.143.601",
 	"options": {
 		"registry_host_arg": true,
-		"git_ask_pass": true,
-		"mount_secrets": true
+		"git_ask_pass": true
 	},
 	"installers": {
 		"apt": {
