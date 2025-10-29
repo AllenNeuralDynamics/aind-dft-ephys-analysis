@@ -33,6 +33,12 @@ from scipy import stats
 from sklearn.model_selection import KFold
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+from matplotlib.cm import get_cmap
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+
+
 # ----------------------------- utilities -----------------------------
 
 def _one_hot(vec: np.ndarray) -> np.ndarray:
@@ -905,3 +911,215 @@ def tdr_from_psth(
 # Y = out["projection_trace"]                      # (n_trials_used, n_timepoints)
 # t = out["time_for_projection"]                   # (n_timepoints,)
 # ids = out["trial_ids"]                           # (n_trials_used,)
+
+
+def plot_tdr_trace_by_quantile(
+    Y: np.ndarray,
+    t: np.ndarray,
+    latent: np.ndarray,
+    n_quantiles: int = 5,
+    *,
+    y_fit: np.ndarray = None,
+    group_by: str = "latent",    # "latent" or "y_fit"
+    ci: str = "sem",             # "sem" or "none"
+    show_trials: bool = False,
+    cmap: str = "viridis",
+    title: str = "TDR projection by bins",
+    alpha_trials: float = 0.08,
+    lw_mean: float = 2.0,
+    smooth: dict | None = None,  # e.g., {"method":"gaussian","sigma":0.05,"unit":"s"}
+    legend_ci_patch: bool = False,  # add a faint patch in legend to indicate CI color
+
+    # --- binning controls ---
+    binning: str = "equal_width",        # "equal_width" or "quantile"
+    bin_edges: np.ndarray | None = None, # explicit edges (overrides binning)
+    quantile_method: str = "linear",     # np.nanquantile(method=...) when binning="quantile"
+
+    # --- filtering ---
+    min_traces_per_bin: int = 1,         # exclude bins with < this many trials
+):
+    """
+    Plot TDR projection traces grouped by bins of a variable, with optional smoothing.
+
+    Binning modes:
+      - binning="equal_width": evenly spaced edges between min and max (value-based bins)
+      - binning="quantile": equal-count bins via np.nanquantile(..., method=quantile_method)
+      - bin_edges: provide explicit edges (length n_quantiles+1); overrides binning
+
+    Exclusion:
+      - Bins with < min_traces_per_bin trials are excluded from plot & legend.
+    """
+
+    # ---- helpers ----
+    def _build_gaussian_kernel(sigma_pts: float, truncate: float = 3.0) -> np.ndarray:
+        sigma_pts = float(max(sigma_pts, 1e-6))
+        half = int(np.ceil(truncate * sigma_pts))
+        xk = np.arange(-half, half + 1, dtype=float)
+        k = np.exp(-0.5 * (xk / sigma_pts) ** 2)
+        return k / k.sum()
+
+    def _build_moving_kernel(window_pts: int) -> np.ndarray:
+        window_pts = int(max(1, window_pts))
+        if window_pts % 2 == 0:
+            window_pts += 1
+        k = np.ones(window_pts, dtype=float)
+        return k / k.sum()
+
+    def _nanaware_convolve_same(y: np.ndarray, k: np.ndarray) -> np.ndarray:
+        out = np.empty_like(y, dtype=float)
+        for i in range(y.shape[0]):
+            row = y[i]
+            valid = np.isfinite(row).astype(float)
+            data = np.nan_to_num(row, nan=0.0)
+            num = np.convolve(data, k, mode="same")
+            den = np.convolve(valid, k, mode="same")
+            sm = np.divide(num, den, out=np.full_like(num, np.nan), where=den > 1e-12)
+            out[i] = sm
+        return out
+
+    def _maybe_smooth(Yin: np.ndarray, tvec: np.ndarray, spec: dict | None) -> np.ndarray:
+        if not spec:
+            return Yin
+        method = spec.get("method", "gaussian").lower()
+        unit = spec.get("unit", "s").lower()
+        truncate = float(spec.get("truncate", 3.0))
+        if unit == "s":
+            dt = float(np.median(np.diff(tvec)))
+            if method == "gaussian":
+                sigma = float(spec.get("sigma", 0.05))  # seconds
+                k = _build_gaussian_kernel(max(sigma, 1e-6) / max(dt, 1e-9), truncate)
+            else:
+                window = float(spec.get("window", 0.05))  # seconds
+                k = _build_moving_kernel(int(round(window / max(dt, 1e-9))))
+        else:  # samples
+            if method == "gaussian":
+                k = _build_gaussian_kernel(float(spec.get("sigma", 5)), truncate)
+            else:
+                k = _build_moving_kernel(int(spec.get("window", 5)))
+        return _nanaware_convolve_same(Yin, k)
+
+    # ---- validations ----
+    Y = np.asarray(Y); t = np.asarray(t).reshape(-1)
+    if Y.ndim != 2 or Y.shape[1] != t.size:
+        raise ValueError("Y must be (n_trials, n_timepoints) and match t length")
+
+    if group_by == "latent":
+        x = np.asarray(latent).reshape(-1)
+    elif group_by == "y_fit":
+        if y_fit is None:
+            raise ValueError("y_fit must be provided when group_by='y_fit'")
+        x = np.asarray(y_fit).reshape(-1)
+    else:
+        raise ValueError("group_by must be 'latent' or 'y_fit'")
+
+    if x.size != Y.shape[0]:
+        raise ValueError(f"{group_by} length must match number of trials in Y")
+
+    # drop invalid trials
+    good = np.isfinite(x) & np.isfinite(Y).any(axis=1)
+    Y = Y[good]; x = x[good]
+    if Y.shape[0] < n_quantiles:
+        raise ValueError("Not enough valid trials to form the requested bins.")
+
+    # optional smoothing
+    Y_sm = _maybe_smooth(Y, t, smooth)
+
+    # ---- choose bin edges ----
+    if bin_edges is not None:
+        edges = np.asarray(bin_edges, dtype=float)
+        if edges.ndim != 1 or edges.size != (n_quantiles + 1):
+            raise ValueError("bin_edges must be 1D with length n_quantiles+1")
+    else:
+        if binning not in {"equal_width", "quantile"}:
+            raise ValueError("binning must be 'equal_width' or 'quantile'")
+        if binning == "quantile":
+            # even-count bins by quantiles, with controllable quantile method
+            edges = np.nanquantile(x, np.linspace(0, 1, n_quantiles + 1), method=quantile_method)
+        else:  # equal_width
+            xmin = float(np.nanmin(x)); xmax = float(np.nanmax(x))
+            if not np.isfinite(xmin) or not np.isfinite(xmax):
+                raise ValueError("Non-finite values in grouping variable after filtering.")
+            if xmax == xmin:
+                xmin -= 0.5; xmax += 0.5
+            edges = np.linspace(xmin, xmax, n_quantiles + 1)
+
+    # Ensure strictly increasing edges (guard against ties)
+    for i in range(1, len(edges)):
+        if edges[i] <= edges[i-1]:
+            edges[i] = edges[i-1] + np.finfo(float).eps
+
+    # Digitize; include max by slightly expanding last edge
+    span = edges[-1] - edges[0]
+    edges_expanded = edges.copy()
+    edges_expanded[-1] = edges[-1] + (1e-12 * (span if span > 0 else 1.0))
+    bin_idx = np.digitize(x, edges_expanded[1:-1], right=True)
+
+    # ---- decide which bins to keep based on min_traces_per_bin ----
+    kept_bins = []
+    bin_members = []
+    for b in range(n_quantiles):
+        idx = np.where(bin_idx == b)[0]
+        if idx.size >= max(1, int(min_traces_per_bin)):
+            kept_bins.append(b)
+            bin_members.append(idx)
+
+    if len(kept_bins) == 0:
+        raise ValueError("All bins were excluded by min_traces_per_bin.")
+
+    # ---- plot ----
+    fig, ax = plt.subplots(figsize=(20, 8))
+    if show_trials:
+        ax.plot(t, Y_sm.T, color="0.6", alpha=alpha_trials, linewidth=0.6, zorder=1)
+
+    # assign colors only to bins we actually plot (keeps legend colors correct)
+    cm = get_cmap(cmap, len(kept_bins))
+    legend_handles, legend_labels = [], []
+
+    for i_plot, (b, idx) in enumerate(zip(kept_bins, bin_members)):
+        color = cm(i_plot)
+        Yb = Y_sm[idx]
+        mean_b = np.nanmean(Yb, axis=0)
+        ax.plot(t, mean_b, color=color, linewidth=lw_mean, zorder=3)
+        if ci == "sem":
+            sem_b = np.nanstd(Yb, axis=0) / max(1, np.sqrt(idx.size))
+            ax.fill_between(t, mean_b - sem_b, mean_b + sem_b, color=color, alpha=0.25, zorder=2)
+
+        # legend handle
+        line_handle = Line2D([0], [0], color=color, lw=lw_mean)
+        if legend_ci_patch and ci == "sem":
+            patch_handle = Patch(facecolor=color, alpha=0.25, edgecolor='none')
+            legend_handles.append((line_handle, patch_handle))
+        else:
+            legend_handles.append(line_handle)
+
+        legend_labels.append(
+            f"B{b+1}/{n_quantiles} [{edges[b]:.3g}, {edges[b+1]:.3g}] n={idx.size}"
+        )
+
+    ax.axhline(0, color="k", linewidth=0.8, linestyle="--", zorder=0)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Projection (a.u.)")
+    by = "latent" if group_by == "latent" else "y_fit"
+    subtitle = f"{binning}"
+    if binning == "quantile":
+        subtitle += f", method={quantile_method}"
+    if min_traces_per_bin > 1:
+        subtitle += f", min_n={min_traces_per_bin}"
+    ax.set_title(title + f" (by {by}, {subtitle})")
+
+    # legend outside
+    if legend_handles:
+        ax.legend(
+            legend_handles,
+            legend_labels,
+            frameon=False,
+            fontsize=9,
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            borderaxespad=0,
+            handlelength=2.8,
+            handletextpad=0.8,
+        )
+
+    fig.tight_layout(rect=[0, 0, 0.82, 1])
+    plt.show()
