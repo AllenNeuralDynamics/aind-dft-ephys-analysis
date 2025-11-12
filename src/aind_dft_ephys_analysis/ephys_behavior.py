@@ -637,7 +637,7 @@ def correlate_firing_latent_multiple_variable(
         },
     trial_shifts: Union[int, List[int], Tuple[int, ...]] = [-1,0,1],  
     n_jobs: Optional[int] = None,
-    save_folder: str = "/root/capsule/results",
+    save_folder: str = "/root/capsule/scratch",
     save_name: str = "correlations_multi",
     save_result: bool = False,
     save_format: str = "zarr", 
