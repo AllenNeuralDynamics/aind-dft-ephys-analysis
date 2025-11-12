@@ -578,7 +578,7 @@ def extract_fitted_data(
             rewardedR = trials['rewarded_historyR'][:]
             responses = trials['animal_response'][:]
 
-            # Drop first trial from Q arrays
+            # Drop last trial from Q arrays
             q0 = q0_full[:-1]
             q1 = q1_full[:-1]
             valid_mask = (responses!= 2)
