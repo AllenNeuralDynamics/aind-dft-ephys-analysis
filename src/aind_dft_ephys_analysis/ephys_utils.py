@@ -86,15 +86,29 @@ def load_ccf_channel_locations(
     Dict[str, Any]
         Loaded JSON data, or {} if the file was not found.
     """
-    # Build the glob pattern to find the JSON file
-    pattern = os.path.join(
-        alignment_root,
-        'result-*',
-        f'ecephys_{session_name}',
-        probe_name,
-        f'ccf_channel_locations_shank{shank_id}.json'
-    )
-    matches = glob.glob(pattern)
+    # Build glob patterns for both possible folder names
+    patterns = [
+        os.path.join(
+            alignment_root,
+            'result-*',
+            f'ecephys_{session_name}',
+            probe_name,
+            f'ccf_channel_locations_shank{shank_id}.json'
+        ),
+        os.path.join(
+            alignment_root,
+            'results-*',
+            f'ecephys_{session_name}',
+            probe_name,
+            f'ccf_channel_locations_shank{shank_id}.json'
+        ),
+    ]
+
+    # Search for files using both patterns
+    matches = []
+    for pattern in patterns:
+        matches.extend(glob.glob(pattern))
+
     if not matches:
         # No file found
         return {}
