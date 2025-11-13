@@ -25,7 +25,6 @@ from ephys_behavior import get_units_passed_default_qc
 
 
 
-
 def plot_raster_graph(
     nwb_data: Any,
     unit_index: int,
@@ -2202,15 +2201,6 @@ def plot_stat_2d_grid_by_ccf(
 
     return fig, ax, squares_df
 
-
-
-
-
-from typing import Union, List, Tuple, Optional
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize, LogNorm
 
 def plot_unit_count_2d_grid_by_ccf(
     ds: pd.DataFrame,
