@@ -13,14 +13,17 @@ from matplotlib import rcParams
 from matplotlib.lines import Line2D
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
-from matplotlib.colors import Normalize, TwoSlopeNorm
+from matplotlib.colors import Normalize, TwoSlopeNorm, LogNorm
 import pandas as pd
 from sklearn.decomposition import PCA
+from scipy.signal import convolve2d
 
 from general_utils import smart_read_csv
 from behavior_utils   import extract_fitted_data       
 from behavior_utils import extract_event_timestamps   # your helper that returns per-trial timestamps
 from ephys_behavior import get_units_passed_default_qc
+
+
 
 
 def plot_raster_graph(
@@ -1912,9 +1915,9 @@ def plot_stat_3d_by_ccf(
         s=s, alpha=alpha, linewidths=0
     )
 
-    ax.set_xlabel("Posterior → Anterior (µm)")
+    ax.set_xlabel("Anterior → Posterior (µm)")
     ax.set_ylabel("Inferior → Superior (µm)")
-    ax.set_zlabel("Right → Left (µm)")
+    ax.set_zlabel("Left → Right (µm)")
     ax.set_title(f"{column}\n{region_label}, time_window = {time_window}")
     ax.view_init(elev=20, azim=-70)
     ax.view_init(elev=90, azim=-90)
@@ -1928,4 +1931,521 @@ def plot_stat_3d_by_ccf(
     plt.show()
 
     return fig, ax, plotted_df
+
+
+
+def plot_stat_2d_grid_by_ccf(
+    ds: pd.DataFrame,
+    *,
+    column: str,
+    filter_region: Union[str, List[str]],
+    time_window: str,
+    plane: str = "xy",
+    bin_size_um: float = 200.0,
+    repertoire_um: float = 200.0,
+    min_points_per_square: int = 1,
+    slab_center_um: Optional[float] = None,
+    slab_thickness_um: Optional[float] = None,
+    symmetric_color: bool = True,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    cmap: str = "coolwarm",
+    figsize: Tuple[float, float] = (7.5, 6.5),
+    dpi: int = 120,
+    draw_grid_lines: bool = False,
+    flip_axis: Optional[str] = None,
+    flip_mid_um: Optional[float] = None,
+    flip_side: str = "greater",
+) -> Tuple[plt.Figure, plt.Axes, pd.DataFrame]:
+    """
+    Visualize a 2D heatmap of a specified statistic in PIR coordinates.
+    Each neuron contributes to all grid squares within its defined repertoire area.
+
+    Parameters
+    ----------
+    ds : pd.DataFrame
+        Must contain:
+            - 'ccf_location' : JSON/dict with LPS coordinates (x=L, y=P, z=S) in mm
+            - 'brain_region' : str
+            - 'time_window'  : str
+            - <column>       : numeric value for color mapping
+
+    column : str
+        Column name in `ds` whose numeric values are used for color mapping.
+
+    filter_region : str | list[str]
+        Region(s) to include or exclude.
+        - ""       → include all
+        - "!MD"    → exclude MD
+        - "MD"     → include only MD
+        - ["MD","PFC"] → include either of these
+
+    time_window : str
+        Exact time window to include (e.g., "0.3_2").
+
+    plane : {"xy","xz","yz"}, default="xy"
+        Projection plane in PIR coordinates:
+            - "xy": Posterior–Anterior × Inferior–Superior
+            - "xz": Posterior–Anterior × Right–Left
+            - "yz": Inferior–Superior × Right–Left
+
+    bin_size_um : float, default=200.0
+        Grid resolution (µm per bin).
+
+    repertoire_um : float, default=200.0
+        Footprint (µm) each neuron contributes to (square of side `repertoire_um`).
+
+    min_points_per_square : int, default=1
+        Minimum number of contributing neurons to show a grid square.
+
+    slab_center_um : float, optional
+        Center (µm, PIR) of a thin slab orthogonal to the chosen plane.
+
+    slab_thickness_um : float, optional
+        Thickness (µm) of the slab. If set, only neurons within this range
+        around `slab_center_um` are used. If None, uses all neurons.
+
+    symmetric_color : bool, default=True
+        If True, use a diverging norm centered at 0. (Set False for plain Normalize.)
+
+    vmin, vmax : float, optional
+        Explicit lower/upper bounds for the colormap. If BOTH are provided,
+        they are used directly. If either is None, remaining bounds are inferred
+        from the data (symmetric around 0 when `symmetric_color=True`).
+
+    cmap : str, default="coolwarm"
+        Matplotlib colormap.
+
+    figsize : (float, float), default=(7.5, 6.5)
+        Figure size in inches.
+
+    dpi : int, default=120
+        Figure resolution.
+
+    draw_grid_lines : bool, default=False
+        Draw faint grid lines if True.
+
+    flip_axis : {"x","y","z"}, optional
+        Axis (in PIR) along which to reflect data across a midline.
+
+    flip_mid_um : float, optional
+        Midline (µm) for reflection.
+
+    flip_side : {"greater","less","both"}, default="greater"
+        Which side to reflect across the midline.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    ax : matplotlib.axes.Axes
+    plotted_df : pd.DataFrame
+        Columns: ['x_min','x_max','y_min','y_max','value','count']
+
+    Notes
+    -----
+    LPS (x=L, y=P, z=S) → PIR (x'=P, y'=I, z'=R), mm → µm:
+        x' = +y_LPS * 1000
+        y' = -z_LPS * 1000
+        z' = -x_LPS * 1000
+    """
+    # --- filter ---
+    filtered, region_label = _filter_by_region_and_time(ds, filter_region, time_window)
+    for req in ("ccf_location", "brain_region", column):
+        if req not in filtered.columns:
+            raise KeyError(f"Missing column: {req!r}")
+
+    # --- coordinates & values ---
+    coords = filtered["ccf_location"].apply(_parse_ccf_location)
+    ok = coords.notna() & filtered[column].notna()
+    if not ok.any():
+        raise ValueError("No valid rows.")
+
+    pts_lps = np.array(coords[ok].tolist(), dtype=float)
+    vals = filtered.loc[ok, column].astype(float).to_numpy()
+
+    # --- LPS → PIR (mm→µm) ---
+    pts_pir = np.column_stack([
+        pts_lps[:, 1] * 1000.0,   # x' = +y_LPS
+        -pts_lps[:, 2] * 1000.0,  # y' = -z_LPS
+        -pts_lps[:, 0] * 1000.0,  # z' = -x_LPS
+    ])
+
+    # --- optional midline reflection ---
+    if flip_axis and flip_mid_um is not None:
+        axis_map = {"x": 0, "y": 1, "z": 2}
+        ai = axis_map[flip_axis.lower()]
+        mid = float(flip_mid_um)
+        arr = pts_pir[:, ai]
+        if flip_side == "greater":
+            mask = arr > mid
+            pts_pir[mask, ai] = 2.0 * mid - arr[mask]
+        elif flip_side == "less":
+            mask = arr < mid
+            pts_pir[mask, ai] = 2.0 * mid - arr[mask]
+        else:
+            pts_pir[:, ai] = mid - np.abs(arr - mid)
+
+    # --- plane selection & labels ---
+    plane = plane.lower()
+    if plane == "xy":
+        ix, iy, iorth = 0, 1, 2
+        xlabel, ylabel = "Anterior  → Posterior (µm)", "Inferior → Superior (µm)"
+    elif plane == "xz":
+        ix, iy, iorth = 0, 2, 1
+        xlabel, ylabel = "Anterior  → Posterior (µm)", "Left → Right (µm)"
+    elif plane == "yz":
+        ix, iy, iorth = 1, 2, 0
+        xlabel, ylabel = "Inferior → Superior (µm)", "Left → Right (µm)"
+    else:
+        raise ValueError("plane must be one of {'xy','xz','yz'}")
+
+    XY = pts_pir[:, [ix, iy]]
+    ORTH = pts_pir[:, iorth]
+
+    # --- optional slab filter ---
+    if slab_thickness_um:
+        c = np.median(ORTH) if slab_center_um is None else float(slab_center_um)
+        half = float(slab_thickness_um) / 2.0
+        m = (ORTH >= c - half) & (ORTH <= c + half)
+        XY, vals = XY[m], vals[m]
+        if XY.shape[0] == 0:
+            raise ValueError("No points remain after applying the slab filter.")
+
+    # --- grid edges ---
+    mins, maxs = XY.min(axis=0), XY.max(axis=0)
+    x_edges = np.arange(np.floor(mins[0]/bin_size_um)*bin_size_um,
+                        np.ceil(maxs[0]/bin_size_um)*bin_size_um + bin_size_um,
+                        bin_size_um)
+    y_edges = np.arange(np.floor(mins[1]/bin_size_um)*bin_size_um,
+                        np.ceil(maxs[1]/bin_size_um)*bin_size_um + bin_size_um,
+                        bin_size_um)
+    nx, ny = len(x_edges)-1, len(y_edges)-1
+
+    # --- accumulate within each neuron's repertoire square ---
+    H_sum = np.zeros((nx, ny))
+    H_count = np.zeros((nx, ny))
+    half_r = float(repertoire_um) / 2.0
+
+    for (x, y), v in zip(XY, vals):
+        ix_min = np.searchsorted(x_edges, x - half_r) - 1
+        ix_max = np.searchsorted(x_edges, x + half_r) - 1
+        iy_min = np.searchsorted(y_edges, y - half_r) - 1
+        iy_max = np.searchsorted(y_edges, y + half_r) - 1
+        ix_min, iy_min = max(ix_min, 0), max(iy_min, 0)
+        ix_max, iy_max = min(ix_max, nx-1), min(iy_max, ny-1)
+        if ix_max >= ix_min and iy_max >= iy_min:
+            H_sum[ix_min:ix_max+1, iy_min:iy_max+1] += v
+            H_count[ix_min:ix_max+1, iy_min:iy_max+1] += 1
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        H_mean = H_sum / H_count
+
+    valid = H_count >= float(min_points_per_square)
+    C = np.full_like(H_mean, np.nan)
+    C[valid] = H_mean[valid]
+
+    # --- color normalization (manual range honored if both vmin & vmax provided) ---
+    vdata = C[np.isfinite(C)]
+    if vdata.size == 0:
+        raise ValueError("No valid cells to plot.")
+
+    dmin, dmax = float(vdata.min()), float(vdata.max())
+    if vmin is not None and vmax is not None:
+        # use user-specified range exactly
+        pass
+    else:
+        if symmetric_color:
+            a = max(abs(dmin), abs(dmax))
+            vmin = -a if vmin is None else vmin
+            vmax =  a if vmax is None else vmax
+        else:
+            vmin = dmin if vmin is None else vmin
+            vmax = dmax if vmax is None else vmax
+
+    norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax) if symmetric_color else Normalize(vmin=vmin, vmax=vmax)
+
+    # --- plot ---
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    quad = ax.pcolormesh(x_edges, y_edges, C.T, cmap=cmap, norm=norm, shading="flat")
+
+    if draw_grid_lines:
+        for xe in x_edges:
+            ax.axvline(xe, color="k", lw=0.2, alpha=0.2)
+        for ye in y_edges:
+            ax.axhline(ye, color="k", lw=0.2, alpha=0.2)
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(
+        f"{column} (mean per {bin_size_um:.0f}µm square)\n"
+        f"{region_label}, time_window={time_window}, plane={plane.upper()}"
+    )
+
+    cb = fig.colorbar(quad, ax=ax, fraction=0.046, pad=0.04)
+    cb.set_label(f"{column} (mean)")
+    # (Optional: show the range on the colorbar label)
+    # cb.set_label(f"{column} (mean) [{vmin:.2f}, {vmax:.2f}]")
+
+    ax.set_aspect("equal", adjustable="box")
+    plt.tight_layout()
+    plt.show()
+
+    # --- tidy DataFrame of plotted squares ---
+    squares_df = pd.DataFrame({
+        "x_min": np.repeat(x_edges[:-1], ny),
+        "x_max": np.repeat(x_edges[1:], ny),
+        "y_min": np.tile(y_edges[:-1], nx),
+        "y_max": np.tile(y_edges[1:], nx),
+        "value": C.ravel(order="C"),
+        "count": H_count.ravel(order="C"),
+    }).dropna(subset=["value"])
+
+    return fig, ax, squares_df
+
+
+
+
+
+from typing import Union, List, Tuple, Optional
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize, LogNorm
+
+def plot_unit_count_2d_grid_by_ccf(
+    ds: pd.DataFrame,
+    *,
+    filter_region: Union[str, List[str]],
+    time_window: str,
+    plane: str = "xy",
+    bin_size_um: float = 200.0,
+    repertoire_um: float = 200.0,
+    slab_center_um: Optional[float] = None,
+    slab_thickness_um: Optional[float] = None,
+    cmap: str = "viridis",
+    figsize: Tuple[float, float] = (7.5, 6.5),
+    dpi: int = 120,
+    log_scale: bool = False,
+    flip_axis: Optional[str] = None,
+    flip_mid_um: Optional[float] = None,
+    flip_side: str = "greater",
+) -> Tuple[plt.Figure, plt.Axes, pd.DataFrame]:
+    """
+    Visualize how many neurons fall into (or influence) each grid square in PIR coordinates.
+    The grid resolution (`bin_size_um`) and each neuron's footprint (`repertoire_um`)
+    can be controlled independently.
+
+    Parameters
+    ----------
+    ds : pd.DataFrame
+        Input DataFrame containing:
+            - 'ccf_location' : JSON/dict with LPS coordinates
+            - 'brain_region' : str
+            - 'time_window'  : str
+
+    filter_region : str | list[str]
+        Region(s) to include or exclude (same as in plot_stat_2d_grid_by_ccf).
+        - ""       → include all
+        - "!MD"    → exclude MD
+        - "MD"     → include only MD
+        - ["MD","PFC"] → include either of these
+
+    time_window : str
+        Exact time window to include (e.g., "0.3_2").
+
+    plane : {"xy","xz","yz"}, default="xy"
+        Projection plane in PIR coordinates:
+            - "xy": Posterior–Anterior × Inferior–Superior
+            - "xz": Posterior–Anterior × Right–Left
+            - "yz": Inferior–Superior × Right–Left
+
+    bin_size_um : float, default=200.0
+        Grid resolution (µm per bin). Determines how finely the heatmap is divided.
+
+    repertoire_um : float, default=200.0
+        Footprint area (µm) each neuron influences. Each neuron contributes
+        to all bins whose centers lie within this square region.
+
+    slab_center_um : float, optional
+        Center coordinate (µm, PIR) of a thin slab orthogonal to the chosen plane.
+
+    slab_thickness_um : float, optional
+        Thickness (µm) of the slab. If set, only neurons within this range
+        around `slab_center_um` are included. If None, uses all neurons.
+
+    cmap : str, default="viridis"
+        Colormap for the count heatmap.
+
+    figsize : (float, float), default=(7.5, 6.5)
+        Figure size in inches.
+
+    dpi : int, default=120
+        Figure resolution in dots per inch.
+
+    log_scale : bool, default=False
+        If True, use logarithmic normalization for count values.
+
+    flip_axis : {"x","y","z"}, optional
+        Axis (in PIR coordinates) along which to reflect data across a midline.
+
+    flip_mid_um : float, optional
+        Coordinate (µm) of the midline along the chosen flip axis.
+
+    flip_side : {"greater","less","both"}, default="greater"
+        Which side to reflect:
+            - "greater" → reflect coordinates > midline
+            - "less"    → reflect coordinates < midline
+            - "both"    → fold both sides toward the midline.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        Matplotlib Figure object.
+    ax : matplotlib.axes.Axes
+        Axes containing the heatmap.
+    counts_df : pd.DataFrame
+        DataFrame containing grid count data:
+            ['x_min','x_max','y_min','y_max','count']
+
+    Notes
+    -----
+    - LPS (x=L, y=P, z=S) → PIR (x'=P, y'=I, z'=R)
+      Conversion (mm → µm):
+          x' = +y_LPS * 1000
+          y' = -z_LPS * 1000
+          z' = -x_LPS * 1000
+    """
+    # --- 1) Filter ---
+    filtered, region_label = _filter_by_region_and_time(ds, filter_region, time_window)
+
+    for req in ("ccf_location", "brain_region"):
+        if req not in filtered.columns:
+            raise KeyError(f"Missing required column: {req!r}")
+
+    # --- 2) Parse coordinates ---
+    coords = filtered["ccf_location"].apply(_parse_ccf_location)
+    ok = coords.notna()
+    if not ok.any():
+        raise ValueError("No valid rows after filtering.")
+
+    pts_lps = np.array(coords[ok].tolist(), dtype=float)
+
+    # --- 3) LPS → PIR (mm → µm) ---
+    # PIR: [X(P), Y(I), Z(R)]
+    pts_pir = np.column_stack([
+        pts_lps[:, 1] * 1000.0,
+        -pts_lps[:, 2] * 1000.0,
+        -pts_lps[:, 0] * 1000.0,
+    ])
+
+    # --- 4) Optional midline reflection ---
+    if flip_axis and flip_mid_um is not None:
+        axis_map = {"x": 0, "y": 1, "z": 2}
+        ai = axis_map[flip_axis.lower()]
+        mid = float(flip_mid_um)
+        arr = pts_pir[:, ai]
+        fs = flip_side.lower()
+        if fs == "greater":
+            mask = arr > mid
+            pts_pir[mask, ai] = 2.0 * mid - arr[mask]
+        elif fs == "less":
+            mask = arr < mid
+            pts_pir[mask, ai] = 2.0 * mid - arr[mask]
+        else:
+            pts_pir[:, ai] = mid - np.abs(arr - mid)
+
+    # --- 5) Plane selection and axis labels ---
+    plane = plane.lower()
+    if plane == "xy":
+        ix, iy, iorth = 0, 1, 2
+        xlabel, ylabel = "Anterior → Posterior (µm)", "Inferior → Superior (µm)"
+    elif plane == "xz":
+        ix, iy, iorth = 0, 2, 1
+        xlabel, ylabel = "Anterior → Posterior (µm)", "Left → Right (µm)"
+    elif plane == "yz":
+        ix, iy, iorth = 1, 2, 0
+        xlabel, ylabel = "Inferior → Superior (µm)", "Left → Right (µm)"
+    else:
+        raise ValueError("plane must be one of {'xy','xz','yz'}")
+
+    XY = pts_pir[:, [ix, iy]]
+    ORTH = pts_pir[:, iorth]
+
+    # --- 6) Optional slab filter ---
+    slab_note = ""
+    if slab_thickness_um is not None:
+        c = np.median(ORTH) if slab_center_um is None else float(slab_center_um)
+        half = float(slab_thickness_um) / 2.0
+        mask = (ORTH >= c - half) & (ORTH <= c + half)
+        XY = XY[mask]
+        if XY.shape[0] == 0:
+            raise ValueError("No points remain after applying the slab filter.")
+        slab_note = f"\nslab: ±{half:.0f}µm around center={c:.0f}µm"
+
+    # --- 7) Grid edges ---
+    mins = XY.min(axis=0)
+    maxs = XY.max(axis=0)
+    x_edges = np.arange(np.floor(mins[0]/bin_size_um)*bin_size_um,
+                        np.ceil(maxs[0]/bin_size_um)*bin_size_um + bin_size_um,
+                        bin_size_um)
+    y_edges = np.arange(np.floor(mins[1]/bin_size_um)*bin_size_um,
+                        np.ceil(maxs[1]/bin_size_um)*bin_size_um + bin_size_um,
+                        bin_size_um)
+    nx, ny = len(x_edges)-1, len(y_edges)-1
+
+    # --- 8) Accumulate counts with each neuron's footprint ---
+    H_count = np.zeros((nx, ny))
+    half_r = repertoire_um / 2.0
+    for x, y in XY:
+        ix_min = np.searchsorted(x_edges, x - half_r) - 1
+        ix_max = np.searchsorted(x_edges, x + half_r) - 1
+        iy_min = np.searchsorted(y_edges, y - half_r) - 1
+        iy_max = np.searchsorted(y_edges, y + half_r) - 1
+        ix_min, iy_min = max(ix_min, 0), max(iy_min, 0)
+        ix_max, iy_max = min(ix_max, nx-1), min(iy_max, ny-1)
+        H_count[ix_min:ix_max+1, iy_min:iy_max+1] += 1
+
+    # --- 9) Plot heatmap ---
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    norm = LogNorm(vmin=1, vmax=H_count.max()) if log_scale else Normalize(vmin=0, vmax=H_count.max())
+    quad = ax.pcolormesh(x_edges, y_edges, H_count.T, cmap=cmap, norm=norm, shading="flat")
+
+    cb = fig.colorbar(quad, ax=ax, fraction=0.046, pad=0.04)
+    cb.set_label("Unit count" + (" (log)" if log_scale else ""))
+
+    # Axis labels (now added)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    flip_note = ""
+    if flip_axis and flip_mid_um is not None:
+        flip_note = f"\nflip: {flip_axis.upper()}={flip_mid_um:.0f}µm ({flip_side})"
+
+    ax.set_title(
+        f"Neuron count per {bin_size_um:.0f}µm square\n"
+        f"{region_label}, time_window={time_window}, plane={plane.upper()}"
+        f"{slab_note}{flip_note}"
+    )
+
+    ax.set_aspect("equal", adjustable="box")
+    plt.tight_layout()
+    plt.show()
+
+    # --- 10) Return tidy DataFrame ---
+    xs = np.stack([x_edges[:-1], x_edges[1:]], axis=1)
+    ys = np.stack([y_edges[:-1], y_edges[1:]], axis=1)
+    x_min = np.repeat(xs[:, 0], ny)
+    x_max = np.repeat(xs[:, 1], ny)
+    y_min = np.tile(ys[:, 0], nx)
+    y_max = np.tile(ys[:, 1], nx)
+    df = pd.DataFrame({
+        "x_min": x_min,
+        "x_max": x_max,
+        "y_min": y_min,
+        "y_max": y_max,
+        "count": H_count.ravel(order="C"),
+    })
+
+    return fig, ax, df
+
 
