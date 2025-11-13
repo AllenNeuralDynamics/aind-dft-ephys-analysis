@@ -3,7 +3,7 @@ import os, re
 import json
 import itertools
 from itertools import product
-from typing import List, Optional, Tuple, Union, Any, Dict, Sequence
+from typing import List, Optional, Tuple, Union, Any, Dict, Sequence, Literal
 import math
 from pathlib import Path
 import xarray as xr
@@ -11,6 +11,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
 from matplotlib.lines import Line2D
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
+from matplotlib.colors import Normalize, TwoSlopeNorm
 import pandas as pd
 from sklearn.decomposition import PCA
 
@@ -18,6 +21,7 @@ from general_utils import smart_read_csv
 from behavior_utils   import extract_fitted_data       
 from behavior_utils import extract_event_timestamps   # your helper that returns per-trial timestamps
 from ephys_behavior import get_units_passed_default_qc
+
 
 def plot_raster_graph(
     nwb_data: Any,
@@ -861,94 +865,133 @@ def fit_and_plot_all_sessions(
     return fit_results
 
 
+
+# ---------------------------
+# Shared helper
+# ---------------------------
+def _filter_by_region_and_time(
+    ds: pd.DataFrame,
+    filter_region: Union[str, List[str]],
+    time_window: str,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Apply region and time_window filters.
+
+    Rules:
+      - If filter_region is a list[str]: include rows whose brain_region is in the list.
+      - If filter_region == "": include all regions.
+      - If filter_region == "!MD": include rows with brain_region != "MD".
+      - Else (str): include rows whose brain_region == filter_region.
+
+    Returns
+    -------
+    filtered : pd.DataFrame
+        Filtered copy of ds.
+    region_label : str
+        Human-readable label summarizing the region selection.
+    """
+    if isinstance(filter_region, list):
+        filtered = ds[
+            ds["brain_region"].isin(filter_region) &
+            (ds["time_window"] == time_window)
+        ].copy()
+        region_label = ", ".join(filter_region) if filter_region else "[]"
+    elif filter_region == "":
+        filtered = ds[ds["time_window"] == time_window].copy()
+        region_label = "all regions"
+    elif filter_region == "!MD":
+        filtered = ds[
+            (ds["brain_region"] != "MD") &
+            (ds["time_window"] == time_window)
+        ].copy()
+        region_label = "non-MD regions"
+    else:
+        filtered = ds[
+            (ds["brain_region"] == filter_region) &
+            (ds["time_window"] == time_window)
+        ].copy()
+        region_label = str(filter_region)
+
+    return filtered, region_label
+
+
+# ---------------------------
+# Plot 1: Polar angle fraction
+# ---------------------------
 def plot_angle_fraction_polar(
     ds: pd.DataFrame,
     *,
-    filter_region: str,
+    filter_region: Union[str, List[str]],
     time_window: str,
     col_x: str,
     col_y: str,
     col_pval_x: str,
     col_pval_y: str,
     alpha_level: float = 0.05,
-    include: str = "both",
-    # one of {"both", "x", "y", "any", "none", "all"}
-    # "both" = X- and Y-significant; "x" = X-significant only; "y" = Y-significant only
-    # "any"  = X or Y significant;  "none" = neither significant; "all" = all points (ignores p-values)
+    include: Literal["both", "x", "y", "any", "none", "all"] = "both",
     angle_bin_deg: float = 15.0,
-    normalize: str = "selected",
-    # one of {"selected","overall"}:
-    #   "selected" → fraction within the selected subset (denominator = #points that pass masks)
-    #   "overall"  → fraction out of all filtered points before the p-value mask
-    start_angle_deg: float = 0.0,    # rotate binning origin if desired
+    normalize: Literal["selected", "overall"] = "selected",
+    start_angle_deg: float = 0.0,
     show_reference_diagonals: bool = True,
-    figsize: tuple[float,float] = (6.5, 6.5),
+    figsize: Tuple[float, float] = (6.5, 6.5),
     dpi: int = 120,
-) -> tuple[plt.Figure, plt.Axes, pd.DataFrame]:
+) -> tuple[Figure, Axes, pd.DataFrame]:
     """
-    Make a circular (polar) bar plot of the fraction of neurons by polar angle
+    Make a circular (polar) bar plot of the fraction of units by polar angle
     in the (col_x, col_y) space.
-
-    Filtering and significance semantics mirror `plot_diagonal_significance`.
 
     Parameters
     ----------
-    ds
-        Full DataFrame containing at least col_x, col_y, p-value columns, 'time_window', and 'brain_region'.
-    filter_region
-        '' for all regions, '!MD' for non-MD, or an exact region code to include.
-    time_window
-        Exact time window value to include (e.g., '-1_0').
-    col_x, col_y
+    ds : pd.DataFrame
+        Full DataFrame containing at least col_x, col_y, p-value columns,
+        'time_window', and 'brain_region'.
+    filter_region : str | list[str]
+        '' → all regions; '!MD' → exclude MD; str → exact region; list[str] → include-any.
+    time_window : str
+        Exact time window to include (e.g., '-1_0').
+    col_x, col_y : str
         Names of the X and Y statistic columns (e.g., t-values).
-    col_pval_x, col_pval_y
+    col_pval_x, col_pval_y : str
         Column names for the corresponding p-values.
-    alpha_level
+    alpha_level : float
         P-value threshold for significance.
-    include
-        Which set of units to include based on significance ("both","x","y","any","none","all").
-    angle_bin_deg
+    include : {"both","x","y","any","none","all"}
+        Which units to include based on significance.
+    angle_bin_deg : float
         Angular bin width in degrees (e.g., 15 → 24 bins).
-    normalize
-        "selected": bar heights sum to 1 over the selected subset.
+    normalize : {"selected","overall"}
+        "selected": bar heights sum to 1 over the selected subset;
         "overall" : bar heights sum to (selected / overall) over the full filtered set.
-    start_angle_deg
-        Rotate the 0° direction for binning (useful if you want bins centered on 45°, etc.).
-    show_reference_diagonals
-        If True, draw reference rays at ±45° and 180° offsets.
-    figsize, dpi
-        Figure size / resolution.
+    start_angle_deg : float
+        Rotate the 0° direction for binning (useful to shift bin boundaries).
+    show_reference_diagonals : bool
+        If True, draw reference rays at ±45° and 180° offsets (relative to start_angle_deg).
+    figsize : (float, float)
+        Matplotlib figure size.
+    dpi : int
+        Figure resolution.
 
     Returns
     -------
-    fig, ax, table
-        Matplotlib figure/axes, and a table with counts/fractions per angular bin.
+    fig : matplotlib.figure.Figure
+    ax : matplotlib.axes.Axes (polar)
+    table : pd.DataFrame
+        Counts and fractions per angular bin with columns:
+        ["bin_start_deg","bin_end_deg","bin_center_deg","count","fraction"].
     """
-    # ------------------------
     # 1) Region / window filter and basic cleaning
-    # ------------------------
-    if filter_region == '':
-        filtered = ds[ds['time_window'] == time_window].copy()
-        region_label = 'all regions'
-    elif filter_region == '!MD':
-        filtered = ds[(ds['brain_region'] != 'MD') & (ds['time_window'] == time_window)].copy()
-        region_label = 'non-MD regions'
-    else:
-        filtered = ds[(ds['brain_region'] == filter_region) & (ds['time_window'] == time_window)].copy()
-        region_label = filter_region
+    filtered, region_label = _filter_by_region_and_time(ds, filter_region, time_window)
 
     needed = [col_x, col_y, col_pval_x, col_pval_y]
     filtered = filtered.dropna(subset=needed)
     if filtered.empty:
         raise ValueError("No rows remain after filtering or NaN removal.")
 
-    # ------------------------
     # 2) Significance masks
-    # ------------------------
-    mask_x    = filtered[col_pval_x] <= alpha_level
-    mask_y    = filtered[col_pval_y] <= alpha_level
+    mask_x = filtered[col_pval_x] <= alpha_level
+    mask_y = filtered[col_pval_y] <= alpha_level
     mask_both = mask_x & mask_y
-    mask_any  = mask_x | mask_y
+    mask_any = mask_x | mask_y
     mask_none = ~(mask_x | mask_y)
 
     if include == "both":
@@ -976,294 +1019,291 @@ def plot_angle_fraction_polar(
     if selected.empty:
         raise ValueError("Selection mask resulted in zero rows.")
 
-    # ------------------------
     # 3) Angles (0..2π)
-    # ------------------------
-    x = filtered[col_x].to_numpy(dtype=float)
-    y = filtered[col_y].to_numpy(dtype=float)
-    theta_all = np.arctan2(y, x)               # (-π, π]
-    theta_all = np.mod(theta_all, 2*np.pi)     # [0, 2π)
+    x_all = filtered[col_x].to_numpy(dtype=float)
+    y_all = filtered[col_y].to_numpy(dtype=float)
+    theta_all = np.mod(np.arctan2(y_all, x_all), 2 * np.pi)
 
-    xs = selected[col_x].to_numpy(dtype=float)
-    ys = selected[col_y].to_numpy(dtype=float)
-    theta_sel = np.arctan2(ys, xs)
-    theta_sel = np.mod(theta_sel, 2*np.pi)
+    x_sel = selected[col_x].to_numpy(dtype=float)
+    y_sel = selected[col_y].to_numpy(dtype=float)
+    theta_sel = np.mod(np.arctan2(y_sel, x_sel), 2 * np.pi)
 
     # Rotate angles if requested
     rot = np.deg2rad(start_angle_deg)
-    theta_all = np.mod(theta_all - rot, 2*np.pi)
-    theta_sel = np.mod(theta_sel - rot, 2*np.pi)
+    theta_all = np.mod(theta_all - rot, 2 * np.pi)
+    theta_sel = np.mod(theta_sel - rot, 2 * np.pi)
 
-    # ------------------------
     # 4) Bin edges and counts
-    # ------------------------
-    if angle_bin_deg <= 0 or angle_bin_deg > 360:
+    if not (0 < angle_bin_deg <= 360):
         raise ValueError("`angle_bin_deg` must be in (0, 360].")
     n_bins = int(np.ceil(360.0 / angle_bin_deg))
-    bin_edges = np.linspace(0.0, 2*np.pi, n_bins + 1)
+    bin_edges = np.linspace(0.0, 2 * np.pi, n_bins + 1)
     bin_width = bin_edges[1] - bin_edges[0]
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
 
     counts_sel, _ = np.histogram(theta_sel, bins=bin_edges)
-    denom = counts_sel.sum() if normalize == "selected" else len(theta_all)  # selected vs overall
+    denom = counts_sel.sum() if normalize == "selected" else len(theta_all)
     fractions = counts_sel.astype(float) / max(denom, 1)
 
     # Build results table
     table = pd.DataFrame({
         "bin_start_deg": np.rad2deg(bin_edges[:-1]),
-        "bin_end_deg":   np.rad2deg(bin_edges[1:]),
+        "bin_end_deg": np.rad2deg(bin_edges[1:]),
         "bin_center_deg": np.rad2deg(bin_centers),
         "count": counts_sel,
-        "fraction": fractions
+        "fraction": fractions,
     })
 
-    # ------------------------
     # 5) Plot (polar bar plot)
-    # ------------------------
-    fig = plt.figure(figsize=figsize, dpi=dpi)
-    ax = fig.add_subplot(111, projection="polar")
+    fig: Figure = plt.figure(figsize=figsize, dpi=dpi)
+    ax: Axes = fig.add_subplot(111, projection="polar")  # type: ignore[assignment]
 
-    bars = ax.bar(
-        bin_centers, fractions,
+    ax.bar(
+        bin_centers,
+        fractions,
         width=bin_width,
         align="center",
         edgecolor="k",
         linewidth=0.8,
-        alpha=0.85
+        alpha=0.85,
     )
 
-    # Style tweaks
     ax.set_theta_direction(1)          # clockwise increases
-    ax.set_theta_zero_location("E")     # 0° (bin start_angle) to the right
+    ax.set_theta_zero_location("E")    # 0° to the right (East)
     ax.set_title(
         f"{region_label}, time_window = {time_window}\n"
-        f"{sel_name} • bins={n_bins} (Δ={angle_bin_deg:.1f}°) • "
-        f"normalize={normalize}",
-        va="bottom"
+        f"{sel_name} • bins={n_bins} (Δ={angle_bin_deg:.1f}°) • normalize={normalize}",
+        va="bottom",
     )
 
-    # Optional reference diagonals at ±45° (and opposite)
+    # Optional reference diagonals at ±45° (and opposite), adjusted by start_angle_deg
     if show_reference_diagonals:
         ref_degs = np.array([45, 135, 225, 315], dtype=float) - start_angle_deg
         for d in ref_degs:
             th = np.deg2rad(d % 360)
             ax.plot([th, th], [0, ax.get_rmax()], ls="--", lw=1.0, color="gray", alpha=0.8)
 
-    # Radial grid and label percentages at peaks
-    ax.set_rlabel_position(90)  # put radial labels on top
+    # Radial grid and annotate a few highest bins
+    ax.set_rlabel_position(90)
     ax.grid(alpha=0.3, ls=":")
-    # Annotate a few highest bins
     if fractions.size:
         top_idx = np.argsort(fractions)[-min(5, len(fractions)):]
         for i in top_idx:
             if fractions[i] <= 0:
                 continue
             th = bin_centers[i]
-            r  = fractions[i]
-            ax.text(th, r + 0.02 * (ax.get_rmax() or 1), f"{100*r:.1f}%", ha="center", va="bottom", fontsize=8)
+            r = fractions[i]
+            ax.text(th, r + 0.02 * (ax.get_rmax() or 1), f"{100 * r:.1f}%",
+                    ha="center", va="bottom", fontsize=8)
 
     plt.tight_layout()
     plt.show()
     return fig, ax, table
 
 
-
+# ---------------------------
+# Plot 2: Diagonal significance scatter
+# ---------------------------
 def plot_diagonal_significance(
     ds: pd.DataFrame,
-    filter_region: str,
+    filter_region: Union[str, List[str]],
     time_window: str,
     col_x: str,
     col_y: str,
     col_pval_x: str,
     col_pval_y: str,
-    diagonal: str = 'negative',           # default aligned with docstring
+    diagonal: Literal["both", "negative", "positive"] = "negative",
     angle_tolerance_deg: float = 10.0,
-    xlim: tuple = (-30, 30),
-    ylim: tuple = (-30, 30),
+    xlim: Tuple[float, float] = (-30.0, 30.0),
+    ylim: Tuple[float, float] = (-30.0, 30.0),
     point_size: float = 5.0,
     alpha_level: float = 0.05,
-    fit_oval: bool = True,               # New parameter to fit an oval to the data
-    fit_oval_only_both_sig: bool = True  # New parameter to fit oval only on Both-sig points
-):
+    fit_oval: bool = True,
+    fit_oval_only_both_sig: bool = True,
+) -> tuple[Figure, List[Axes]]:
     """
     Filter a DataFrame by region and time window, compute significance masks
-    for X and Y variables, and plot diagonal panels as specified.
+    for X and Y variables, and plot diagonal panels.
 
     Parameters
     ----------
-    ds : pandas.DataFrame
-        The full dataset containing at least the columns specified.
-    filter_region : str
-        Region filter: '' for all regions, '!MD' for non-MD, or a specific region code.
+    ds : pd.DataFrame
+        Full DataFrame containing at least the specified columns.
+    filter_region : str | list[str]
+        '' → all regions; '!MD' → exclude MD; str → exact region; list[str] → include-any.
     time_window : str
-        The time_window value to select (e.g. '-1_0').
+        Exact time window to include (e.g., '-1_0').
     col_x, col_y : str
-        Column names for the X and Y statistics (e.g. t-values).
+        Column names for the X and Y statistics (e.g., t-values).
     col_pval_x, col_pval_y : str
         Column names for the corresponding p-values.
-    diagonal : str, optional
-        Which diagonal to plot: 'both', 'negative', or 'positive'. Default is 'negative'.
-    angle_tolerance_deg : float, optional
-        Tolerance around the diagonal in degrees (default=10°).
-    xlim : tuple, optional
-        X-axis limits (default=(-30, 30)).
-    ylim : tuple, optional
-        Y-axis limits (default=(-30, 30)).
-    point_size : float, optional
-        Marker size for all scatter points (default=5).
-    alpha_level: float, optional
-        The p value used to determine the significant neuron.
-    fit_oval : bool, optional
-        If True, fit and plot an oval (ellipse) to the scatter plot (default=False).
-    fit_oval_only_both_sig : bool, optional
-        If True, fit the oval using only the Both-sig points (default=False).
+    diagonal : {"both","negative","positive"}
+        Which diagonal panel(s) to draw.
+    angle_tolerance_deg : float
+        Angular tolerance around the diagonal (default=10°; max effectively 44.9°).
+    xlim, ylim : (float, float)
+        Axis limits.
+    point_size : float
+        Marker size.
+    alpha_level : float
+        The p-value threshold used to determine significance.
+    fit_oval : bool
+        If True, fit and plot an ellipse to the scatter points.
+    fit_oval_only_both_sig : bool
+        If True, fit the ellipse using only Both-sig points.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    axes : list[matplotlib.axes.Axes]
+        One or two axes depending on `diagonal`.
     """
-    # Backward-compatibility shim if caller still passes p_value via keywords
-    if 'p_value' in locals():
-        alpha_level = locals().get('p_value', alpha_level)
-
     # 1) Region + time window filter
-    if filter_region == '':
-        filtered = ds[ds['time_window'] == time_window].copy()
-        region_label = 'all regions'
-    elif filter_region == '!MD':
-        filtered = ds[(ds['brain_region'] != 'MD') & (ds['time_window'] == time_window)].copy()
-        region_label = 'non-MD regions'
-    else:
-        filtered = ds[(ds['brain_region'] == filter_region) & (ds['time_window'] == time_window)].copy()
-        region_label = filter_region
+    filtered, region_label = _filter_by_region_and_time(ds, filter_region, time_window)
 
-    # 2) Drop rows with NaNs in any required columns
+    # 2) Drop rows with NaNs in required columns
     needed = [col_x, col_y, col_pval_x, col_pval_y]
     filtered = filtered.dropna(subset=needed)
     if filtered.empty:
-        print("No rows after filtering / NaN removal.")
-        return None, None
+        raise ValueError("No rows after filtering / NaN removal.")
 
-    # 3) Significance masks (use <=)
-    mask_x    = filtered[col_pval_x] <= alpha_level
-    mask_y    = filtered[col_pval_y] <= alpha_level
+    # 3) Significance masks
+    mask_x = filtered[col_pval_x] <= alpha_level
+    mask_y = filtered[col_pval_y] <= alpha_level
     mask_both = mask_x & mask_y
     mask_none = ~(mask_x | mask_y)
+    total = int(len(filtered))
 
-    total = len(filtered)
-
-    # 4) Angle-based banding
+    # 4) Angle-based banding around ±45°
     angle_tol = np.deg2rad(angle_tolerance_deg)
-    max_tol = np.deg2rad(44.9)
+    max_tol = np.deg2rad(44.9)  # avoid degeneracy
     if angle_tol >= max_tol:
         angle_tol = max_tol
 
-    angles = np.arctan2(filtered[col_y].values, filtered[col_x].values)
+    angles = np.arctan2(filtered[col_y].to_numpy(), filtered[col_x].to_numpy())
 
-    def in_band(center):
+    def in_band(center: float) -> np.ndarray:
+        # Smallest circular distance between angles and center
         delta = np.abs(np.arctan2(np.sin(angles - center), np.cos(angles - center)))
         return delta < angle_tol
 
-    band_neg = mask_both & (in_band(-np.pi/4) | in_band(3*np.pi/4))
-    band_pos = mask_both & (in_band(np.pi/4) | in_band(-3*np.pi/4))
+    band_neg = mask_both & (in_band(-np.pi / 4) | in_band(3 * np.pi / 4))
+    band_pos = mask_both & (in_band(np.pi / 4) | in_band(-3 * np.pi / 4))
 
-    # 5) Counts/fractions
+    # 5) Counts/fractions for legend text
     count_none = int(mask_none.sum())
-    count_x    = int(mask_x.sum())
-    count_y    = int(mask_y.sum())
+    count_x = int(mask_x.sum())
+    count_y = int(mask_y.sum())
     count_both = int(mask_both.sum())
     count_neg_band = int(band_neg.sum())
     count_pos_band = int(band_pos.sum())
 
-    # Sign fractions by sign
+    # Sign fractions by sign for X
     cnt_x_pos = int((mask_x & (filtered[col_x] > 0)).sum())
     cnt_x_neg = int((mask_x & (filtered[col_x] < 0)).sum())
-    frac_x_pos = cnt_x_pos / count_x if count_x else 0.0
-    frac_x_neg = cnt_x_neg / count_x if count_x else 0.0
+    frac_x_pos = (cnt_x_pos / count_x) if count_x else 0.0
+    frac_x_neg = (cnt_x_neg / count_x) if count_x else 0.0
 
+    # Sign fractions by sign for Y
     cnt_y_pos = int((mask_y & (filtered[col_y] > 0)).sum())
     cnt_y_neg = int((mask_y & (filtered[col_y] < 0)).sum())
-    frac_y_pos = cnt_y_pos / count_y if count_y else 0.0
-    frac_y_neg = cnt_y_neg / count_y if count_y else 0.0
+    frac_y_pos = (cnt_y_pos / count_y) if count_y else 0.0
+    frac_y_neg = (cnt_y_neg / count_y) if count_y else 0.0
 
     # 6) Which panels to draw
-    draw_neg = diagonal in ('both', 'negative')
-    draw_pos = diagonal in ('both', 'positive')
+    draw_neg = diagonal in ("both", "negative")
+    draw_pos = diagonal in ("both", "positive")
     n_panels = int(draw_neg) + int(draw_pos)
 
-    fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 6), sharex=True, sharey=True)
+    fig, axes_arr = plt.subplots(1, n_panels, figsize=(7 * n_panels, 6), sharex=True, sharey=True)
     if n_panels == 1:
-        axes = [axes]
-    ax_idx = 0
-    x_vals = np.linspace(*xlim, 200)
+        axes: List[Axes] = [axes_arr]  # type: ignore[list-item]
+    else:
+        axes = list(axes_arr)  # type: ignore[arg-type]
 
-    def fit_ellipse(x, y):
-        # Center the data before applying PCA
+    x_vals = np.linspace(xlim[0], xlim[1], 200)
+
+    def _fit_ellipse(x: np.ndarray, y: np.ndarray):
+        """
+        Fit an ellipse using PCA on centered data.
+        Returns:
+            ellipse_rot : (2, N) sampled ellipse points (rotated + translated)
+            major_axis_end : (2,) endpoint of major axis (from center)
+            minor_axis_end : (2,) endpoint of minor axis (from center)
+            angle : float, rotation angle (radians)
+            center : (2,) ellipse center
+        """
         data = np.column_stack((x, y))
         center = np.mean(data, axis=0)
-        data_centered = data - center  # Center the data by subtracting the mean
-        
-        # Fit an ellipse to the centered data using PCA
+        data_centered = data - center
+
         pca = PCA(n_components=2)
         pca.fit(data_centered)
         eigenvalues = pca.explained_variance_
         eigenvectors = pca.components_
 
-        # The angle of rotation
+        # Angle of the first principal axis
         angle = np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0])
 
-        # Ellipse parameters
-        t = np.linspace(0, 2 * np.pi, 100)
-        ellipse = np.array([np.cos(t), np.sin(t)])
+        # Unit circle sampled then scaled by sqrt of eigenvalues
+        t = np.linspace(0, 2 * np.pi, 200)
+        ellipse = np.vstack([np.cos(t), np.sin(t)])
         ellipse[0, :] *= np.sqrt(eigenvalues[0])
         ellipse[1, :] *= np.sqrt(eigenvalues[1])
 
-        # Rotate the ellipse based on the eigenvectors
-        ellipse_rot = np.dot(eigenvectors.T, ellipse)
+        # Rotate into PCA basis, then translate back to data center
+        ellipse_rot = eigenvectors.T @ ellipse
+        ellipse_rot = ellipse_rot + center[:, None]
 
-        # Correcting axis vectors to ensure they are 2D
-        major_axis = eigenvectors[:, 0] * np.sqrt(eigenvalues[0]) * 2  # Major axis along the first eigenvector
-        minor_axis = eigenvectors[:, 1] * np.sqrt(eigenvalues[1]) * 2  # Minor axis along the second eigenvector
+        # Major/minor axis vectors (2×1), scaled to 2*sqrt(lambda) for visibility
+        major_axis_vec = eigenvectors[:, 0] * (2.0 * np.sqrt(eigenvalues[0]))
+        minor_axis_vec = eigenvectors[:, 1] * (2.0 * np.sqrt(eigenvalues[1]))
 
-        # Ensure that major_axis and minor_axis are treated as 2D vectors, not scalars
-        major_axis = np.array([major_axis[0], major_axis[1]])  # Create a 2D vector for major axis
-        minor_axis = np.array([minor_axis[0], minor_axis[1]])  # Create a 2D vector for minor axis
+        return ellipse_rot, major_axis_vec + center, minor_axis_vec + center, angle, center
 
-        return ellipse_rot + center[:, None], major_axis + center, minor_axis + center, angle, center
-
-
-    def draw_panel(ax: plt.Axes, negative: bool):
+    def _draw_panel(ax: Axes, negative: bool) -> None:
         # Scatter layers
-        ax.scatter(filtered[col_x], filtered[col_y], color='lightgray', s=point_size,
-                   label=f'Non-sig (n={count_none}; {count_none/total:.1%})')
-        ax.scatter(filtered.loc[mask_x, col_x], filtered.loc[mask_x, col_y],
-                   color='blue', s=point_size,
-                   label=f'X-sig (n={count_x}; {count_x/total:.1%})')
-        ax.scatter(filtered.loc[mask_y, col_x], filtered.loc[mask_y, col_y],
-                   color='green', s=point_size,
-                   label=f'Y-sig (n={count_y}; {count_y/total:.1%})')
-        ax.scatter(filtered.loc[mask_both, col_x], filtered.loc[mask_both, col_y],
-                   color='red', s=point_size,
-                   label=f'Both-sig (n={count_both}; {count_both/total:.1%})')
+        ax.scatter(
+            filtered[col_x], filtered[col_y],
+            color="lightgray", s=point_size,
+            label=f"Non-sig (n={count_none}; {count_none/total:.1%})",
+        )
+        ax.scatter(
+            filtered.loc[mask_x, col_x], filtered.loc[mask_x, col_y],
+            color="blue", s=point_size,
+            label=f"X-sig (n={count_x}; {count_x/total:.1%})",
+        )
+        ax.scatter(
+            filtered.loc[mask_y, col_x], filtered.loc[mask_y, col_y],
+            color="green", s=point_size,
+            label=f"Y-sig (n={count_y}; {count_y/total:.1%})",
+        )
+        ax.scatter(
+            filtered.loc[mask_both, col_x], filtered.loc[mask_both, col_y],
+            color="red", s=point_size,
+            label=f"Both-sig (n={count_both}; {count_both/total:.1%})",
+        )
 
         # Diagonal band overlay
         band_mask = band_neg if negative else band_pos
-        cnt_band  = count_neg_band if negative else count_pos_band
-        ax.scatter(filtered.loc[band_mask, col_x], filtered.loc[band_mask, col_y],
-                   color='purple', s=point_size,
-                   label=f'Diag band (n={cnt_band}; {cnt_band/total:.1%})')
+        cnt_band = count_neg_band if negative else count_pos_band
+        ax.scatter(
+            filtered.loc[band_mask, col_x], filtered.loc[band_mask, col_y],
+            color="purple", s=point_size,
+            label=f"Diag band (n={cnt_band}; {cnt_band/total:.1%})",
+        )
 
         # Diagonal line and tolerance boundaries
-        center = -np.pi/4 if negative else np.pi/4
+        center_angle = -np.pi / 4 if negative else np.pi / 4
         diag_y = -x_vals if negative else x_vals
-        ax.plot(x_vals, diag_y, '--', color='k', label='y = -x' if negative else 'y = +x')
-        b_hi = np.tan(center + angle_tol) * x_vals
-        b_lo = np.tan(center - angle_tol) * x_vals
-        ax.plot(x_vals, b_hi, ':', color='k')
-        ax.plot(x_vals, b_lo, ':', color='k')
+        ax.plot(x_vals, diag_y, "--", color="k", label="y = -x" if negative else "y = +x")
+        b_hi = np.tan(center_angle + angle_tol) * x_vals
+        b_lo = np.tan(center_angle - angle_tol) * x_vals
+        ax.plot(x_vals, b_hi, ":", color="k")
+        ax.plot(x_vals, b_lo, ":", color="k")
 
         # Panel-specific annotation
-        if negative:
-            title = f"Negative Diagonal (±{angle_tolerance_deg}°)"
-        else:
-            title = f"Positive Diagonal (±{angle_tolerance_deg}°)"
-
+        title = f"{'Negative' if negative else 'Positive'} Diagonal (±{angle_tolerance_deg:.1f}°)"
         stats_text = (
             f"X-sig: + {cnt_x_pos} ({frac_x_pos:.1%}), − {cnt_x_neg} ({frac_x_neg:.1%})\n"
             f"Y-sig: + {cnt_y_pos} ({frac_y_pos:.1%}), − {cnt_y_neg} ({frac_y_neg:.1%})\n"
@@ -1273,43 +1313,51 @@ def plot_diagonal_significance(
         ax.set_xlim(*xlim)
         ax.set_ylim(*ylim)
         ax.set_xlabel(col_x)
-        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
-                va='top', fontsize='small',
-                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray"))
-        ax.legend(loc='upper right', fontsize='small')
+        ax.text(
+            0.02, 0.98, stats_text, transform=ax.transAxes,
+            va="top", fontsize="small",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray"),
+        )
+        ax.legend(loc="upper right", fontsize="small")
 
         # Fit and plot ellipse if requested
         if fit_oval:
-            data_for_ellipse = filtered
-            if fit_oval_only_both_sig:
-                data_for_ellipse = filtered.loc[mask_both]  # Only use Both-sig points
-            ellipse_rot, major_axis, minor_axis, angle, center = fit_ellipse(data_for_ellipse[col_x], data_for_ellipse[col_y])
-            ax.plot(ellipse_rot[0, :], ellipse_rot[1, :], color='orange', lw=2, label="Fitted Ellipse")
-            
-            # Plot Major and Minor Axes
-            ax.quiver(center[0], center[1], major_axis[0], major_axis[1], angles='xy', scale_units='xy', scale=1, color='blue', label="Major Axis")
-            ax.quiver(center[0], center[1], minor_axis[0], minor_axis[1], angles='xy', scale_units='xy', scale=1, color='green', label="Minor Axis")
+            data_for_ellipse = filtered.loc[mask_both] if fit_oval_only_both_sig else filtered
+            if len(data_for_ellipse) >= 3:
+                ellipse_rot, major_axis_end, minor_axis_end, angle, center_xy = _fit_ellipse(
+                    data_for_ellipse[col_x].to_numpy(),
+                    data_for_ellipse[col_y].to_numpy(),
+                )
+                ax.plot(ellipse_rot[0, :], ellipse_rot[1, :], color="orange", lw=2, label="Fitted Ellipse")
+                # Draw major/minor axes from the center
+                ax.quiver(center_xy[0], center_xy[1],
+                          major_axis_end[0] - center_xy[0], major_axis_end[1] - center_xy[1],
+                          angles="xy", scale_units="xy", scale=1, color="blue", label="Major Axis")
+                ax.quiver(center_xy[0], center_xy[1],
+                          minor_axis_end[0] - center_xy[0], minor_axis_end[1] - center_xy[1],
+                          angles="xy", scale_units="xy", scale=1, color="green", label="Minor Axis")
 
-            # Add angle of rotation to the legend
-            ax.legend(loc='upper left', fontsize='small', title=f"Rotation: {np.degrees(angle):.1f}°")
-            ax.set_aspect('equal', adjustable='box')
+                # Put rotation angle in legend title
+                ax.legend(loc="upper left", fontsize="small", title=f"Rotation: {np.degrees(angle):.1f}°")
+                ax.set_aspect("equal", adjustable="box")
 
+    ax_i = 0
     if draw_neg:
-        draw_panel(axes[ax_idx], negative=True)
-        axes[ax_idx].set_ylabel(col_y)
-        ax_idx += 1
+        _draw_panel(axes[ax_i], negative=True)
+        axes[ax_i].set_ylabel(col_y)
+        ax_i += 1
     if draw_pos:
-        draw_panel(axes[ax_idx], negative=False)
+        _draw_panel(axes[ax_i], negative=False)
 
     plt.suptitle(
         f"{region_label}, time_window = {time_window}\n"
-        "Gray=non-sig, Blue=X-sig, Green=Y-sig, Red=both-sig; Purple=diagonal band & both-sig",
-        fontsize=14
+        "Gray=non-sig, Blue=X-sig, Green=Y-sig, Red=both-sig; Purple=diagonal band among both-sig",
+        fontsize=14,
     )
-    
     plt.tight_layout(rect=[0, 0, 1, 0.94])
     plt.show()
     return fig, axes
+
 
 
 
@@ -1666,3 +1714,218 @@ def plot_session_spike_raster(
 
     plt.show()
     return candidates
+
+
+def _parse_ccf_location(val) -> Optional[Tuple[float, float, float]]:
+    """
+    Parse CCF coordinate information stored as JSON strings or dictionaries.
+
+    Parameters
+    ----------
+    val : str | dict | None
+        Either a JSON string like
+        '{"x": -5.1, "y": 6.45, "z": -3.78, ...}'
+        or a pre-decoded dictionary with 'x', 'y', 'z' keys.
+
+    Returns
+    -------
+    tuple[float, float, float] | None
+        (x, y, z) in LPS space:
+            x → Left (+)
+            y → Posterior (+)
+            z → Superior (+)
+        Returns None if parsing fails or coordinates are missing.
+    """
+    if pd.isna(val):
+        return None
+    try:
+        d = json.loads(val) if isinstance(val, str) else val
+        x = float(d.get("x", np.nan))
+        y = float(d.get("y", np.nan))
+        z = float(d.get("z", np.nan))
+        if np.isnan(x) or np.isnan(y) or np.isnan(z):
+            return None
+        return (x, y, z)
+    except Exception:
+        return None
+
+
+def _set_axes_equal_3d(ax) -> None:
+    """
+    Enforce equal scaling on 3D axes so that distances are not distorted.
+    Useful for anatomical coordinates.
+
+    Parameters
+    ----------
+    ax : mpl_toolkits.mplot3d.axes3d.Axes3D
+        Matplotlib 3D axis to modify in-place.
+    """
+    xlim = ax.get_xlim3d()
+    ylim = ax.get_ylim3d()
+    zlim = ax.get_zlim3d()
+    ranges = np.array([xlim, ylim, zlim], dtype=float)
+    centers = ranges.mean(axis=1)
+    half_range = 0.5 * np.max(ranges[:, 1] - ranges[:, 0])
+    ax.set_xlim3d([centers[0] - half_range, centers[0] + half_range])
+    ax.set_ylim3d([centers[1] - half_range, centers[1] + half_range])
+    ax.set_zlim3d([centers[2] - half_range, centers[2] + half_range])
+
+
+def plot_stat_3d_by_ccf(
+    ds: pd.DataFrame,
+    *,
+    column: str,
+    filter_region: Union[str, List[str]],
+    time_window: str,
+    symmetric_color: bool = True,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    cmap: str = "coolwarm",
+    s: float = 8.0,
+    alpha: float = 0.9,
+    figsize: Tuple[float, float] = (7.5, 6.5),
+    dpi: int = 120,
+) -> Tuple[plt.Figure, plt.Axes, pd.DataFrame]:
+    """
+    Visualize 3D scatter of units in PIR coordinates colored by a specified statistic.
+
+    Parameters
+    ----------
+    ds : pd.DataFrame
+        Input DataFrame containing:
+            - 'ccf_location' : JSON/dict with LPS coordinates
+            - 'brain_region' : str
+            - 'time_window'  : str
+            - <column>       : numeric value for color mapping
+
+    column : str
+        Column name in `ds` whose numeric values are used for color mapping
+        (e.g., 'simple_LR-QLearning_L2F1_CK1_softmax-reward-g1-s0-d0-tval').
+
+    filter_region : str | list[str]
+        Region(s) to include or exclude:
+            - "" → include all
+            - "!MD" → exclude MD
+            - "MD" → include only MD
+            - ["MD", "PFC"] → include either of these
+
+    time_window : str
+        Exact time window to include (e.g., "-1_0").
+
+    symmetric_color : bool, default=True
+        If True, color scale is symmetric around zero
+        (good for t-values or signed coefficients).
+
+    vmin, vmax : float | None, default=None
+        Minimum/maximum values for color normalization.
+        If None, inferred automatically from data range.
+
+    cmap : str, default="coolwarm"
+        Matplotlib colormap name.
+
+    s : float, default=8.0
+        Marker size in scatter plot.
+
+    alpha : float, default=0.9
+        Transparency for points.
+
+    figsize : (float, float), default=(7.5, 6.5)
+        Figure size in inches.
+
+    dpi : int, default=120
+        Figure resolution in dots per inch.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        Created Matplotlib Figure.
+
+    ax : matplotlib.axes._subplots.Axes3DSubplot
+        The 3D Axes object with scatter plotted.
+
+    plotted_df : pd.DataFrame
+        DataFrame containing plotted coordinates and values with columns:
+            ['x', 'y', 'z', 'value', 'brain_region']
+
+    Notes
+    -----
+    - LPS (x=L, y=P, z=S) → PIR (x'=P, y'=I, z'=R)
+        Conversion and scaling:
+            x' = +y_LPS * 1000 µm
+            y' = -z_LPS * 1000 µm
+            z' = -x_LPS * 1000 µm
+    """
+
+    # 1) Filter using the existing helper (defined elsewhere)
+    filtered, region_label = _filter_by_region_and_time(ds, filter_region, time_window)
+
+    # Ensure required columns are present
+    for req in ("ccf_location", "brain_region", column):
+        if req not in filtered.columns:
+            raise KeyError(f"Missing required column: {req!r}")
+
+    # 2) Parse LPS coordinates and drop invalid rows
+    coords = filtered["ccf_location"].apply(_parse_ccf_location)
+    ok = coords.notna() & filtered[column].notna()
+    if not ok.any():
+        raise ValueError("No valid rows to plot after filtering or NaN removal.")
+
+    pts_lps = np.array(coords[ok].tolist(), dtype=float)
+
+    # 3) Convert LPS → PIR and mm → µm
+    # LPS (x=L, y=P, z=S)  →  PIR (x'=P, y'=I, z'=R)
+    pts_pir = np.column_stack([
+        pts_lps[:, 1] * 1000,   # x' (Posterior) = +y_LPS
+        -pts_lps[:, 2] * 1000,  # y' (Inferior)  = -z_LPS
+        -pts_lps[:, 0] * 1000,  # z' (Right)     = -x_LPS
+    ])
+
+    vals = filtered.loc[ok, column].astype(float).to_numpy()
+
+    plotted_df = pd.DataFrame({
+        "x": pts_pir[:, 0],
+        "y": pts_pir[:, 1],
+        "z": pts_pir[:, 2],
+        "value": vals,
+        "brain_region": filtered.loc[ok, "brain_region"].to_numpy(),
+    })
+
+    # 4) Color normalization
+    if vmin is None or vmax is None:
+        dmin, dmax = np.nanmin(vals), np.nanmax(vals)
+        if symmetric_color:
+            a = max(abs(dmin), abs(dmax))
+            vmin, vmax = -a, a
+        else:
+            vmin = dmin if vmin is None else vmin
+            vmax = dmax if vmax is None else vmax
+
+    norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax) if symmetric_color else Normalize(vmin=vmin, vmax=vmax)
+
+    # 5) Plot 3D scatter
+    fig = plt.figure(figsize=figsize, dpi=dpi)
+    ax = fig.add_subplot(111, projection="3d")
+
+    sc = ax.scatter(
+        plotted_df["x"], plotted_df["y"], plotted_df["z"],
+        c=plotted_df["value"], cmap=cmap, norm=norm,
+        s=s, alpha=alpha, linewidths=0
+    )
+
+    ax.set_xlabel("Posterior → Anterior (µm)")
+    ax.set_ylabel("Inferior → Superior (µm)")
+    ax.set_zlabel("Right → Left (µm)")
+    ax.set_title(f"{column}\n{region_label}, time_window = {time_window}")
+    ax.view_init(elev=20, azim=-70)
+    ax.view_init(elev=90, azim=-90)
+    ax.view_init(elev=0, azim=-90)
+    _set_axes_equal_3d(ax)
+
+    cb = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+    cb.set_label(column)
+
+    plt.tight_layout()
+    plt.show()
+
+    return fig, ax, plotted_df
+
