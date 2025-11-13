@@ -1050,9 +1050,9 @@ def correlation_results_summary(
 # ──────────────────────────────────────────────────────────────────────────
 def correlation_results_summary_combined(
     paths: Optional[List[Union[str, Path]]] = None,
-    search_folder: str = "/root/capsule/scratch",
+    search_folder: str = "/root/capsule/scratch/correlation_results",
     pattern: str = "correlations_multi*.zarr",
-    save_folder: str = "/root/capsule/scratch",
+    save_folder: str = "/root/capsule/scratch/correlation_results",
     save_name: str = "sig_dir_all_sessions",
     save_result: bool = False,
     save_format: str = "zarr",
