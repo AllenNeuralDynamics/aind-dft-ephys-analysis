@@ -2439,3 +2439,203 @@ def plot_unit_count_2d_grid_by_ccf(
     return fig, ax, df
 
 
+def plot_stat_profile_along_axis_by_ccf(
+    ds: pd.DataFrame,
+    *,
+    column: str,
+    filter_region: Union[str, List[str]],
+    time_window: str,
+    axis: str = "z",                    # {"x","y","z"} in PIR
+    bin_size_um: float = 200.0,         # horizontal bin width (µm)
+    repertoire_um: float = 200.0,       # each neuron's influence range (µm)
+    origin_um: Optional[float] = None,  # shift coordinates if needed
+    min_points_per_bin: int = 1,
+    slab_axis: Optional[str] = None,
+    slab_center_um: Optional[float] = None,
+    slab_thickness_um: Optional[float] = None,
+    flip_axis: Optional[str] = None,
+    flip_mid_um: Optional[float] = None,
+    flip_side: str = "greater",
+    smooth: str = "none",               # {"none","boxcar","gaussian"}
+    smooth_um: float = 400.0,
+    figsize: Tuple[float, float] = (7.5, 4.0),
+    dpi: int = 120,
+    line_kwargs: Optional[dict] = None,
+    scatter_kwargs: Optional[dict] = None,
+) -> Tuple[plt.Figure, plt.Axes, pd.DataFrame]:
+    """
+    Plot average of `column` versus distance along a PIR axis, with each neuron
+    contributing to all bins within its spatial repertoire.
+
+    Parameters
+    ----------
+    ds : pd.DataFrame
+        Must include 'ccf_location', 'brain_region', 'time_window', and <column>.
+
+    column : str
+        Statistic column to plot (e.g., t-values).
+
+    axis : {"x","y","z"}, default="z"
+        PIR axis along which to compute the profile.
+
+    bin_size_um : float, default=200.0
+        Bin spacing (µm) for averaging.
+
+    repertoire_um : float, default=200.0
+        Each neuron influences all bins within ±repertoire_um/2 along the chosen axis.
+
+    min_points_per_bin : int
+        Minimum contributing neurons per bin to display.
+
+    smooth : {"none","boxcar","gaussian"}, default="none"
+        Apply 1D smoothing over the resulting curve.
+
+    smooth_um : float
+        Box width or Gaussian σ (in µm) for smoothing.
+
+    Returns
+    -------
+    fig, ax : matplotlib Figure and Axes
+    prof_df : DataFrame with ['bin_center_um','count','mean','mean_smoothed']
+    """
+    # --- filter ---
+    filtered, region_label = _filter_by_region_and_time(ds, filter_region, time_window)
+    for req in ("ccf_location", "brain_region", column):
+        if req not in filtered.columns:
+            raise KeyError(f"Missing column: {req!r}")
+
+    coords = filtered["ccf_location"].apply(_parse_ccf_location)
+    ok = coords.notna() & filtered[column].notna()
+    if not ok.any():
+        raise ValueError("No valid rows after filtering.")
+
+    pts_lps = np.array(coords[ok].tolist(), dtype=float)
+    vals = filtered.loc[ok, column].astype(float).to_numpy()
+
+    # --- LPS → PIR (mm→µm) ---
+    pts_pir = np.column_stack([
+        pts_lps[:, 1] * 1000.0,
+        -pts_lps[:, 2] * 1000.0,
+        -pts_lps[:, 0] * 1000.0,
+    ])
+
+    # --- optional flip ---
+    if flip_axis and flip_mid_um is not None:
+        axis_map = {"x": 0, "y": 1, "z": 2}
+        ai = axis_map[flip_axis.lower()]
+        mid = float(flip_mid_um)
+        arr = pts_pir[:, ai]
+        if flip_side == "greater":
+            mask = arr > mid
+            pts_pir[mask, ai] = 2.0 * mid - arr[mask]
+        elif flip_side == "less":
+            mask = arr < mid
+            pts_pir[mask, ai] = 2.0 * mid - arr[mask]
+        else:
+            pts_pir[:, ai] = mid - np.abs(arr - mid)
+
+    # --- optional slab ---
+    if slab_axis and slab_thickness_um:
+        axis_map = {"x": 0, "y": 1, "z": 2}
+        sai = axis_map[slab_axis.lower()]
+        orth = pts_pir[:, sai]
+        c = np.median(orth) if slab_center_um is None else float(slab_center_um)
+        half = slab_thickness_um / 2.0
+        m = (orth >= c - half) & (orth <= c + half)
+        pts_pir, vals = pts_pir[m], vals[m]
+        if pts_pir.shape[0] == 0:
+            raise ValueError("No points remain after slab filtering.")
+
+    # --- extract coordinate ---
+    axis_map = {"x": 0, "y": 1, "z": 2}
+    ai = axis_map[axis.lower()]
+    coord = pts_pir[:, ai]
+    if origin_um is not None:
+        coord = coord - float(origin_um)
+
+    # --- bin edges ---
+    lo = np.floor(coord.min() / bin_size_um) * bin_size_um
+    hi = np.ceil(coord.max() / bin_size_um) * bin_size_um
+    edges = np.arange(lo, hi + bin_size_um, bin_size_um)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    n_bins = len(centers)
+
+    # --- repertoire accumulation ---
+    half_r = repertoire_um / 2.0
+    H_sum = np.zeros(n_bins)
+    H_count = np.zeros(n_bins)
+
+    for c, v in zip(coord, vals):
+        ix_min = np.searchsorted(edges, c - half_r) - 1
+        ix_max = np.searchsorted(edges, c + half_r) - 1
+        ix_min = max(ix_min, 0)
+        ix_max = min(ix_max, n_bins - 1)
+        H_sum[ix_min:ix_max+1] += v
+        H_count[ix_min:ix_max+1] += 1
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mean = H_sum / H_count
+    valid = H_count >= min_points_per_bin
+    mean[~valid] = np.nan
+
+    # --- smoothing ---
+    def _nanaware_smooth(y, kernel):
+        y_filled = np.nan_to_num(y, nan=0.0)
+        mask = np.isfinite(y).astype(float)
+        num = np.convolve(y_filled, kernel, mode="same")
+        den = np.convolve(mask, kernel, mode="same")
+        out = np.full_like(y, np.nan, dtype=float)
+        good = den > 1e-12
+        out[good] = num[good] / den[good]
+        return out
+
+    mean_smoothed = mean.copy()
+    if smooth.lower() in {"boxcar", "gaussian"} and smooth_um > 0 and n_bins > 1:
+        sigma_bins = smooth_um / bin_size_um
+        if smooth.lower() == "boxcar":
+            win_bins = max(1, int(round(sigma_bins)))
+            if win_bins % 2 == 0:
+                win_bins += 1
+            win_bins = min(win_bins, n_bins)
+            kernel = np.ones(win_bins) / win_bins
+        else:
+            half_w = max(1, int(np.ceil(4.0 * sigma_bins)))
+            xs = np.arange(-half_w, half_w + 1)
+            kernel = np.exp(-0.5 * (xs / sigma_bins)**2)
+            kernel /= kernel.sum()
+            if kernel.size > n_bins:
+                kernel = kernel[:n_bins]
+                kernel /= kernel.sum()
+        mean_smoothed = _nanaware_smooth(mean, kernel)
+
+    # --- plot ---
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    lk = dict(lw=2, alpha=0.9)
+    sk = dict(s=20, alpha=0.7)
+    if line_kwargs: lk.update(line_kwargs)
+    if scatter_kwargs: sk.update(scatter_kwargs)
+
+    ax.scatter(centers, mean, **sk, label="Binned mean")
+    ax.plot(centers, mean_smoothed, **lk, label=f"Smoothed ({smooth}, {smooth_um:.0f} µm)")
+
+    axis_labels = {"x": "Anterior  → Posterior (µm)",
+                   "y": "Inferior → Superior (µm)",
+                   "z": "Right → Left (µm)"}
+    ax.set_xlabel(axis_labels[axis.lower()])
+    ax.set_ylabel(column)
+    ax.set_title(f"{column} vs {axis.upper()} | bin={bin_size_um}µm, repertoire={repertoire_um}µm")
+    ax.grid(True, alpha=0.3)
+    ax.legend(frameon=False)
+    plt.tight_layout()
+    plt.show()
+
+    # --- output ---
+    prof_df = pd.DataFrame({
+        "bin_center_um": centers,
+        "count": H_count,
+        "mean": mean,
+        "mean_smoothed": mean_smoothed
+    })
+
+    return fig, ax, prof_df
+
