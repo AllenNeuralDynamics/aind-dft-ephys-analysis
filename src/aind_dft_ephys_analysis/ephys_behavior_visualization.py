@@ -2639,3 +2639,282 @@ def plot_stat_profile_along_axis_by_ccf(
 
     return fig, ax, prof_df
 
+
+
+
+def plot_significant_fraction_along_axis_by_ccf(
+    ds: pd.DataFrame,
+    *,
+    column: str,                             # p-value column
+    filter_region: Union[str, List[str]],
+    time_window: str,
+    axis: str = "z",                         # {"x","y","z"} in PIR
+    bin_size_um: float = 200.0,
+    repertoire_um: float = 200.0,
+    origin_um: Optional[float] = None,
+    min_points_per_bin: int = 1,
+    slab_axis: Optional[str] = None,
+    slab_center_um: Optional[float] = None,
+    slab_thickness_um: Optional[float] = None,
+    flip_axis: Optional[str] = None,
+    flip_mid_um: Optional[float] = None,
+    flip_side: str = "greater",
+    alpha_level: float = 0.05,               # significance threshold on p-values
+    # --- new params for sign-split ---
+    effect_column: Optional[str] = None,     # t-value / coefficient column for sign
+    effect_zero_is: str = "exclude",         # {"exclude","positive","negative"}
+    which: str = "all3",                     # {"both","pos","neg","posneg","all3"}
+    # ---------------------------------
+    smooth: str = "none",                    # {"none","boxcar","gaussian"}
+    smooth_um: float = 400.0,
+    figsize: Tuple[float, float] = (7.5, 4.0),
+    dpi: int = 120,
+    line_kwargs: Optional[dict] = None,
+    scatter_kwargs: Optional[dict] = None,
+) -> Tuple[plt.Figure, plt.Axes, pd.DataFrame]:
+    """
+    Plot fractions of significant neurons along a PIR axis, optionally split by the
+    sign of an effect (t-value / coefficient) provided via `effect_column`.
+
+    If `effect_column` is None:
+        - Only the total significant fraction ("both") is computed/plot.
+    If `effect_column` is provided:
+        - Also computes positive- and negative-significant fractions based on effect sign.
+
+    Parameters
+    ----------
+    column : str
+        P-value column (raw p-values).
+    effect_column : str or None
+        Column holding signed effects (e.g., t-value). Used to split into positive/negative.
+    effect_zero_is : {"exclude","positive","negative"}
+        How to treat exactly-zero effects when significant.
+    which : {"both","pos","neg","posneg","all3"}
+        Controls which curves to plot:
+          - "both": total significant fraction only
+          - "pos":  positive-only
+          - "neg":  negative-only
+          - "posneg": positive and negative
+          - "all3": total + positive + negative
+    Returns
+    -------
+    fig, ax, prof_df
+        prof_df has: bin_center_um, count, n_sig_both, n_sig_pos, n_sig_neg,
+        fraction_both, fraction_pos, fraction_neg, and smoothed counterparts.
+    """
+    # --- filter ---
+    filtered, region_label = _filter_by_region_and_time(ds, filter_region, time_window)
+    for req in ("ccf_location", "brain_region", column):
+        if req not in filtered.columns:
+            raise KeyError(f"Missing column: {req!r}")
+    if effect_column is not None and effect_column not in filtered.columns:
+        raise KeyError(f"Missing effect column: {effect_column!r}")
+
+    coords = filtered["ccf_location"].apply(_parse_ccf_location)
+    ok = coords.notna() & filtered[column].notna()
+    if effect_column is not None:
+        ok = ok & filtered[effect_column].notna()
+    if not ok.any():
+        raise ValueError("No valid rows after filtering.")
+
+    pts_lps = np.array(coords[ok].tolist(), dtype=float)
+    pvals = filtered.loc[ok, column].astype(float).to_numpy()
+    effects = None
+    if effect_column is not None:
+        effects = filtered.loc[ok, effect_column].astype(float).to_numpy()
+
+    # --- LPS → PIR (mm→µm) ---
+    pts_pir = np.column_stack([
+        pts_lps[:, 1] * 1000.0,
+        -pts_lps[:, 2] * 1000.0,
+        -pts_lps[:, 0] * 1000.0,
+    ])
+
+    # --- optional flip ---
+    if flip_axis and flip_mid_um is not None:
+        axis_map = {"x": 0, "y": 1, "z": 2}
+        ai = axis_map[flip_axis.lower()]
+        mid = float(flip_mid_um)
+        arr = pts_pir[:, ai]
+        if flip_side == "greater":
+            mask = arr > mid
+            pts_pir[mask, ai] = 2.0 * mid - arr[mask]
+        elif flip_side == "less":
+            mask = arr < mid
+            pts_pir[mask, ai] = 2.0 * mid - arr[mask]
+        else:
+            pts_pir[:, ai] = mid - np.abs(arr - mid)
+
+    # --- optional slab ---
+    if slab_axis and slab_thickness_um:
+        axis_map = {"x": 0, "y": 1, "z": 2}
+        sai = axis_map[slab_axis.lower()]
+        orth = pts_pir[:, sai]
+        c = np.median(orth) if slab_center_um is None else float(slab_center_um)
+        half = slab_thickness_um / 2.0
+        m = (orth >= c - half) & (orth <= c + half)
+        pts_pir, pvals = pts_pir[m], pvals[m]
+        if effects is not None:
+            effects = effects[m]
+        if pts_pir.shape[0] == 0:
+            raise ValueError("No points remain after slab filtering.")
+
+    # --- extract coordinate along main axis ---
+    axis_map = {"x": 0, "y": 1, "z": 2}
+    ai = axis_map[axis.lower()]
+    coord = pts_pir[:, ai]
+    if origin_um is not None:
+        coord = coord - float(origin_um)
+
+    # --- bin edges ---
+    lo = np.floor(coord.min() / bin_size_um) * bin_size_um
+    hi = np.ceil(coord.max() / bin_size_um) * bin_size_um
+    edges = np.arange(lo, hi + bin_size_um, bin_size_um)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    n_bins = len(centers)
+
+    # --- repertoire accumulation ---
+    half_r = repertoire_um / 2.0
+    H_count     = np.zeros(n_bins)
+    H_sig_both  = np.zeros(n_bins)
+    H_sig_pos   = np.zeros(n_bins)
+    H_sig_neg   = np.zeros(n_bins)
+
+    for i in range(coord.size):
+        c = coord[i]
+        p = pvals[i]
+        eff = effects[i] if effects is not None else None
+
+        ix_min = np.searchsorted(edges, c - half_r) - 1
+        ix_max = np.searchsorted(edges, c + half_r) - 1
+        ix_min = max(ix_min, 0)
+        ix_max = min(ix_max, n_bins - 1)
+        if ix_max < ix_min:
+            continue
+
+        sig = (p < alpha_level)
+        H_count[ix_min:ix_max + 1] += 1.0
+        if not sig:
+            continue
+
+        # total significant
+        H_sig_both[ix_min:ix_max + 1] += 1.0
+
+        # split by sign if available
+        if eff is not None:
+            if eff > 0:
+                H_sig_pos[ix_min:ix_max + 1] += 1.0
+            elif eff < 0:
+                H_sig_neg[ix_min:ix_max + 1] += 1.0
+            else:
+                if effect_zero_is == "positive":
+                    H_sig_pos[ix_min:ix_max + 1] += 1.0
+                elif effect_zero_is == "negative":
+                    H_sig_neg[ix_min:ix_max + 1] += 1.0
+                # "exclude" -> count only in H_sig_both (already added)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        frac_both = H_sig_both / H_count
+        frac_pos  = H_sig_pos  / H_count
+        frac_neg  = H_sig_neg  / H_count
+    valid = H_count >= min_points_per_bin
+    for arr in (frac_both, frac_pos, frac_neg):
+        arr[~valid] = np.nan
+
+    # --- smoothing ---
+    def _nanaware_smooth(y: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+        y_filled = np.nan_to_num(y, nan=0.0)
+        mask = np.isfinite(y).astype(float)
+        num = np.convolve(y_filled, kernel, mode="same")
+        den = np.convolve(mask, kernel, mode="same")
+        out = np.full_like(y, np.nan, dtype=float)
+        good = den > 1e-12
+        out[good] = num[good] / den[good]
+        return out
+
+    def _maybe_smooth(y: np.ndarray) -> np.ndarray:
+        if smooth.lower() not in {"boxcar","gaussian"} or smooth_um <= 0 or n_bins <= 1:
+            return y.copy()
+        sigma_bins = max(1e-9, smooth_um / bin_size_um)
+        if smooth.lower() == "boxcar":
+            win = max(1, int(round(sigma_bins)))
+            if win % 2 == 0:
+                win += 1
+            win = min(win, n_bins)
+            kernel = np.ones(win) / win
+        else:
+            half_w = max(1, int(np.ceil(4.0 * sigma_bins)))
+            xs = np.arange(-half_w, half_w + 1)
+            kernel = np.exp(-0.5 * (xs / sigma_bins) ** 2)
+            kernel /= kernel.sum()
+            if kernel.size > n_bins:
+                kernel = kernel[:n_bins]
+                kernel /= kernel.sum()
+        return _nanaware_smooth(y, kernel)
+
+    frac_both_s = _maybe_smooth(frac_both)
+    frac_pos_s  = _maybe_smooth(frac_pos)
+    frac_neg_s  = _maybe_smooth(frac_neg)
+
+    # --- plot ---
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    lk = dict(lw=2, alpha=0.9)
+    sk = dict(s=20, alpha=0.7)
+    if line_kwargs: lk.update(line_kwargs)
+    if scatter_kwargs: sk.update(scatter_kwargs)
+
+    axis_labels = {"x": "Anterior  → Posterior (µm)",
+                   "y": "Inferior → Superior (µm)",
+                   "z": "Right → Left (µm)"}
+    alpha_str = f"p < {alpha_level:g}"
+
+    def _plot_pair(x, y_raw, y_sm, label):
+        ax.scatter(x, y_raw, **sk, label=f"{label} (binned)")
+        ax.plot(x, y_sm, **lk)
+
+    label_both = f"Significant ({alpha_str})"
+    label_pos  = f"Positive-significant ({alpha_str})"
+    label_neg  = f"Negative-significant ({alpha_str})"
+
+    # Decide which to draw
+    draw_both = which in {"both", "posneg", "all3"}
+    draw_pos  = (effect_column is not None) and (which in {"pos","posneg","all3"})
+    draw_neg  = (effect_column is not None) and (which in {"neg","posneg","all3"})
+
+    if draw_both:
+        _plot_pair(centers, frac_both, frac_both_s, label_both)
+    if draw_pos:
+        _plot_pair(centers, frac_pos,  frac_pos_s,  label_pos)
+    if draw_neg:
+        _plot_pair(centers, frac_neg,  frac_neg_s,  label_neg)
+
+    ax.set_xlabel(axis_labels[axis.lower()])
+    ylab = "Fraction significant"
+    if effect_column is not None and which in {"pos","neg","posneg","all3"}:
+        ylab += " (sign-split)"
+    ax.set_ylabel(ylab)
+    ax.set_title(
+        f"Significant fractions vs {axis.upper()} | bin={bin_size_um}µm, "
+        f"repertoire={repertoire_um}µm\n{region_label}, time_window={time_window}"
+    )
+    ax.grid(True, alpha=0.3)
+    ax.legend(frameon=False)
+    plt.tight_layout()
+    plt.show()
+
+    # --- output ---
+    prof_df = pd.DataFrame({
+        "bin_center_um": centers,
+        "count": H_count,
+        "n_sig_both": H_sig_both,
+        "n_sig_pos": H_sig_pos,
+        "n_sig_neg": H_sig_neg,
+        "fraction_both": frac_both,
+        "fraction_pos": frac_pos,
+        "fraction_neg": frac_neg,
+        "fraction_both_smoothed": frac_both_s,
+        "fraction_pos_smoothed": frac_pos_s,
+        "fraction_neg_smoothed": frac_neg_s,
+    })
+    return fig, ax, prof_df
+
