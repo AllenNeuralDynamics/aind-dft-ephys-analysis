@@ -1,16 +1,22 @@
+# -*- coding: utf-8 -*-
+# Complete plotting utilities WITHOUT _to_1d_int
+# - plot_psth_raster_for_units
+# - plot_raster_and_quantile_psth_by_latent
+# All comments are in English.
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Sequence, Tuple, Optional, Union, Literal, List, Dict
 
 import numpy as np
 import xarray as xr
-from pathlib import Path
-from typing import Any, Iterable, Sequence, Tuple, Optional, Union
-from ephys_behavior import get_units_passed_default_qc
-from behavior_utils import extract_event_timestamps, find_trials
-import numpy as np
-import xarray as xr
-from pathlib import Path
-from typing import Any, Iterable, Tuple, Optional, Union, Literal,Mapping, List, Dict
 import matplotlib.pyplot as plt
-from matplotlib.figure import Figure
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+import pandas as pd
+
+# Project-specific loader (assumed available in your environment)
 from create_psth import load_psth_raster_subset
 
 
@@ -35,6 +41,7 @@ def plot_psth_raster_for_units(
     y_mode: Literal["auto_per_unit", "auto_global", "none"] = "auto_per_unit",
     y_pad: float = 0.05,
     group_name: Optional[Sequence[str]] = None,
+    show: bool = True,  # control whether to display figures
 ) -> None:
     """
     Plot both PSTH and raster for each specified unit in separate figures.
@@ -42,30 +49,27 @@ def plot_psth_raster_for_units(
     Parameters
     ----------
     source : str | Path | xr.Dataset | xr.DataArray
-        Path to a Zarr folder produced by ``extract_neuron_psth_to_zarr``
+        Path to a Zarr folder produced by `extract_neuron_psth_to_zarr`
         or an already loaded PSTH Dataset/DataArray.
     unit_ids : sequence of int, optional
         Indices of units (neurons) to plot. If None, all units are plotted.
-    trial_ids : sequence or nested sequences of int, optional
-        Specific trial index values to include. Can be a flat list for one group
-        or a list of lists for multiple groups to be plotted with different colors.
+    trial_ids : sequence or list of sequences of int, optional
+        Specific trial index values to include. Flat list → one group; nested → multiple groups.
     trial_types : sequence of str, optional
-        Behavioral trial type names used to select trials via ``find_trials``
-        if ``trial_ids`` is not provided.
+        Behavioral trial type names used to select trials via `find_trials`
+        if `trial_ids` is not provided.
     nwb_data : Any, optional
-        NWB file handle required if ``trial_types`` is used to look up trial indices.
+        NWB handle required if `trial_types` is used to look up trial indices.
     align_to_event : str, optional
-        Event name (without the ``psth_`` prefix) when multiple PSTHs exist.
-        Ignored if only one event is present.
+        Event name (without the `psth_` prefix) if multiple PSTHs exist.
     time_window : (float, float), optional
-        Time window slice along the PSTH time axis, also sets x-axis limits.
-    plot_type : {'single', 'mean'}, default 'single'
-        'single' → plot each trial separately;
-        'mean' → plot mean firing rate per group with SEM shading.
+        Time window slice along the PSTH time axis; also sets x-limits.
+    plot_type : {'single','mean'}, default 'single'
+        'single' → plot each trial separately; 'mean' → mean ± SEM per group.
     colors : sequence of str, optional
         Colors for each trial group. Defaults to Matplotlib’s color cycle.
     sem_alpha : float, default 0.3
-        Transparency for SEM shading when ``plot_type='mean'``.
+        Transparency for SEM shading when `plot_type='mean'`.
     figsize : (float, float), default (6.0, 4.0)
         Figure size in inches (width, height) per unit.
     sharey : bool, default False
@@ -233,9 +237,7 @@ def plot_psth_raster_for_units(
     colors = colors or cmap
     group_colors = {g: colors[i % len(colors)] for i, g in enumerate(trial_groups)}
 
-    # -----------------------------
-    # 2) Global autoscale (optional)
-    # -----------------------------
+    # Optional global autoscale
     global_max = 0.0
     if y_mode == "auto_global":
         for unit in unit_ids:
@@ -254,6 +256,7 @@ def plot_psth_raster_for_units(
         except IndexError:
             # Skip units not present in the dataset
             continue
+        pos = int(where[0])
 
         unit_psth = psth_da.isel(unit=pos)
         unit_raster = raster_da.isel(unit=pos)
@@ -323,12 +326,12 @@ def plot_psth_raster_for_units(
         ax_psth.set_ylabel("Firing rate (spk/s)")
         ax_psth.set_xlabel("Time (s)")
 
-        # X-limits from requested window (if any)
+        # X-limits
         if time_window is not None:
             ax_rast.set_xlim(*time_window)
             ax_psth.set_xlim(*time_window)
 
-        # Y-limits strategy
+        # Y-limits
         if y_mode == "auto_per_unit" and unit_max > 0:
             ax_psth.set_ylim(0, unit_max * (1 + y_pad))
         elif y_mode == "auto_global" and global_max > 0:
@@ -339,6 +342,7 @@ def plot_psth_raster_for_units(
 
         plt.tight_layout()
 
+        # Save / Show / Close
         if save_path:
             save_target = Path(save_path)
             if save_target.suffix == "" or save_target.is_dir():
@@ -350,19 +354,15 @@ def plot_psth_raster_for_units(
             fig.savefig(fp, dpi=dpi, bbox_inches="tight")
             print(f"Saved Unit {unit} figure to {fp}")
 
-        plt.show()
-
-from typing import Sequence, Optional, Tuple, Union, Literal
-from pathlib import Path
-import numpy as np
-import xarray as xr
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import matplotlib.colors as mcolors
-import pandas as pd
-from create_psth import load_psth_raster_subset
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
 
 
+# ---------------------------------------------------------------------
+# Plot Raster (sorted by latent) + Quantile PSTH summaries
+# ---------------------------------------------------------------------
 def plot_raster_and_quantile_psth_by_latent(
     source: Union[str, Path, xr.DataArray, xr.Dataset],
     *,
@@ -387,7 +387,8 @@ def plot_raster_and_quantile_psth_by_latent(
     show_colormap: bool = True,
     sort_order: Literal["ascending", "descending"] = "ascending",
     save_prefix: Optional[str] = None,
-    latent_name: Optional[str] = None,  # NEW
+    latent_name: Optional[str] = None,  # colorbar label
+    show: bool = True,                  # control figure display
 ) -> None:
     """
     Plot per-unit rasters and binned PSTH summaries using a trial-wise latent value.
@@ -411,23 +412,18 @@ def plot_raster_and_quantile_psth_by_latent(
     n_bins : int, default 5
         Number of bins (quantiles or equal-width bins) used to divide latent values.
     binning : {'quantile', 'equal'}, default 'quantile'
-        How to compute bin edges:
         - 'quantile': divides data into quantiles with equal number of trials.
         - 'equal': divides into equal-width ranges.
     bin_range : (float, float), optional
-        Range of latent values for equal-width binning.
-        If None, the full observed range is used.
+        Range of latent values for equal-width binning. If None, use observed range.
     bin_label : {'mean', 'center'}, default 'mean'
-        How to label bins in the colorbar:
-        - 'mean': use mean latent value per bin.
-        - 'center': use midpoint of bin edges.
+        Labels for colorbar ticks:
+        - 'mean': mean latent value per bin.
+        - 'center': midpoint of bin edges.
     quantile_stat : {'mean', 'median'}, default 'mean'
         Aggregation function for PSTH within each bin.
     ci : {'sem', 'iqr', 'none'}, default 'sem'
-        Confidence interval style:
-        - 'sem': plot mean ± SEM.
-        - 'iqr': plot interquartile range (25–75%).
-        - 'none': no shading.
+        Confidence interval style: 'sem' (mean±SEM), 'iqr' (25–75%), or 'none'.
     figsize : (float, float), default (6.0, 5.0)
         Figure size for each unit.
     dpi : int, default 300
@@ -438,22 +434,22 @@ def plot_raster_and_quantile_psth_by_latent(
         Directory or full path to save each unit’s plot.
         If a directory is provided, files are named `unit_<id>.png`.
     title_prefix : str, optional
-        Text prefix added to each figure title (e.g. session name).
+        Text prefix added to each figure title (e.g., session name).
     cmap_name : str, default 'viridis'
         Name of Matplotlib colormap for bins and colorbar.
     raster_colormap : bool, default True
-        If True, color-code raster trials by bin color.
-        If False, plot all rasters in black.
+        If True, color-code raster trials by bin color; if False, rasters are black.
     show_colormap : bool, default True
         Whether to display a colorbar showing latent value range.
-    sort_order : {'ascending', 'descending'}, default 'ascending'
+    sort_order : {'ascending','descending'}, default 'ascending'
         Sort order of trials by latent value for raster display.
     save_prefix : str, optional
         Optional filename prefix added to each saved figure.
     latent_name : str, optional
         Custom label for the colorbar. Defaults to 'Latent value' if not provided.
+    show : bool, default True
+        If True, display each figure. If False, suppress display and close after saving.
     """
-
     # -----------------------------
     # 1) Validate inputs
     # -----------------------------
@@ -521,6 +517,7 @@ def plot_raster_and_quantile_psth_by_latent(
 
     cmap = cm.get_cmap(cmap_name, n_bins)
     colors = [mcolors.to_hex(cmap(i)) for i in range(n_bins)]
+
     if bin_label == "center":
         bin_tick_vals = list(0.5 * (edges[:-1] + edges[1:]))
     else:
@@ -543,6 +540,7 @@ def plot_raster_and_quantile_psth_by_latent(
         unit_psth = psth_da.isel(unit=upos)
         unit_rast = raster_da.isel(unit=upos)
 
+        # Sorting
         sort_order_bool = sort_order == "ascending"
         sort_order_arr = np.argsort(lat, kind="mergesort")
         if not sort_order_bool:
@@ -554,7 +552,7 @@ def plot_raster_and_quantile_psth_by_latent(
             2, 1, figsize=figsize, sharex=True, gridspec_kw={'height_ratios': [1, 1.3]}
         )
 
-        # --- Raster ---
+        # Raster (color by bin if requested)
         y = 0
         for idx, tval in enumerate(sorted_trials):
             y += 1
@@ -573,7 +571,7 @@ def plot_raster_and_quantile_psth_by_latent(
         ax_rast.set_title(f"{ttl} (sorted {order_str})")
         ax_rast.set_ylabel("Trials (sorted by latent)")
 
-        # --- PSTH summaries ---
+        # PSTH summaries by bin
         ymax = 0.0
         for b in range(n_bins):
             sel = (bin_idx == b)
@@ -608,7 +606,7 @@ def plot_raster_and_quantile_psth_by_latent(
 
         plt.tight_layout()
 
-        # --- Colorbar ---
+        # Colorbar
         if show_colormap:
             sm = plt.cm.ScalarMappable(
                 cmap=cm.get_cmap(cmap_name),
@@ -621,7 +619,7 @@ def plot_raster_and_quantile_psth_by_latent(
             cbar.set_ticklabels([f"{v:.2f}" for v in ticks])
             cbar.ax.tick_params(size=0)
 
-        # --- Save ---
+        # Save / Show / Close
         if save_path:
             save_target = Path(save_path)
             if save_target.suffix == "" or save_target.is_dir():
@@ -635,4 +633,7 @@ def plot_raster_and_quantile_psth_by_latent(
             fig.savefig(fp, dpi=dpi, bbox_inches="tight")
             print(f"Saved Unit {unit} figure to {fp}")
 
-        plt.show()
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
