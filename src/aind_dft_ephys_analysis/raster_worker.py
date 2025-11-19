@@ -26,9 +26,10 @@ LATENT_NAMES = ["deltaQ-1", "reward", "sumQ-1"]
 
 
 LATENTS      = [
-    "QLearning_L2F1_softmax-reward",
+    "QLearning_L2F1_softmax-deltaQ-1",
+    "QLearning_L2F1_softmax-sumQ-1"
 ]
-LATENT_NAMES = [ "reward"]
+LATENT_NAMES = [ "deltaQ-1","sumQ-1"]
 
 
 ALIGN_TO = "go_cue"

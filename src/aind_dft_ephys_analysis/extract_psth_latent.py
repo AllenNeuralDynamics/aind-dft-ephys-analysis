@@ -100,6 +100,9 @@ def _extract_response_trials_for_one_session(
     time_window: Optional[Tuple[float, float]],
     bin_size_label: str,
     consolidated: bool,
+    normalize_latent: bool = False,
+    latent_range: Tuple[float, float] = (0.0, 1.0),
+    zscore: bool = False,
 ) -> Dict[str, Any]:
     """
     For ONE session, extract single-trial PSTH on response trials for
@@ -110,13 +113,40 @@ def _extract_response_trials_for_one_session(
 
         df_beh["QLearning_L2F1_softmax-reward"].iloc[0]  ->  (n_trials,)
 
+    Parameters
+    ----------
+    session_id : str
+        Session identifier.
+    unit_indices : sequence of int
+        Unit indices to extract within this session.
+    latent_cols : sequence of str
+        Behavior latent columns to extract from the behavior summary CSV.
+    psth_root, behavior_summary_root, behavior_summary_prefix,
+    behavior_summary_suffix, align_to_event, time_window, bin_size_label,
+    consolidated : see caller for details.
+    normalize_latent : bool, default False
+        If True, each latent column in THIS session is linearly scaled to
+        the interval [latent_range[0], latent_range[1]] based on its
+        min/max over the response trials in this session.
+    latent_range : tuple of float, default (0.0, 1.0)
+        Target range for latent normalization (low, high). Must satisfy
+        high > low.
+    zscore : bool, default False
+        If True, PSTH for each unit is z-scored within this session over
+        all (trial, time) samples:
+
+            x_z = (x - mean_unit) / std_unit
+
+        where mean/std are computed over the flattened (n_trials * T)
+        samples for that unit.
+
     Returns
     -------
     result : dict with keys
         "time"       : (T,)
         "unit_index" : (N_units_s,) int array of units actually found
         "psth"       : (N_units_s, N_trials_s, T)
-        "latent"     : (N_trials_s, L)  per-trial latent values
+        "latent"     : (N_trials_s, L)  per-trial latent values (response trials)
         "latent_cols": list[str]
     """
     # --------------------------
@@ -186,6 +216,7 @@ def _extract_response_trials_for_one_session(
     # --------------------------
     # Build latent matrix from ONE row of df_beh
     #   df_beh[col].iloc[0] -> 1D array over trials
+    #   Then subset to response trials only (and keep shapes aligned).
     # --------------------------
     latent_arrays = []
     for col in latent_cols:
@@ -195,8 +226,31 @@ def _extract_response_trials_for_one_session(
     # shape: (n_trials_all, L)
     latent_all = np.stack(latent_arrays, axis=1)
 
-    # Safety: only keep response_ids within array bounds
+
     latent_vals = latent_all  # (N_trials_s, L)
+
+    # Optional: per-session latent normalization
+    if normalize_latent:
+        low, high = latent_range
+        if not (high > low):
+            raise ValueError(
+                f"latent_range must satisfy high > low; got latent_range={latent_range}"
+            )
+
+        scale = high - low
+        lat_min = np.nanmin(latent_vals, axis=0)
+        lat_max = np.nanmax(latent_vals, axis=0)
+        denom = lat_max - lat_min
+
+        latent_norm = np.empty_like(latent_vals, dtype=float)
+        for j in range(latent_vals.shape[1]):
+            col = latent_vals[:, j]
+            if not np.isfinite(denom[j]) or np.isclose(denom[j], 0.0):
+                # Degenerate column (all equal or NaN): fill with midpoint
+                latent_norm[:, j] = 0.5 * (low + high)
+            else:
+                latent_norm[:, j] = low + (col - lat_min[j]) * scale / denom[j]
+        latent_vals = latent_norm
 
     # --------------------------
     # Load PSTH subset ONCE for all units in this session
@@ -225,7 +279,6 @@ def _extract_response_trials_for_one_session(
         kept_units.append(int(uid))
         u_pos = int(where_unit[0])
         psth_unit = psth_da.isel(unit=u_pos).values  # (N_trials_s, T)
-        
         psth_list.append(psth_unit)
 
     if not kept_units:
@@ -240,6 +293,18 @@ def _extract_response_trials_for_one_session(
     # Stack units: (N_units_s, N_trials_s, T)
     psth_arr = np.stack(psth_list, axis=0)
 
+    # Optional: per-unit z-score of PSTH within this session
+    if zscore:
+        # z-score each unit over all (trial, time) samples
+        for i_unit in range(psth_arr.shape[0]):
+            x = psth_arr[i_unit]  # (N_trials_s, T)
+            mean_unit = np.nanmean(x)
+            std_unit = np.nanstd(x, ddof=1)
+            if not np.isfinite(std_unit) or std_unit == 0:
+                # Leave this unit unscaled if std is degenerate
+                continue
+            psth_arr[i_unit] = (x - mean_unit) / std_unit
+
     return {
         "time": time,
         "unit_index": np.asarray(kept_units, int),
@@ -249,10 +314,6 @@ def _extract_response_trials_for_one_session(
     }
 
 
-
-# -------------------------------------------------------------------
-# 3) Multi-session extractor: concatenate trials across all units
-# -------------------------------------------------------------------
 def extract_response_psth_and_latent(
     unit_specs: Sequence[Dict[str, Any]],
     *,
@@ -265,6 +326,9 @@ def extract_response_psth_and_latent(
     time_window: Optional[Tuple[float, float]] = None,
     bin_size_label: str = "0.2s",
     consolidated: bool = True,
+    normalize_latent: bool = False,
+    latent_range: Tuple[float, float] = (0.0, 1.0),
+    zscore: bool = False,
     save_zarr_path: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     """
@@ -280,6 +344,44 @@ def extract_response_psth_and_latent(
         latent_values  : (N_trials_total, L)
 
     Only psth, time, latent_values are saved into Zarr (plus attrs).
+
+    Parameters
+    ----------
+    unit_specs : sequence of dict
+        Each dict must contain at least:
+            {"session_id": <str>, "unit_index": <int>}
+    latent_cols : str or sequence of str
+        Name(s) of latent columns in the behavior summary CSV.
+    psth_root, behavior_summary_root, behavior_summary_prefix,
+    behavior_summary_suffix, align_to_event, time_window,
+    bin_size_label, consolidated : see above.
+    normalize_latent : bool, default False
+        If True, within each session, each latent column is linearly
+        scaled to [latent_range[0], latent_range[1]] based on the
+        min/max over RESPONSE trials in that session. Different sessions
+        are normalized independently.
+    latent_range : tuple of float, default (0.0, 1.0)
+        Target range for latent normalization (low, high).
+    zscore : bool, default False
+        If True, for each session the PSTH of each unit is z-scored
+        across all (trial, time) samples:
+
+            x_z = (x - mean_unit) / std_unit
+
+        This normalization is applied before concatenating across sessions.
+    save_zarr_path : str or Path, optional
+        If provided, save the combined result into a Zarr group at this path.
+
+    Returns
+    -------
+    res : dict
+        {
+            "time": (T,),
+            "psth": (N_trials_total, T),
+            "latent_values": (N_trials_total, L),
+            "latent_cols": list[str],
+            "unit_list": list[(session_id, unit_index)],
+        }
     """
     # Normalize latent_cols to list
     if isinstance(latent_cols, str):
@@ -322,6 +424,9 @@ def extract_response_psth_and_latent(
             time_window=time_window,
             bin_size_label=bin_size_label,
             consolidated=consolidated,
+            normalize_latent=normalize_latent,
+            latent_range=latent_range,
+            zscore=zscore,
         )
 
         time = sess_res["time"]
@@ -348,7 +453,8 @@ def extract_response_psth_and_latent(
             psth_u = psth_sess[i_local, :, :]    # (N_trials_s, T)
 
             psth_blocks.append(psth_u)
-            latent_blocks.append(latent_sess)    # same latent per trial, replicated per unit
+            # Same latent per trial, replicated per unit
+            latent_blocks.append(latent_sess)
             unit_info.extend([(session_id, uid)] * N_trials_s)
 
     if common_time is None or not psth_blocks:
@@ -376,6 +482,7 @@ def extract_response_psth_and_latent(
         print(f"Saved combined psth + latent_values to Zarr: {save_zarr_path}")
 
     return res
+
 
 
 # -------------------------------------------------------------------
