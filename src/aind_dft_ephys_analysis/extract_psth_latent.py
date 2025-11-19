@@ -196,19 +196,7 @@ def _extract_response_trials_for_one_session(
     latent_all = np.stack(latent_arrays, axis=1)
 
     # Safety: only keep response_ids within array bounds
-    n_trials_all = latent_all.shape[0]
-    valid_mask = (response_ids >= 0) & (response_ids < n_trials_all)
-    if not np.any(valid_mask):
-        return {
-            "time": np.zeros((0,), dtype=float),
-            "unit_index": np.zeros((0,), dtype=int),
-            "psth": np.zeros((0, 0, 0), dtype=float),
-            "latent": np.zeros((0, len(latent_cols)), dtype=float),
-            "latent_cols": list(latent_cols),
-        }
-
-    response_ids = response_ids[valid_mask]
-    latent_vals = latent_all[response_ids, :]  # (N_trials_s, L)
+    latent_vals = latent_all  # (N_trials_s, L)
 
     # --------------------------
     # Load PSTH subset ONCE for all units in this session
@@ -237,10 +225,7 @@ def _extract_response_trials_for_one_session(
         kept_units.append(int(uid))
         u_pos = int(where_unit[0])
         psth_unit = psth_da.isel(unit=u_pos).values  # (N_trials_s, T)
-
-        # Make sure lengths match (just in case)
-        n_keep2 = min(psth_unit.shape[0], latent_vals.shape[0])
-        psth_unit = psth_unit[:n_keep2, :]
+        
         psth_list.append(psth_unit)
 
     if not kept_units:
@@ -254,8 +239,6 @@ def _extract_response_trials_for_one_session(
 
     # Stack units: (N_units_s, N_trials_s, T)
     psth_arr = np.stack(psth_list, axis=0)
-    N_trials_s = psth_arr.shape[1]
-    latent_vals = latent_vals[:N_trials_s, :]
 
     return {
         "time": time,
