@@ -201,7 +201,8 @@ def find_unique_combinations(
     count_col : str, default "n_trials"
         Name of the count column in the output.
     include_na : bool, default True
-        If True, include groups where at least one column is NA/None.
+        If True, keep groups where at least one column is NA/None
+        (NaN is treated as a valid group level).
         If False, drop rows with NA in any of the specified columns before grouping.
 
     Returns
@@ -217,42 +218,45 @@ def find_unique_combinations(
     if missing:
         raise ValueError(f"Columns not found in DataFrame: {missing}")
 
-    # De-duplicate requested columns to avoid accidental repeats
+    # De-duplicate requested columns
     columns = list(dict.fromkeys(columns))
 
+    # Start with just the grouping columns
     work = df[columns].copy()
+
+    have_session = "session" in df.columns
+    have_subject = "subject_id" in df.columns
+
     if not include_na:
+        # Drop rows that have NA in any grouping column
         work = work.dropna(subset=columns)
 
-    # Attach optional keys only if not already present
-    have_session = 'session' in df.columns
-    have_subject = 'subject_id' in df.columns
+    # Align extra columns to the current index of `work`
+    if have_session:
+        work["session"] = df.loc[work.index, "session"].values
+    if have_subject:
+        work["subject_id"] = df.loc[work.index, "subject_id"].values
 
-    if have_session and 'session' not in work.columns:
-        work['session'] = df['session'].values
-    if have_subject and 'subject_id' not in work.columns:
-        work['subject_id'] = df['subject_id'].values
-
-    # Group and aggregate
-    gb = work.groupby(columns, dropna=include_na)
+    # Group: dropna=False keeps NaN as a key; dropna=True excludes it
+    gb = work.groupby(columns, dropna=include_na is False)
 
     counts = gb.size().rename(count_col)
 
     if have_session:
-        n_session = gb['session'].nunique(dropna=True).rename('n_session')
+        n_session = gb["session"].nunique(dropna=True).rename("n_session")
     else:
-        n_session = pd.Series(pd.NA, index=counts.index, dtype='Int64', name='n_session')
+        n_session = pd.Series(pd.NA, index=counts.index, dtype="Int64", name="n_session")
 
     if have_subject:
-        n_mice = gb['subject_id'].nunique(dropna=True).rename('n_mice')
+        n_mice = gb["subject_id"].nunique(dropna=True).rename("n_mice")
     else:
-        n_mice = pd.Series(pd.NA, index=counts.index, dtype='Int64', name='n_mice')
+        n_mice = pd.Series(pd.NA, index=counts.index, dtype="Int64", name="n_mice")
 
     out = (
         pd.concat([counts, n_session, n_mice], axis=1)
-          .reset_index()
-          .sort_values(by=count_col, ascending=False, kind="stable")
-          .reset_index(drop=True)
+        .reset_index()
+        .sort_values(by=count_col, ascending=False, kind="stable")
+        .reset_index(drop=True)
     )
     return out
 

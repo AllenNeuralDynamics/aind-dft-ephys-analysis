@@ -2616,7 +2616,8 @@ def plot_stat_profile_along_axis_by_ccf(
     if scatter_kwargs: sk.update(scatter_kwargs)
 
     ax.scatter(centers, mean, **sk, label="Binned mean")
-    ax.plot(centers, mean_smoothed, **lk, label=f"Smoothed ({smooth}, {smooth_um:.0f} µm)")
+    #ax.plot(centers, mean_smoothed, **lk, label=f"Smoothed ({smooth}, {smooth_um:.0f} µm)")
+    ax.plot(centers, mean_smoothed, **lk)
 
     axis_labels = {"x": "Anterior  → Posterior (µm)",
                    "y": "Inferior → Superior (µm)",
