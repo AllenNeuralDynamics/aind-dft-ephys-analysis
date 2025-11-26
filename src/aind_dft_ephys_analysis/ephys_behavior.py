@@ -1472,6 +1472,7 @@ def get_qc_passed_units_metadata(
         print(f"QC-passed units metadata saved to {out_path}")
 
     return df
+
 def get_qc_passed_units_metadata_combined(
     session_names: List[str],
     save_folder: str = "/root/capsule/scratch",
@@ -1480,38 +1481,56 @@ def get_qc_passed_units_metadata_combined(
 ) -> pd.DataFrame:
     """
     Run `get_qc_passed_units_metadata` for multiple sessions, combine the results,
-    and optionally save the combined table to a CSV file.
+    attach the sorted list of input session names, and optionally save the combined
+    table to a CSV file.
 
     Parameters
     ----------
     session_names : list of str
-        List of session identifiers to load via NWBUtils.combine_nwb().
-        Each session will produce one metadata table, which will be concatenated.
+        List of session identifiers to load using NWBUtils.combine_nwb().
+        Each entry should be a valid session name string. The results from each
+        successfully processed session will be concatenated.
 
     save_folder : str, optional
-        Directory where the combined CSV should be written if `save_result=True`.
-        Defaults to "/root/capsule/results".
+        Directory where the combined CSV will be written if `save_result=True`.
+        Defaults to "/root/capsule/scratch".
 
     save_name : str, optional
         Filename for the combined CSV when `save_result=True`.
         Defaults to "qc_passed_units_metadata_all_sessions.csv".
 
     save_result : bool, optional
-        If True, save the combined DataFrame as a CSV file.
-        Default is False.
+        If True, the combined DataFrame will be saved to
+        `<save_folder>/<save_name>`. Default is False.
 
     Returns
     -------
     pd.DataFrame
-        Combined DataFrame across sessions with columns:
-            - session_id
-            - unit_index
-            - brain_region
-            - ccf_location
-            - device_name
+        A combined metadata table with one row per QC-passed unit across all
+        successfully processed sessions. Columns include:
+            - session_id : str
+            - unit_index : int
+            - brain_region : str
+            - ccf_location : dict
+            - device_name : str
+            - sorted_session_name : str
+              (comma-separated string of sorted input `session_names`)
+        If all sessions fail, an empty DataFrame with the above columns is returned.
+
+    Notes
+    -----
+    • Sessions that fail (e.g., missing waveform_mean, NWB load errors,
+      corrupt units tables) are skipped but reported in the console.
+    • The NWB file is always closed, even on exceptions.
+    • `sorted_session_name` is included in every row to keep provenance when
+      later concatenating multiple batches of results.
     """
+
     all_dfs: List[pd.DataFrame] = []
     skipped_sessions: List[Tuple[str, str]] = []
+
+    # NEW — store sorted session names as a reproducible provenance string
+    sorted_session_name = ",".join(sorted(session_names))
 
     total = len(session_names)
     print(f"Processing QC metadata for {total} sessions...\n")
@@ -1519,7 +1538,7 @@ def get_qc_passed_units_metadata_combined(
     for i, sess in enumerate(session_names, start=1):
         print(f"[{i}/{total}] Loading session {sess} ...")
 
-        # Try to load NWB for this session
+        # Load session
         try:
             nwb_data, tag = NWBUtils.combine_nwb(session_name=sess)
         except Exception as e:
@@ -1528,6 +1547,7 @@ def get_qc_passed_units_metadata_combined(
             skipped_sessions.append((sess, str(e)))
             continue
 
+        # Skip behavior-only or missing sessions
         if tag in ["none_loaded", "behavior_only"]:
             msg = f"  → Warning: tag='{tag}' – no ephys for session {sess}, skipping.\n"
             print(msg)
@@ -1541,28 +1561,38 @@ def get_qc_passed_units_metadata_combined(
                 save_result=False,   # avoid per-session CSV spam
             )
             print(f"  → Found {len(df)} QC-passed units.\n")
+
+            # NEW — include provenance column
+            df["sorted_session_name"] = sorted_session_name
+
             all_dfs.append(df)
 
         except Exception as e:
-            # Catch errors such as KeyError('waveform_mean') etc.
             msg = f"  → ERROR while processing session {sess}: {e}. Skipping this session.\n"
             print(msg)
             skipped_sessions.append((sess, str(e)))
 
         finally:
-            # Always try to close the NWB file if it exists
+            # Always close NWB
             try:
                 if "nwb_data" in locals() and hasattr(nwb_data, "io"):
                     nwb_data.io.close()
             except Exception:
                 pass
 
-    # Combine dataframes from successful sessions
+    # Combine results
     if all_dfs:
         combined_df = pd.concat(all_dfs, ignore_index=True)
     else:
         combined_df = pd.DataFrame(
-            columns=["session_id", "unit_index", "brain_region", "ccf_location", "device_name"]
+            columns=[
+                "session_id",
+                "unit_index",
+                "brain_region",
+                "ccf_location",
+                "device_name",
+                "sorted_session_name",
+            ]
         )
 
     # Save combined CSV
@@ -1572,6 +1602,7 @@ def get_qc_passed_units_metadata_combined(
         combined_df.to_csv(out_path, index=False)
         print(f"Combined QC-passed units metadata saved to {out_path}")
 
+    # Summary
     print(f"\nFinished processing {total} sessions.")
     print(f"Successfully processed sessions: {total - len(skipped_sessions)}")
     print(f"Total QC-passed units across all sessions: {len(combined_df)}")
@@ -1582,6 +1613,7 @@ def get_qc_passed_units_metadata_combined(
             print(f"  • {sess}: {err}")
 
     return combined_df
+
 
 
 
