@@ -375,6 +375,9 @@ def extract_fitted_data(
     model_alias : str, optional
         Alias of the fitted model, e.g. "QLearning_L1F1_CK1_softmax".
         Required if `fitted_latent` is None.
+        Special case:
+          - "no_model" with latent_name starting with "reward_rate_#":
+            behavior-only reward-rate computed from the trials table.
 
     latent_name : str, optional
        Which derived series to return. One of:
@@ -399,28 +402,80 @@ def extract_fitted_data(
           - 'QR'                        → Q for option 1 after update
           - 'QR-1'                      → Q₁ (after update) with last trial dropped and first-trial value replaced by 0
           - 'QR+1'                      → Q₁ (after update) with first trial dropped and last-trial value replaced by 0
-          - 'chosenQ'                  → Q of the chosen option (after choice)
-          - 'chosenQ-1'                → Chosen-Q with last valid entry dropped and first valid entry replaced by 0
-          - 'chosenQ+1'                → Chosen-Q with first valid entry dropped and last valid entry replaced by 0
-          - 'unchosenQ'                → Q of the unchosen option (after update)
-          - 'unchosenQ-1'              → Unchosen-Q (after update) with last valid entry dropped and first valid entry replaced by 0
-          - 'unchosenQ+1'              → Unchosen-Q (after update) with first valid entry dropped and last valid entry replaced by 0
+          - 'chosenQ'                   → Q of the chosen option (after choice)
+          - 'chosenQ-1'                 → Chosen-Q with last valid entry dropped and first valid entry replaced by 0
+          - 'chosenQ+1'                 → Chosen-Q with first valid entry dropped and last valid entry replaced by 0
+          - 'unchosenQ'                 → Q of the unchosen option (after update)
+          - 'unchosenQ-1'               → Unchosen-Q (after update) with last valid entry dropped and first valid entry replaced by 0
+          - 'unchosenQ+1'               → Unchosen-Q (after update) with first valid entry dropped and last valid entry replaced by 0
           - 'reward'                    → Returns 1 for rewarded trials, 0 for unrewarded trials (no trimming)
           - 'reward-1'                  → Reward series with last valid entry dropped and first valid entry replaced by 0
           - 'reward+1'                  → Reward series with first valid entry dropped and last valid entry replaced by 0
-          - 'choice'                   → Animal's choice per trial (0=left, 1=right) with no trimming, excludes no-response trials
-          - 'choice-1'                 → Choice series with last valid entry dropped and first entry replaced by 0 (keep length constant)
-          - 'choice+1'                 → Choice series with first valid entry dropped and last entry replaced by 0 (keep length constant)   
-          - 'value'                    → For model ForagingCompareThreshold.
-          - 'value-1'                  → For model ForagingCompareThreshold (with last trial dropped and first-trial value replaced by 0).
-          - 'value+1'                  → For model ForagingCompareThreshold (with first trial dropped and last-trial value replaced by 0).
+          - 'choice'                    → Animal's choice per trial (0=left, 1=right) with no trimming, excludes no-response trials
+          - 'choice-1'                  → Choice series with last valid entry dropped and first entry replaced by 0 (keep length constant)
+          - 'choice+1'                  → Choice series with first valid entry dropped and last entry replaced by 0 (keep length constant)
+          - 'value'                     → For model ForagingCompareThreshold.
+          - 'value-1'                   → For model ForagingCompareThreshold (with last trial dropped and first-trial value replaced by 0).
+          - 'value+1'                   → For model ForagingCompareThreshold (with first trial dropped and last-trial value replaced by 0).
+          - 'reward_rate_N' (with model_alias == "no_model"):
+                Empirical reward rate over the previous N valid trials,
+                computed as (# rewarded) / (# rewarded + # unrewarded),
+                excluding no-response trials. The current trial is not included
+                in the window; early trials use as many previous valid trials
+                as available, and if there are none the rate is set to 0.
+
     Returns
     -------
     np.ndarray or None
-        A 1-D float array for the requested latent series, or None if unsupported. All returned arrays (except None) have the same length as the number of trials.
+        A 1-D float array for the requested latent series, or None if unsupported.
+        All returned arrays (except None) have the same length as the number of
+        valid trials, unless otherwise noted.
     """
     try:
-        # 1) Validate inputs and fetch if needed
+        # ------------------------------------------------------------------
+        # Special case: behavior-only reward rate (no_model)
+        # ------------------------------------------------------------------
+        if model_alias == 'no_model':
+            pass
+        if (
+            model_alias == "no_model"
+            and latent_name is not None
+            and latent_name.startswith("reward_rate_")
+        ):
+            # Parse window size from latent_name, e.g. "reward_rate_10"
+            try:
+                window_size = int(latent_name.split("_")[-1])
+            except Exception:
+                print(f"Invalid reward_rate latent_name: {latent_name}")
+                return None
+
+            trials = nwb_behavior_data.trials
+            rewardedL = trials['rewarded_historyL'][:]
+            rewardedR = trials['rewarded_historyR'][:]
+            responses = trials['animal_response'][:]
+
+            # Exclude no-response trials (animal_response == 2), as in 'reward'
+            valid_mask = (responses != 2)
+            rewarded = (rewardedL | rewardedR).astype(int)[valid_mask]
+
+            n_valid = len(rewarded)
+            reward_rate = np.zeros(n_valid, dtype=float)
+
+            # For each valid trial index i, compute reward rate over the
+            # previous `window_size` valid trials (excluding trial i itself).
+            for i in range(n_valid):
+                start = max(0, i - window_size)
+                window_rewards = rewarded[start:i]  # previous valid trials only
+                if window_rewards.size == 0:
+                    reward_rate[i] = 0.0
+                else:
+                    reward_rate[i] = float(window_rewards.sum()) / float(window_rewards.size)
+
+            return reward_rate
+
+        # ------------------------------------------------------------------
+        # 1) Validate inputs and fetch fit if needed (model-based latents)
+        # ------------------------------------------------------------------
         if fitted_latent is None:
             if session_name is None or model_alias is None or latent_name is None:
                 raise ValueError(
@@ -446,7 +501,7 @@ def extract_fitted_data(
             q0_full = q1_full = None
 
         if 'value' in FL:
-            value_full= np.array(FL['value'])
+            value_full = np.array(FL['value'])
 
         # Helper: apply trimming based on suffix
         def _trim_series(arr: np.ndarray, base: str, suffix: str) -> np.ndarray:
@@ -459,10 +514,10 @@ def extract_fitted_data(
             if suffix == '':
                 return arr[1:]
             elif suffix == '-1':
-                # drop last valid trial, the first trial is already initianized with zero or other value
+                # drop last valid trial; first trial is already initialized
                 return arr[:-1]
             elif suffix == '+1':
-                # drop the first trial, and append the last trial with 0
+                # drop the first trial, and append a 0 at the end
                 trimmed = arr[2:]
                 return np.append(trimmed, 0)
             else:
@@ -472,12 +527,19 @@ def extract_fitted_data(
         base_name = latent_name
         suffix = ''
         if latent_name is not None and (latent_name.endswith('-1') or latent_name.endswith('+1')):
-            base_name, suffix = latent_name.rsplit('-', 1) if latent_name.endswith('-1') else latent_name.rsplit('+', 1)
-            suffix = '-' + suffix if latent_name.endswith('-1') else '+' + suffix
+            if latent_name.endswith('-1'):
+                base_name, suffix_part = latent_name.rsplit('-', 1)
+                suffix = '-' + suffix_part
+            else:
+                base_name, suffix_part = latent_name.rsplit('+', 1)
+                suffix = '+' + suffix_part
 
-        # 3) Compute requested series
+        # ------------------------------------------------------------------
+        # 3) Compute requested series (model-based)
+        # ------------------------------------------------------------------
+
         # ----- value for ForagingCompareThreshold -----
-        if base_name == 'value' and model_alias=='ForagingCompareThreshold':
+        if base_name == 'value' and model_alias == 'ForagingCompareThreshold':
             return _trim_series(value_full, 'value', suffix)
 
         # ----- deltaQ -----
@@ -500,44 +562,42 @@ def extract_fitted_data(
             if suffix == '':
                 return cp
             elif suffix == '-1':
-                # drop last valid trial, then append a 0 to the begining to keep length consistent
+                # drop last valid trial, then prepend 0
                 trimmed = cp[:-1]
                 return np.insert(trimmed, 0, 0)
             elif suffix == '+1':
-                # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
+                # drop first valid trial, then append 0
                 trimmed = cp[1:]
                 return np.append(trimmed, 0)
             else:
                 return None
 
         # ----- Reward Prediction Error (RPE) -----
-        if base_name == 'RPE' and model_alias=='ForagingCompareThreshold':
+        if base_name == 'RPE' and model_alias == 'ForagingCompareThreshold':
             trials = nwb_behavior_data.trials
             rewardedL = trials['rewarded_historyL'][:]
             rewardedR = trials['rewarded_historyR'][:]
             responses = trials['animal_response'][:]
 
-            # Drop last trial from Q arrays before computing
+            # Drop last trial from value arrays before computing
             value = value_full[:-1]
             valid = responses != 2
             rewarded = (rewardedL | rewardedR).astype(int)[valid]
 
-            rpe_full=rewarded-value
+            rpe_full = rewarded - value
 
             if suffix == '':
                 return rpe_full
             elif suffix == '-1':
-                # drop last valid trial, then append a 0 to the begining to keep length consistent
                 trimmed = rpe_full[:-1]
                 return np.insert(trimmed, 0, 0)
             elif suffix == '+1':
-                # drop first valid trial, then prepend a 0 to the last trial to keep length consistent
                 trimmed = rpe_full[1:]
                 return np.append(trimmed, 0)
             else:
                 return None
 
-        if base_name == 'RPE' and model_alias!='ForagingCompareThreshold':
+        if base_name == 'RPE' and model_alias != 'ForagingCompareThreshold':
             trials = nwb_behavior_data.trials
             rewardedL = trials['rewarded_historyL'][:]
             rewardedR = trials['rewarded_historyR'][:]
@@ -548,7 +608,7 @@ def extract_fitted_data(
             q1 = q1_full[:-1]
             valid = responses != 2
             rewarded = (rewardedL | rewardedR).astype(int)[valid]
-            resp_valid     = responses[valid]
+            resp_valid = responses[valid]
 
             rpe_full = np.where(resp_valid == 0, rewarded - q0, rewarded - q1)
 
@@ -565,7 +625,6 @@ def extract_fitted_data(
             else:
                 return None
 
-
         # ----- QL and QR -----
         if base_name in ('QL', 'QR'):
             arr_full = q0_full if base_name == 'QL' else q1_full
@@ -581,7 +640,7 @@ def extract_fitted_data(
             # Drop last trial from Q arrays
             q0 = q0_full[:-1]
             q1 = q1_full[:-1]
-            valid_mask = (responses!= 2)
+            valid_mask = (responses != 2)
             resp_valid = responses[valid_mask]
 
             chosen = np.where(resp_valid == 0, q0, q1)
@@ -600,7 +659,6 @@ def extract_fitted_data(
                 return np.append(trimmed, 0)
             else:
                 return None
-
 
         # ----- reward -----
         if base_name == 'reward':
@@ -651,10 +709,12 @@ def extract_fitted_data(
 
         # Unsupported latent_name
         return None
-    except:
+
+    except Exception as e:
         # print your custom message plus the exception’s own message
-        print(f"Can't extract {latent_name} from {model_alias}")
+        print(f"Can't extract {latent_name} from {model_alias}: {e}")
         return None
+
 
 def find_trials(
     nwb_behavior_data: Any,
@@ -783,7 +843,7 @@ def find_trials(
 
 def generate_behavior_summary(
     nwb_data: Any,
-    model_alias:  Union[str, List[str]] = ['ForagingCompareThreshold','QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax','q_learning_Y1'],
+    model_alias:  Union[str, List[str]] = ['ForagingCompareThreshold','QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax','q_learning_Y1','no_model'],
     latent_names: Optional[List[str]] = None,
     trial_types : Optional[List[str]]  = None
 ) -> pd.DataFrame:
@@ -845,6 +905,8 @@ def generate_behavior_summary(
             'value+1'
         ]
 
+    # Add reward_rate_1 ... reward_rate_100
+    latent_names += [f"reward_rate_{i}" for i in range(1, 40)]
 
     if trial_types is None:
         trial_types = [
@@ -922,7 +984,7 @@ def generate_behavior_summary(
 
 def generate_behavior_summary_combined(
     session_names: List[str],
-    model_alias:  Union[str, List[str]] = ['ForagingCompareThreshold','QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax','q_learning_Y1'],
+    model_alias:  Union[str, List[str]] = ['ForagingCompareThreshold','QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax','q_learning_Y1','no_model'],
     latent_names: Optional[List[str]] = None,
     trial_types: Optional[List[str]] = None,
     save_folder: str = '/root/capsule/results',
