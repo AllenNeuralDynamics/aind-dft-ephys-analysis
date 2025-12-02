@@ -1,4 +1,4 @@
-# hash:sha256:d39892ac016258bb2031bd687142f449a67813e4f637a41d0b138e008bf5c028
+# hash:sha256:3061e32b006c65c5b87654bc6cd8365917155763868aa75b65ba2d607dcf1af3
 ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/c1-vscode:4.20.0-pylint2023.10.1-copilot1.143.601
 
@@ -27,6 +27,7 @@ RUN --mount=type=secret,id=git-access-token \
     ipykernel==6.29.5 \
     jupyter==1.1.1 \
     matplotlib==3.10.0 \
+    matplotlib-venn==1.1.2 \
     numpy==2.2.2 \
     pandas==2.2.3 \
     pynwb==2.8.3 \
