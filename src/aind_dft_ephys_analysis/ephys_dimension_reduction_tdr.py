@@ -37,6 +37,8 @@ import matplotlib.pyplot as plt
 from matplotlib.cm import get_cmap
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+from matplotlib.cm import ScalarMappable
+
 
 
 # ----------------------------- utilities -----------------------------
@@ -913,6 +915,8 @@ def tdr_from_psth(
 # ids = out["trial_ids"]                           # (n_trials_used,)
 
 
+
+
 def plot_tdr_trace_by_quantile(
     Y: np.ndarray,
     t: np.ndarray,
@@ -947,7 +951,7 @@ def plot_tdr_trace_by_quantile(
       - bin_edges: provide explicit edges (length n_quantiles+1); overrides binning
 
     Exclusion:
-      - Bins with < min_traces_per_bin trials are excluded from plot & legend.
+      - Bins with < min_traces_per_bin trials are excluded from plot and legend.
     """
 
     # ---- helpers ----
@@ -991,7 +995,7 @@ def plot_tdr_trace_by_quantile(
             else:
                 window = float(spec.get("window", 0.05))  # seconds
                 k = _build_moving_kernel(int(round(window / max(dt, 1e-9))))
-        else:  # samples
+        else:  # "samples"
             if method == "gaussian":
                 k = _build_gaussian_kernel(float(spec.get("sigma", 5)), truncate)
             else:
@@ -999,7 +1003,8 @@ def plot_tdr_trace_by_quantile(
         return _nanaware_convolve_same(Yin, k)
 
     # ---- validations ----
-    Y = np.asarray(Y); t = np.asarray(t).reshape(-1)
+    Y = np.asarray(Y)
+    t = np.asarray(t).reshape(-1)
     if Y.ndim != 2 or Y.shape[1] != t.size:
         raise ValueError("Y must be (n_trials, n_timepoints) and match t length")
 
@@ -1017,7 +1022,8 @@ def plot_tdr_trace_by_quantile(
 
     # drop invalid trials
     good = np.isfinite(x) & np.isfinite(Y).any(axis=1)
-    Y = Y[good]; x = x[good]
+    Y = Y[good]
+    x = x[good]
     if Y.shape[0] < n_quantiles:
         raise ValueError("Not enough valid trials to form the requested bins.")
 
@@ -1033,20 +1039,23 @@ def plot_tdr_trace_by_quantile(
         if binning not in {"equal_width", "quantile"}:
             raise ValueError("binning must be 'equal_width' or 'quantile'")
         if binning == "quantile":
-            # even-count bins by quantiles, with controllable quantile method
-            edges = np.nanquantile(x, np.linspace(0, 1, n_quantiles + 1), method=quantile_method)
+            edges = np.nanquantile(
+                x, np.linspace(0, 1, n_quantiles + 1), method=quantile_method
+            )
         else:  # equal_width
-            xmin = float(np.nanmin(x)); xmax = float(np.nanmax(x))
+            xmin = float(np.nanmin(x))
+            xmax = float(np.nanmax(x))
             if not np.isfinite(xmin) or not np.isfinite(xmax):
                 raise ValueError("Non-finite values in grouping variable after filtering.")
             if xmax == xmin:
-                xmin -= 0.5; xmax += 0.5
+                xmin -= 0.5
+                xmax += 0.5
             edges = np.linspace(xmin, xmax, n_quantiles + 1)
 
     # Ensure strictly increasing edges (guard against ties)
     for i in range(1, len(edges)):
-        if edges[i] <= edges[i-1]:
-            edges[i] = edges[i-1] + np.finfo(float).eps
+        if edges[i] <= edges[i - 1]:
+            edges[i] = edges[i - 1] + np.finfo(float).eps
 
     # Digitize; include max by slightly expanding last edge
     span = edges[-1] - edges[0]
@@ -1068,26 +1077,38 @@ def plot_tdr_trace_by_quantile(
 
     # ---- plot ----
     fig, ax = plt.subplots(figsize=(20, 8))
-    if show_trials:
-        ax.plot(t, Y_sm.T, color="0.6", alpha=alpha_trials, linewidth=0.6, zorder=1)
 
-    # assign colors only to bins we actually plot (keeps legend colors correct)
-    cm = get_cmap(cmap, len(kept_bins))
+    if show_trials:
+        ax.plot(t, Y_sm.T, color="0.6", alpha=alpha_trials,
+                linewidth=0.6, zorder=1)
+
+    # continuous colormap for the colorbar
+    cmap_cont = plt.get_cmap(cmap)
+    # discrete colors for the traces (one per kept bin)
+    trace_colors = cmap_cont(np.linspace(0.0, 1.0, len(kept_bins)))
+
     legend_handles, legend_labels = [], []
 
+    # representative bin values for colorbar = bin centers
+    bin_centers = np.array([(edges[b] + edges[b + 1]) / 2.0 for b in kept_bins])
+
     for i_plot, (b, idx) in enumerate(zip(kept_bins, bin_members)):
-        color = cm(i_plot)
+        color = trace_colors[i_plot]
         Yb = Y_sm[idx]
+
         mean_b = np.nanmean(Yb, axis=0)
         ax.plot(t, mean_b, color=color, linewidth=lw_mean, zorder=3)
+
         if ci == "sem":
             sem_b = np.nanstd(Yb, axis=0) / max(1, np.sqrt(idx.size))
-            ax.fill_between(t, mean_b - sem_b, mean_b + sem_b, color=color, alpha=0.25, zorder=2)
+            ax.fill_between(
+                t, mean_b - sem_b, mean_b + sem_b,
+                color=color, alpha=0.25, zorder=2
+            )
 
-        # legend handle
         line_handle = Line2D([0], [0], color=color, lw=lw_mean)
         if legend_ci_patch and ci == "sem":
-            patch_handle = Patch(facecolor=color, alpha=0.25, edgecolor='none')
+            patch_handle = Patch(facecolor=color, alpha=0.25, edgecolor="none")
             legend_handles.append((line_handle, patch_handle))
         else:
             legend_handles.append(line_handle)
@@ -1099,6 +1120,7 @@ def plot_tdr_trace_by_quantile(
     ax.axhline(0, color="k", linewidth=0.8, linestyle="--", zorder=0)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Projection (a.u.)")
+
     by = "latent" if group_by == "latent" else "y_fit"
     subtitle = f"{binning}"
     if binning == "quantile":
@@ -1107,7 +1129,7 @@ def plot_tdr_trace_by_quantile(
         subtitle += f", min_n={min_traces_per_bin}"
     ax.set_title(title + f" (by {by}, {subtitle})")
 
-    # legend outside
+    # legend outside on the right
     if legend_handles:
         ax.legend(
             legend_handles,
@@ -1121,5 +1143,18 @@ def plot_tdr_trace_by_quantile(
             handletextpad=0.8,
         )
 
+    # -------------------------
+    # Continuous colorbar for bins
+    # -------------------------
+    cax = fig.add_axes([0.86, 0.2, 0.02, 0.6])
+    norm = plt.Normalize(vmin=bin_centers.min(), vmax=bin_centers.max())
+    sm = ScalarMappable(norm=norm, cmap=cmap_cont)
+    sm.set_array([])
+
+    cbar = fig.colorbar(sm, cax=cax)
+    cbar.set_label(f"{by} (bin center)", rotation=90)
+
+    # leave room on the right for legend (up to 0.82)
     fig.tight_layout(rect=[0, 0, 0.82, 1])
     plt.show()
+
