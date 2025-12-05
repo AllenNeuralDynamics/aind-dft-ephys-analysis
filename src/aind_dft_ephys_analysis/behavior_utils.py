@@ -843,12 +843,26 @@ def find_trials(
 
 def generate_behavior_summary(
     nwb_data: Any,
-    model_alias:  Union[str, List[str]] = ['ForagingCompareThreshold','QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax','q_learning_Y1','no_model'],
+    model_alias:  Union[str, List[str]] = [
+        'ForagingCompareThreshold',
+        'QLearning_L1F1_CK1_softmax',
+        'QLearning_L2F1_softmax',
+        'QLearning_L2F1_CK1_softmax',
+        'q_learning_Y1',
+        'no_model'
+    ],
     latent_names: Optional[List[str]] = None,
     trial_types : Optional[List[str]]  = None
 ) -> pd.DataFrame:
     """
     Build a one-row behavioral summary for a single session.
+
+    This version avoids repeatedly calling `get_fitted_latent`:
+    for each model alias (except 'no_model' and the locally-fitted
+    'q_learning_Y1'), we call `get_fitted_latent(...)` **once** and
+    cache the result, then reuse that cached `fitted_latent` for all
+    requested latent_names via the `fitted_latent=` argument of
+    `extract_fitted_data`.
 
     If *model_alias* includes "q_learning_Y1", the function fits that model
     locally with `fit_q_learning_model(...)` and uses its latent variables
@@ -902,71 +916,110 @@ def generate_behavior_summary(
             'choice+1',
             'value',
             'value-1',
-            'value+1'
+            'value+1',
         ]
 
-    # Add reward_rate_1 ... reward_rate_100
+    # Add reward_rate_1 ... reward_rate_39 (behavior-only, no model fit)
     latent_names += [f"reward_rate_{i}" for i in range(1, 40)]
 
     if trial_types is None:
         trial_types = [
             'no_response', 'response', 'rewarded', 'unrewarded',
-            'left_rewarded', 'right_rewarded', 
+            'left_rewarded', 'right_rewarded',
             'switch_trial',
-            'switch_trial_reward',      
-            'switch_trial_noreward' ,   
-            'switch_LR',                
-            'switch_LR_reward',         
-            'switch_LR_noreward',       
-            'switch_RL',                
-            'switch_RL_reward',        
+            'switch_trial_reward',
+            'switch_trial_noreward',
+            'switch_LR',
+            'switch_LR_reward',
+            'switch_LR_noreward',
+            'switch_RL',
+            'switch_RL_reward',
             'switch_RL_noreward',
             'left_choice',
-            'right_choice'
+            'right_choice',
         ]
 
     # ------------------------------------------------------------------
-    # 2. Cache for any locally fitted model
+    # 2. Caches
     # ------------------------------------------------------------------
-    local_fit_cache: dict[str, dict] = {}
+    # For locally fitted models (currently only 'q_learning_Y1')
+    local_fit_cache: Dict[str, Dict[str, Any]] = {}
+
+    # For remotely fetched fits (other aliases except 'no_model')
+    remote_fit_cache: Dict[str, Optional[Dict[str, Any]]] = {}
 
     # ------------------------------------------------------------------
     # 3. Assemble summary
     # ------------------------------------------------------------------
-    summary: dict[str, Any] = {'session_id': session_id}
+    summary: Dict[str, Any] = {'session_id': session_id}
 
     for alias in aliases:
         # --------------------------------------------------------------
-        # 3a. Obtain (or compute) fitted_latent for this alias
+        # 3a. Obtain (or compute) fitted_latent for this alias ONCE
         # --------------------------------------------------------------
         if alias == 'q_learning_Y1':
-            # Fit only once per session
+            # Fit only once per session for this alias
             if alias not in local_fit_cache:
                 fit_dict = fit_q_learning_model(nwb_data, model_name=alias)
                 local_fit_cache[alias] = fit_dict
-            fit_source = 'local'   # just for clarity / debugging
+            fit_source = 'local'
+
+        elif alias == 'no_model':
+            # Behavior-only quantities (reward_rate_N, etc.)
+            fit_source = 'no_model'
+
         else:
+            # Remote / archived model fits
+            if alias not in remote_fit_cache:
+                # This calls get_fitted_latent(session_name, alias) ONCE
+                remote_fit_cache[alias] = get_fitted_latent(
+                    session_name=full_session_name,
+                    model_alias=alias
+                )
             fit_source = 'remote'
 
         # --------------------------------------------------------------
         # 3b. Add each requested latent series
         # --------------------------------------------------------------
         for ln in latent_names:
+            col_name = f"{alias}-{ln}"
+
+            # ---- Local fit ('q_learning_Y1') ----
             if fit_source == 'local':
+                fit_dict = local_fit_cache.get(alias)
+                if not fit_dict:
+                    summary[col_name] = None
+                    continue
+
                 values = extract_fitted_data(
                     nwb_behavior_data=nwb_data,
-                    fitted_latent=local_fit_cache[alias],
-                    latent_name=ln
+                    fitted_latent=fit_dict,
+                    latent_name=ln,
                 )
-            else:
+
+            # ---- Behavior-only, no model fit ('no_model') ----
+            elif fit_source == 'no_model':
                 values = extract_fitted_data(
                     nwb_behavior_data=nwb_data,
                     session_name=full_session_name,
-                    model_alias=alias,
-                    latent_name=ln
+                    model_alias='no_model',
+                    latent_name=ln,
                 )
 
-            col_name = f"{alias}-{ln}"
+            # ---- Remote fit (cached result from get_fitted_latent) ----
+            else:  # fit_source == 'remote'
+                fit_dict = remote_fit_cache.get(alias)
+                if not fit_dict:
+                    # Could not fetch / parse this alias for this session
+                    summary[col_name] = None
+                    continue
+
+                values = extract_fitted_data(
+                    nwb_behavior_data=nwb_data,
+                    fitted_latent=fit_dict,
+                    latent_name=ln,
+                )
+
             summary[col_name] = values.tolist() if values is not None else None
 
     # ------------------------------------------------------------------
@@ -979,6 +1032,7 @@ def generate_behavior_summary(
     # 5. Return single-row DataFrame
     # ------------------------------------------------------------------
     return pd.DataFrame([summary])
+
 
 
 
