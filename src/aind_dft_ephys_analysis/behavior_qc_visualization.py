@@ -557,7 +557,7 @@ def plot_behavior_qc_summary(
          go-aligned PSTH (all)            | go-aligned PSTH (reward vs no-reward)
 
       4: start-aligned PSTH (all)         | start-aligned PSTH (by reward)
-         lick raster (all)                | lick raster (grouped by reward)
+         lick raster (all)                | lick raster (reward / unreward / no-response)
 
       5: ITI histogram                    | delay histogram
          metrics summary (left)           | metrics summary (right)
@@ -582,10 +582,19 @@ def plot_behavior_qc_summary(
     mean_iti = float(metrics.get("mean_iti_time", np.nan))
     mean_delay = float(metrics.get("mean_delay_time", np.nan))
 
-    # Trial info
+    # Trial info (all aligned to trial_df length)
+    n_trials = len(trial_df)
     go_times = np.asarray(trial_df["goCue_start_time"], dtype=float)
     start_times = np.asarray(trial_df["start_time"], dtype=float)
     reward = np.asarray(trial_df["reward"], dtype=bool)
+
+    # Response / no response: 0 left, 1 right, 2 no response
+    # Clip to n_trials in case NWB has extra trials
+    animal_response = np.asarray(
+        nwb_data.trials["animal_response"][:],
+        dtype=float,
+    )
+    animal_response = animal_response[:n_trials]
 
     # Lick timestamps (absolute)
     left_licks = np.asarray(
@@ -658,22 +667,16 @@ def plot_behavior_qc_summary(
     # ------------------------
     # Row 2: logistic regression
     # ------------------------
-
-    # Create a nested GridSpec inside row 2 with custom width ratios
     gs_log = gs[2, :].subgridspec(1, 2, width_ratios=[1, 1.0], wspace=0.05)
+    ax_log_coef = fig.add_subplot(gs_log[0, 0])
+    ax_log_pred = fig.add_subplot(gs_log[0, 1])
 
-    ax_log_coef = fig.add_subplot(gs_log[0, 0])   # wider panel
-    ax_log_pred = fig.add_subplot(gs_log[0, 1])   # narrower panel
-
-    # Register them in axes[] array
     axes[2, 0] = ax_log_coef
     axes[2, 1] = ax_log_coef
     axes[2, 2] = ax_log_pred
     axes[2, 3] = ax_log_pred
 
-
-
-    # Row 3: (old row2) latency + go-aligned PSTH
+    # Row 3: latency + go-aligned PSTH
     axes[3, 0] = fig.add_subplot(gs[3, 0])
     axes[3, 1] = fig.add_subplot(gs[3, 1])
     axes[3, 2] = fig.add_subplot(gs[3, 2])
@@ -684,7 +687,7 @@ def plot_behavior_qc_summary(
     ax_psth_all_go = axes[3, 2]
     ax_psth_reward_go = axes[3, 3]
 
-    # Row 4: (old row3) start-aligned PSTHs + rasters
+    # Row 4: start-aligned PSTHs + rasters
     axes[4, 0] = fig.add_subplot(gs[4, 0])
     axes[4, 1] = fig.add_subplot(gs[4, 1])
     axes[4, 2] = fig.add_subplot(gs[4, 2])
@@ -693,9 +696,9 @@ def plot_behavior_qc_summary(
     ax_psth_start_all = axes[4, 0]
     ax_psth_start_reward = axes[4, 1]
     ax_raster_all = axes[4, 2]
-    ax_raster_reward = axes[4, 3]
+    ax_raster_grouped = axes[4, 3]
 
-    # Row 5: (old row4) ITI / delay / metrics summary
+    # Row 5: ITI / delay / metrics summary
     axes[5, 0] = fig.add_subplot(gs[5, 0])
     axes[5, 1] = fig.add_subplot(gs[5, 1])
     axes[5, 2] = fig.add_subplot(gs[5, 2])
@@ -703,13 +706,12 @@ def plot_behavior_qc_summary(
 
     ax_iti = axes[5, 0]
     ax_delay = axes[5, 1]
-    ax_unused_1 = axes[5, 2]   # metrics summary left
-    ax_unused_2 = axes[5, 3]   # metrics summary right
+    ax_metrics_left = axes[5, 2]
+    ax_metrics_right = axes[5, 3]
 
     # ---------------------------------------------------------
     # Row 2: logistic regression (coeffs + predictions)
     # ---------------------------------------------------------
-    # coeffs
     if logreg_fig_coef is not None:
         _embed_figure_as_image(logreg_fig_coef, ax_log_coef)
         plt.close(logreg_fig_coef)
@@ -725,7 +727,6 @@ def plot_behavior_qc_summary(
             fontsize=10,
         )
 
-    # predicted vs actual
     if logreg_fig_pred is not None:
         _embed_figure_as_image(logreg_fig_pred, ax_log_pred)
         plt.close(logreg_fig_pred)
@@ -741,9 +742,8 @@ def plot_behavior_qc_summary(
             fontsize=10,
         )
 
-
     # ---------------------------------------------------------
-    # Row 3: first-lick latency + go-aligned PSTHs (old row2)
+    # Row 3: first-lick latency + go-aligned PSTHs
     # ---------------------------------------------------------
     _plot_hist_panel(
         ax_lat_all,
@@ -793,7 +793,7 @@ def plot_behavior_qc_summary(
     )
 
     # ---------------------------------------------------------
-    # Row 4: start-aligned PSTHs + rasters (old row3)
+    # Row 4: start-aligned PSTHs
     # ---------------------------------------------------------
     plot_lick_rate_psth_from_start_before_go(
         ax_psth_start_all,
@@ -816,7 +816,10 @@ def plot_behavior_qc_summary(
         psth_bin_width=psth_bin_width,
     )
 
-    # Lick rasters (go-aligned)
+    # ---------------------------------------------------------
+    # Row 4: lick rasters (go-aligned)
+    # ---------------------------------------------------------
+    # Panel 1: all trials, colored by side
     if t_rel_all.size > 0:
         mask_left = side_all == 0
         mask_right = side_all == 1
@@ -841,61 +844,119 @@ def plot_behavior_qc_summary(
         ax_raster_all.set_ylabel("Trial index")
         ax_raster_all.set_title("Lick raster (all trials)")
         ax_raster_all.grid(True, alpha=0.3)
-        ax_raster_all.legend()
+        ax_raster_all.legend(fontsize=8, markerscale=2, handlelength=1.5,framealpha=0.3)
     else:
         ax_raster_all.set_title("Lick raster (no licks found)")
         ax_raster_all.set_xlabel("Time from go cue (s)")
         ax_raster_all.set_ylabel("Trial index")
         ax_raster_all.grid(True, alpha=0.3)
 
-    if t_rel_all.size > 0 and reward.size > 0:
-        idx_rewarded = np.where(reward)[0]
-        idx_unrewarded = np.where(~reward)[0]
-        order = np.concatenate([idx_rewarded, idx_unrewarded])
+    # Panel 2: grouped by reward / unreward / no response
+    ax_raster_grouped.clear()
+    if t_rel_all.size > 0 and reward.size > 0 and animal_response.size == reward.size:
+        # Define per-trial groups:
+        #   0: rewarded trials
+        #   1: unrewarded but responded (animal_response 0 or 1)
+        #   2: no response (animal_response == 2 or NaN)
+        resp_codes = animal_response.copy()
 
+        is_noresp = np.isnan(resp_codes) | (resp_codes == 2)
+        is_responded = ~is_noresp
+        is_rewarded = reward & is_responded
+        is_unrewarded_resp = (~reward) & is_responded
+
+        # Trial indices for each group
+        idx_rewarded = np.where(is_rewarded)[0]
+        idx_unrewarded = np.where(is_unrewarded_resp)[0]
+        idx_noresp = np.where(is_noresp)[0]
+
+        # Order trials: rewarded → unrewarded → no response
+        order = np.concatenate([idx_rewarded, idx_unrewarded, idx_noresp])
         if order.size > 0:
-            rank = np.empty_like(order)
+            # Map original trial index → row index in raster
+            rank = np.empty(n_trials, dtype=int)
             rank[order] = np.arange(order.size)
+
+            # Per-trial group codes
+            trial_group = np.full(n_trials, 2, dtype=int)  # default = no response
+            trial_group[is_unrewarded_resp] = 1
+            trial_group[is_rewarded] = 0
+
+            # For each lick, get its trial group and new row index
+            lick_groups = trial_group[trial_idx_all]
             sorted_trial_idx_all = rank[trial_idx_all]
 
-            lick_reward = reward[trial_idx_all]
-            mask_rewarded = lick_reward
-            mask_unrewarded = ~lick_reward
+            mask_g_reward = lick_groups == 0
+            mask_g_unreward = lick_groups == 1
+            mask_g_noresp = lick_groups == 2
 
-            if np.any(mask_rewarded):
-                ax_raster_reward.scatter(
-                    t_rel_all[mask_rewarded],
-                    sorted_trial_idx_all[mask_rewarded],
+            # Plot licks for each group (if any)
+            if np.any(mask_g_reward):
+                ax_raster_grouped.scatter(
+                    t_rel_all[mask_g_reward],
+                    sorted_trial_idx_all[mask_g_reward],
                     s=2,
-                    label="Rewarded trials",
+                    label=f"Rewarded (n={idx_rewarded.size})",
                 )
-            if np.any(mask_unrewarded):
-                ax_raster_reward.scatter(
-                    t_rel_all[mask_unrewarded],
-                    sorted_trial_idx_all[mask_unrewarded],
-                    s=2,
-                    label="Unrewarded trials",
+            else:
+                # Dummy point to keep legend entry
+                ax_raster_grouped.scatter([], [], s=2,
+                    label=f"Rewarded (n={idx_rewarded.size})"
                 )
 
-            ax_raster_reward.axvline(0.0, linestyle=":", linewidth=1.0)
-            ax_raster_reward.set_xlabel("Time from go cue (s)")
-            ax_raster_reward.set_ylabel("Sorted trial index")
-            ax_raster_reward.set_title("Lick raster (grouped by reward)")
-            ax_raster_reward.grid(True, alpha=0.3)
-            ax_raster_reward.legend()
+            if np.any(mask_g_unreward):
+                ax_raster_grouped.scatter(
+                    t_rel_all[mask_g_unreward],
+                    sorted_trial_idx_all[mask_g_unreward],
+                    s=2,
+                    label=f"Unrewarded resp (n={idx_unrewarded.size})",
+                )
+            else:
+                ax_raster_grouped.scatter([], [], s=2,
+                    label=f"Unrewarded resp (n={idx_unrewarded.size})"
+                )
+
+            if np.any(mask_g_noresp):
+                ax_raster_grouped.scatter(
+                    t_rel_all[mask_g_noresp],
+                    sorted_trial_idx_all[mask_g_noresp],
+                    s=2,
+                    label=f"No response (n={idx_noresp.size})",
+                )
+            else:
+                ax_raster_grouped.scatter([], [], s=2,
+                    label=f"No response (n={idx_noresp.size})"
+                )
+
+            ax_raster_grouped.axvline(0.0, linestyle=":", linewidth=1.0)
+            ax_raster_grouped.set_xlabel("Time from go cue (s)")
+            ax_raster_grouped.set_ylabel("Sorted trial index")
+            ax_raster_grouped.set_title("Lick raster\n(reward / unreward / no response)")
+            ax_raster_grouped.grid(True, alpha=0.3)
+            # Create legend and capture the Legend object
+            leg = ax_raster_grouped.legend(
+                fontsize=8,
+                markerscale=2,
+                handlelength=1.5,
+                framealpha=0.3
+            )
+
+            # Adjust legend *text* transparency
+            for text in leg.get_texts():
+                text.set_alpha(0.5)
         else:
-            ax_raster_reward.set_title("Lick raster (no valid trials)")
-            ax_raster_reward.set_xlabel("Time from go cue (s)")
-            ax_raster_reward.set_ylabel("Sorted trial index")
-            ax_raster_reward.grid(True, alpha=0.3)
+            ax_raster_grouped.set_title("Lick raster (no valid trials)")
+            ax_raster_grouped.set_xlabel("Time from go cue (s)")
+            ax_raster_grouped.set_ylabel("Sorted trial index")
+            ax_raster_grouped.grid(True, alpha=0.3)
     else:
-        ax_raster_reward.set_title("Lick raster (no licks found)")
-        ax_raster_reward.set_xlabel("Time from go cue (s)")
-        ax_raster_reward.set_ylabel("Sorted trial index")
-        ax_raster_reward.grid(True, alpha=0.3)
+        ax_raster_grouped.set_title("Lick raster (no licks found)")
+        ax_raster_grouped.set_xlabel("Time from go cue (s)")
+        ax_raster_grouped.set_ylabel("Sorted trial index")
+        ax_raster_grouped.grid(True, alpha=0.3)
 
     # ---------------------------------------------------------
-    # Row 5: ITI / delay / metrics summary (old row4)
+    # Row 5: ITI / delay / metrics summary
     # ---------------------------------------------------------
     plot_iti_hist(ax_iti, iti_time, bins=bins)
     if np.isfinite(mean_iti):
@@ -906,10 +967,10 @@ def plot_behavior_qc_summary(
         ax_delay.set_title(f"Delay duration (mean = {mean_delay:.2f} s)")
 
     # ---------- grouped metrics text panels ----------
-    ax_unused_1.clear()
-    ax_unused_2.clear()
-    ax_unused_1.axis("off")
-    ax_unused_2.axis("off")
+    ax_metrics_left.clear()
+    ax_metrics_right.clear()
+    ax_metrics_left.axis("off")
+    ax_metrics_right.axis("off")
 
     skip_keys = {
         "first_lick_latency_all",
@@ -1003,22 +1064,22 @@ def plot_behavior_qc_summary(
     left_text = "\n".join(grouped_lines[:mid])
     right_text = "\n".join(grouped_lines[mid:])
 
-    ax_unused_1.text(
+    ax_metrics_left.text(
         0.0,
         1.0,
         left_text,
-        transform=ax_unused_1.transAxes,
+        transform=ax_metrics_left.transAxes,
         ha="left",
         va="top",
         fontsize=10,
         fontfamily="monospace",
     )
 
-    ax_unused_2.text(
+    ax_metrics_right.text(
         0.0,
         1.0,
         right_text,
-        transform=ax_unused_2.transAxes,
+        transform=ax_metrics_right.transAxes,
         ha="left",
         va="top",
         fontsize=10,
