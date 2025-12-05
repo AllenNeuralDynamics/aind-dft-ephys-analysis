@@ -202,7 +202,8 @@ def fit_choice_logistic_regression_from_nwb(
     nwb_data: Any,
     lag: int = 10,
     session_id: Optional[str] = None,
-    model_name: str = "logistic_regression"
+    model_name: str = "logistic_regression",
+    verbose: bool = False, 
 ) -> Dict[str, Any]:
     """
     Fit a logistic regression model:
@@ -280,7 +281,8 @@ def fit_choice_logistic_regression_from_nwb(
     X_const = sm.add_constant(X)
     model = sm.Logit(y, X_const)
     result = model.fit(disp=False)
-    print(result.summary())
+    if verbose:
+        print(result.summary()) 
 
     pred_p_right = result.predict(X_const)
     pred_p_left = 1 - pred_p_right

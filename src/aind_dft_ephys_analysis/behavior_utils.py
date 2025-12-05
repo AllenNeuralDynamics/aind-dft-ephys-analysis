@@ -848,6 +848,7 @@ def generate_behavior_summary(
         'QLearning_L1F1_CK1_softmax',
         'QLearning_L2F1_softmax',
         'QLearning_L2F1_CK1_softmax',
+        'QLearning_L2F1_CKFull_softmax',
         'q_learning_Y1',
         'no_model'
     ],

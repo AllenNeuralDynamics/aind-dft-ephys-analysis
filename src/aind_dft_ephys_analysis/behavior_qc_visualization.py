@@ -1,15 +1,18 @@
 import io
+import os
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Dict, Tuple, Sequence
 
 from behavior_qc import compute_behavior_qc_from_nwb
 from general_visualization import plot_behavior_session
-
 from model_fitting import (
     fit_choice_logistic_regression_from_nwb,
     visualize_choice_logistic_regression,
 )
+from behavior_utils import generate_behavior_summary   # ← NEW IMPORT
+import pandas as pd                                    # ← NEW IMPORT
+
 
 # =========================================================
 # Generic 1D histogram panels
@@ -478,10 +481,13 @@ def _compute_lick_raster_with_side(
 # Helper: embed an existing Figure as an image into an Axes
 # =========================================================
 
-def _embed_figure_as_image(src_fig: plt.Figure, ax: plt.Axes) -> None:
+def _embed_figure_as_image(
+    src_fig: plt.Figure,
+    ax: plt.Axes,
+    pad_inches: float = 0.08,   # small margin around the embedded figure
+) -> None:
     """
-    Render a Matplotlib Figure to an RGB image (cropped tightly around
-    the content) and display it in the target Axes.
+    Render a Matplotlib Figure to an RGB image and display it in the target Axes.
     """
 
     if src_fig is None or src_fig.canvas is None:
@@ -497,15 +503,13 @@ def _embed_figure_as_image(src_fig: plt.Figure, ax: plt.Axes) -> None:
         ax.axis("off")
         return
 
-    # Render figure to an in-memory PNG with tight bbox so axes (incl. x-axis)
-    # are fully included and margins are trimmed.
     buf_io = io.BytesIO()
     try:
         src_fig.savefig(
             buf_io,
             format="png",
             bbox_inches="tight",
-            pad_inches=0.0,
+            pad_inches=pad_inches,   # ← was 0.0
             dpi=src_fig.dpi,
         )
         buf_io.seek(0)
@@ -528,6 +532,7 @@ def _embed_figure_as_image(src_fig: plt.Figure, ax: plt.Axes) -> None:
 
 
 
+
 # =========================================================
 # Wrapper: full QC figure (6×3, behavior rows span full width)
 # =========================================================
@@ -536,11 +541,11 @@ def plot_behavior_qc_summary(
     nwb_data: Any,
     response_latency_window: Optional[float] = 1.0,
     bins: int = 30,
-    figsize: Tuple[float, float] = (15.0, 26.0),
+    figsize: Tuple[float, float] = (18.0, 22.0),
     save_path: Optional[str] = None,
-    psth_window_go: Tuple[float, float] = (-5.0, 2.0),
+    psth_window_go: Tuple[float, float] = (-8.0, 4.0),
     psth_bin_width: float = 0.1,
-    psth_window_start: Tuple[float, float] = (0.0, 5.0),
+    psth_window_start: Tuple[float, float] = (0.0, 8.0),
     logreg_lag: int = 8,
 ):
     """
@@ -1118,5 +1123,411 @@ def plot_behavior_qc_summary(
 
     return fig, axes, metrics, trial_df
 
+# ---------------------------------------------------------------------
+# Helper: pull one per-trial array out of the summary
+# ---------------------------------------------------------------------
+def _get_q_array_from_summary(summary: pd.DataFrame, col_name: str) -> np.ndarray:
+    """
+    Extract a 1D float array from a summary column like
+    summary['QLearning_L1F1_CK1_softmax-QR'][0].
+
+    Assumes each cell stores a list/ndarray of per-trial values.
+    If the column does not exist, or there is no usable numeric data,
+    returns an empty array.
+    """
+    if col_name not in summary.columns:
+        return np.array([], dtype=float)
+
+    col = summary[col_name]
+    if len(col) == 0:
+        return np.array([], dtype=float)
+
+    cell = col.iloc[0]
+
+    if cell is None:
+        return np.array([], dtype=float)
+
+    if isinstance(cell, (list, tuple, np.ndarray)):
+        try:
+            arr = np.asarray(cell, dtype=float).ravel()
+        except (TypeError, ValueError):
+            return np.array([], dtype=float)
+    else:
+        try:
+            arr = np.array([float(cell)], dtype=float)
+        except (TypeError, ValueError):
+            return np.array([], dtype=float)
+
+    if arr.size == 0:
+        return np.array([], dtype=float)
+
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return np.array([], dtype=float)
+
+    return arr
 
 
+def _get_model_field_array(
+    summary: pd.DataFrame,
+    model_name: str,
+    field_key: str,
+) -> np.ndarray:
+    """
+    Wrapper around _get_q_array_from_summary that is tolerant to suffixes.
+
+    It first looks for an exact column name:
+        f"{model_name}-{field_key}"
+
+    If that does not exist, it searches for any column that:
+        - starts with f"{model_name}-"
+        - and whose suffix contains `field_key` as a substring.
+
+    This allows, e.g., requesting field_key="value" and matching
+    "ForagingCompareThreshold-value-1" automatically.
+    """
+    exact_name = f"{model_name}-{field_key}"
+    if exact_name in summary.columns:
+        return _get_q_array_from_summary(summary, exact_name)
+
+    prefix = f"{model_name}-"
+    candidates = [
+        c for c in summary.columns
+        if c.startswith(prefix) and field_key in c[len(prefix):]
+    ]
+    if not candidates:
+        return np.array([], dtype=float)
+
+    # Use the first candidate in sorted order for determinism
+    chosen = sorted(candidates)[0]
+    return _get_q_array_from_summary(summary, chosen)
+
+
+# ---------------------------------------------------------------------
+# Main function: hist row + scatter row per model
+# ---------------------------------------------------------------------
+def plot_qlearning_hist_and_scatter_from_nwb(
+    nwb_data: Any,
+    *,
+    bins: int = 30,
+    panel_width: float = 3,
+    panel_height: float = 2.3,
+) -> Tuple[plt.Figure, np.ndarray, pd.DataFrame]:
+    """
+    For each model, plot:
+
+      Row A (per model): histograms of model-specific latent variables
+      Row B (per model): scatter plots of model-specific latent pairs
+
+    Models included:
+      - QLearning_L1F1_CK1_softmax
+      - QLearning_L2F1_softmax
+      - QLearning_L2F1_CK1_softmax
+      - QLearning_L2F1_CKFull_softmax
+      - ForagingCompareThreshold (value / RPE only)
+
+    Any model-field combination that is missing or empty in `summary`
+    is skipped and the corresponding axis is turned off.
+    """
+    # Fonts
+    title_fs = 11          # per-panel title
+    label_fs = 9           # axis labels
+    tick_fs = 8            # tick labels
+    main_title_fs = 18     # figure title
+
+    # -----------------------------------------------------------------
+    # 1) Get summary
+    # -----------------------------------------------------------------
+    summary = generate_behavior_summary(nwb_data)
+
+    # -----------------------------------------------------------------
+    # 2) Per-model configuration
+    # -----------------------------------------------------------------
+    model_configs = [
+        {
+            "name": "QLearning_L1F1_CK1_softmax",
+            "label": "L1F1_CK1",
+            "hist_fields": ["QL", "QR", "chosenQ", "unchosenQ", "deltaQ", "sumQ", "RPE"],
+            "scatter_pairs": [
+                ("chosenQ", "deltaQ"),
+                ("chosenQ", "sumQ"),
+                ("deltaQ",  "sumQ"),
+                ("deltaQ",  "RPE"),
+                ("sumQ",    "RPE"),
+            ],
+        },
+        {
+            "name": "QLearning_L2F1_softmax",
+            "label": "L2F1",
+            "hist_fields": ["QL", "QR", "chosenQ", "unchosenQ", "deltaQ", "sumQ", "RPE"],
+            "scatter_pairs": [
+                ("chosenQ", "deltaQ"),
+                ("chosenQ", "sumQ"),
+                ("deltaQ",  "sumQ"),
+                ("deltaQ",  "RPE"),
+                ("sumQ",    "RPE"),
+            ],
+        },
+        {
+            "name": "QLearning_L2F1_CK1_softmax",
+            "label": "L2F1_CK1",
+            "hist_fields": ["QL", "QR", "chosenQ", "unchosenQ", "deltaQ", "sumQ", "RPE"],
+            "scatter_pairs": [
+                ("chosenQ", "deltaQ"),
+                ("chosenQ", "sumQ"),
+                ("deltaQ",  "sumQ"),
+                ("deltaQ",  "RPE"),
+                ("sumQ",    "RPE"),
+            ],
+        },
+        {
+            "name": "QLearning_L2F1_CKFull_softmax",
+            "label": "L2F1_CKFull",
+            "hist_fields": ["QL", "QR", "chosenQ", "unchosenQ", "deltaQ", "sumQ", "RPE"],
+            "scatter_pairs": [
+                ("chosenQ", "deltaQ"),
+                ("chosenQ", "sumQ"),
+                ("deltaQ",  "sumQ"),
+                ("deltaQ",  "RPE"),
+                ("sumQ",    "RPE"),
+            ],
+        },
+        # New non–Q-learning model: ForagingCompareThreshold
+        {
+            "name": "ForagingCompareThreshold",
+            "label": "Foraging",
+            # We conceptually want value and RPE; suffixes like "value-1" are handled
+            "hist_fields": ["value", "RPE"],
+            "scatter_pairs": [
+                ("value", "RPE"),
+            ],
+        },
+    ]
+
+    n_models = len(model_configs)
+    n_hist_cols = max(len(cfg["hist_fields"]) for cfg in model_configs)
+    n_scatter_cols = max(len(cfg["scatter_pairs"]) for cfg in model_configs)
+    n_cols = max(n_hist_cols, n_scatter_cols)
+
+    # 2 rows per model
+    n_rows = 2 * n_models
+
+    # Figure size based on desired panel size
+    fig_width = panel_width * n_cols
+    fig_height = panel_height * n_rows
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(fig_width, fig_height),
+        squeeze=False,
+        sharex=False,
+        sharey=False,
+    )
+
+    # -----------------------------------------------------------------
+    # 3) Fill panels
+    # -----------------------------------------------------------------
+    for m_idx, cfg in enumerate(model_configs):
+        model_name = cfg["name"]
+        model_label = cfg["label"]
+        hist_fields = cfg["hist_fields"]
+        scatter_pairs = cfg["scatter_pairs"]
+
+        row_hist = 2 * m_idx
+        row_scatter = 2 * m_idx + 1
+
+        # ---------- Histogram row ----------
+        for col, field in enumerate(hist_fields):
+            ax = axes[row_hist, col]
+
+            values = _get_model_field_array(summary, model_name, field)
+            if values.size == 0:
+                ax.axis("off")
+                continue
+
+            ax.hist(values, bins=bins)
+            ax.set_title(f"{model_label} – {field}", fontsize=title_fs)
+            ax.set_xlabel(field, fontsize=label_fs)
+            ax.set_ylabel("Count", fontsize=label_fs)
+            ax.tick_params(axis="both", labelsize=tick_fs)
+            ax.grid(True, alpha=0.3)
+
+        # Any extra histogram columns beyond hist_fields are turned off
+        for col in range(len(hist_fields), n_cols):
+            axes[row_hist, col].axis("off")
+
+        # ---------- Scatter row ----------
+        for col, (x_field, y_field) in enumerate(scatter_pairs):
+            ax = axes[row_scatter, col]
+
+            x_vals = _get_model_field_array(summary, model_name, x_field)
+            y_vals = _get_model_field_array(summary, model_name, y_field)
+
+            # Need both variables with data
+            if (x_vals.size == 0) or (y_vals.size == 0):
+                ax.axis("off")
+                continue
+
+            n = min(x_vals.size, y_vals.size)
+            x_vals = x_vals[:n]
+            y_vals = y_vals[:n]
+
+            mask = np.isfinite(x_vals) & np.isfinite(y_vals)
+            x_vals = x_vals[mask]
+            y_vals = y_vals[mask]
+
+            if x_vals.size == 0:
+                ax.axis("off")
+                continue
+
+            ax.scatter(x_vals, y_vals, s=8, alpha=0.5)
+            ax.set_xlabel(x_field, fontsize=label_fs)
+            ax.set_ylabel(y_field, fontsize=label_fs)
+            ax.set_title(
+                f"{model_label}: {x_field} vs {y_field}",
+                fontsize=title_fs,
+            )
+            ax.tick_params(axis="both", labelsize=tick_fs)
+            ax.grid(True, alpha=0.3)
+
+        # Turn off any scatter columns beyond the defined pairs
+        for col in range(len(scatter_pairs), n_cols):
+            axes[row_scatter, col].axis("off")
+
+    # -----------------------------------------------------------------
+    # 4) Global formatting
+    # -----------------------------------------------------------------
+    fig.suptitle(
+        "Q-learning and Foraging model latents: histograms and pairwise relationships",
+        fontsize=main_title_fs,
+        y=0.95,
+    )
+
+    fig.subplots_adjust(
+        top=0.90,
+        hspace=0.55,
+        wspace=0.45,
+    )
+
+    return fig, axes, summary
+
+
+
+
+def save_combined_behavior_and_qlearning_summary(
+    nwb_data: Any,
+    *,
+    qc_kwargs: Optional[Dict] = None,
+    q_kwargs: Optional[Dict] = None,
+    save_dir: Optional[str] = None,     # ← NEW
+    save_basepath: Optional[str] = "behavior_qlearning_summary",
+    formats: Sequence[str] = ("pdf", "png"),
+    dpi: int = 300,
+) -> Tuple[plt.Figure, pd.DataFrame]:
+
+    """
+    Generate:
+      1) Behavior QC figure
+      2) Q-learning / Foraging latent figure
+    Combine them vertically and save in multiple formats.
+
+    Parameters
+    ----------
+    save_dir : str or None
+        Directory to save into (created automatically if missing).
+        If None → saves in current working directory.
+    save_basepath : str
+        Base filename *without extension*.
+    formats : list[str]
+        Formats to save, e.g. ("pdf","png","eps").
+    """
+
+    if qc_kwargs is None:
+        qc_kwargs = {}
+    if q_kwargs is None:
+        q_kwargs = {}
+
+    # ----------------------------------------------------------
+    # 1. Generate the two figures
+    # ----------------------------------------------------------
+    fig_qc, _, _, _ = plot_behavior_qc_summary(
+        nwb_data,
+        **qc_kwargs,
+    )
+
+    fig_q, _, summary = plot_qlearning_hist_and_scatter_from_nwb(
+        nwb_data,
+        **q_kwargs,
+    )
+
+    # ----------------------------------------------------------
+    # 2. Compute combined figure size
+    # ----------------------------------------------------------
+    w_qc, h_qc = fig_qc.get_size_inches()
+    w_q, h_q = fig_q.get_size_inches()
+
+    fig_width = max(w_qc, w_q)
+    fig_height = h_qc + h_q
+
+    combined_fig = plt.figure(figsize=(fig_width, fig_height))
+    gs = combined_fig.add_gridspec(
+        2, 1,
+        height_ratios=[h_qc, h_q]
+    )
+
+    ax_top = combined_fig.add_subplot(gs[0, 0])
+    ax_bottom = combined_fig.add_subplot(gs[1, 0])
+
+    # ----------------------------------------------------------
+    # 3. Embed the figures as images
+    # ----------------------------------------------------------
+    _embed_figure_as_image(fig_qc, ax_top)
+    _embed_figure_as_image(fig_q, ax_bottom)
+
+    plt.close(fig_qc)
+    plt.close(fig_q)
+
+    combined_fig.suptitle(
+        "Behavior QC and model latent summaries",
+        fontsize=20,
+        y=0.96,        # Lower than default to avoid cutting in PDFs
+    )
+
+    combined_fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.95])
+
+    # ----------------------------------------------------------
+    # 4. Save
+    # ----------------------------------------------------------
+    if save_basepath is not None:
+
+        # Determine final directory
+        if save_dir is None:
+            save_dir = "."
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Full base path including directory
+        full_base = os.path.join(save_dir, save_basepath)
+
+        for ext in formats:
+            ext = ext.replace(".", "").lower()
+            if not ext:
+                continue
+
+            outfile = f"{full_base}.{ext}"
+
+            if ext in ("pdf", "eps", "svg"):
+                # Vector formats → do NOT use tight bbox
+                combined_fig.savefig(outfile, dpi=dpi)
+            else:
+                # Raster formats → use bbox tight
+                combined_fig.savefig(
+                    outfile,
+                    dpi=dpi,
+                    bbox_inches="tight",
+                    pad_inches=0.05,
+                )
+
+            print(f"Saved: {outfile}")
+
+    return combined_fig, summary
