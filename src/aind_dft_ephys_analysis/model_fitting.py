@@ -198,282 +198,302 @@ def fit_q_learning_model(
     }
 
 
-def build_choice_design_matrix(
-    nwb_data: Optional[Union[Any, Sequence[Any]]] = None,
-    session_names: Optional[Union[str, Sequence[str]]] = None,
-    *,
+def fit_choice_logistic_regression_from_nwb(
+    nwb_data: Any,
     lag: int = 10,
-    pad_mode: str = "zero",
-) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    session_id: Optional[str] = None,
+    model_name: str = "logistic_regression"
+) -> Dict[str, Any]:
     """
-    Build the design matrix **X**, outcome vector **y**, and a trial-index
-    array for a history-kernel logistic-regression model of choice behavior.
+    Fit a logistic regression model:
+        logit(P(cr(t)=1)) = β0
+                            + Σ_i β^R_i (Rr(t-i)-Rl(t-i))
+                            + Σ_i β^NR_i (Nr(t-i)-Nl(t-i))
 
-    Either **nwb_data** *or* **session_names** can be supplied:
+    Only the fields REQUIRED for fitting are used:
+        - animal_response (0 left, 1 right, 2 no response)
+        - rewarded_historyL, rewarded_historyR
+        - laser_on_trial (OPTIONALLY saved, not used for fitting)
 
-    * If *session_names* is provided, each session is opened with
-      :func:`NWBUtils.read_ophys_or_behavior_nwb`, processed, and closed
-      immediately to conserve memory; *nwb_data* is ignored.
-    * If *session_names* is *None*, *nwb_data* must be a single NWB object or
-      an iterable of pre-opened NWB objects.
-
-    Mathematical model
-    ------------------
-    ::
-
-        logit(P(c_r(t)=1)) = β0
-                             + sum_{i=1}^{L} β_i^R   * (R_r(t−i) − R_l(t−i))
-                             + sum_{i=1}^{L} β_i^{NR} * (N_r(t−i) − N_l(t−i))
-
-    Parameters
-    ----------
-    nwb_data : NWBFile or Sequence[NWBFile], optional
-        One or more pre-opened NWB handles. Ignored when *session_names* is
-        provided.
-    session_names : str or Sequence[str], optional
-        Session identifiers such as ``"776293_2025-02-14_15-19-17"``. May be a
-        single string or a list/tuple of strings.
-    lag : int, default 10
-        Number of past trials (:math:`L`) to include in the history kernel.
-    pad_mode : {"zero", "repeat"}, default "zero"
-        Strategy for padding the first *lag* trials, where full history is not
-        available. ``"zero"`` pads with zeros; ``"repeat"`` duplicates the
-        earliest valid history vector.
-
-    Returns
-    -------
-    X : ndarray, shape (n_trials, 2*lag + 1)
-        Design matrix with an intercept column followed by, for each lag
-        1 … *L*, the contrast terms ``R_r − R_l`` and ``N_r − N_l``.
-    y : ndarray, shape (n_trials,)
-        Binary outcome vector (1 = right choice, 0 = left choice).
-    trial_idx : ndarray, shape (n_trials,)
-        Absolute trial index within each session, useful for mapping results
-        back to raw data.
-
-    Notes
-    -----
-    * Trials with no response are excluded from **X** and **y**.
-    * The function treats reward as a binary indicator.
-    * When multiple sessions are supplied, **X**, **y**, and **trial_idx**
-      are concatenated in session order.
+    The function returns only:
+        - result (statsmodels LogitResults)
+        - predicted probabilities
+        - used_trial_indices
+        - lag
     """
 
-    # Decide which source to use
-    if session_names is not None:
-        items: List[Union[Any, str]] = (
-            [session_names] if isinstance(session_names, str) else list(session_names)
-        )
-    else:
-        if nwb_data is None:
-            raise ValueError("Either nwb_data or session_names must be provided")
-        items = list(nwb_data) if isinstance(nwb_data, (list, tuple)) else [nwb_data]
+    if session_id is None:
+        session_id = "session_0"
 
-    X_all: List[List[int]] = []
-    y_all: List[int] = []
-    idx_all: List[int] = []
+    trials = nwb_data.trials
 
-    for sess_id, item in enumerate(items):
-        opened_here = False
-        if isinstance(item, str):
-            nwb = NWBUtils.read_ophys_or_behavior_nwb(session_name=item)
-            opened_here = True
-        else:
-            nwb = item
+    # Required fields
+    animal_response = np.array(trials["animal_response"][:])  # 0,1,2
+    reward_left = np.array(trials["rewarded_historyL"][:]).astype(float)
+    reward_right = np.array(trials["rewarded_historyR"][:]).astype(float)
 
-        if nwb is None:
+    # Optional but kept for potential grouping (not used in fitting)
+    laser_on_trial = np.array(trials["laser_on_trial"][:]).astype(int)
+
+    n_trials = len(animal_response)
+    if n_trials <= lag:
+        raise ValueError(f"Not enough trials ({n_trials}) for lag={lag}.")
+
+    # Build Rr, Rl, Nr, Nl
+    Rr = np.zeros(n_trials, dtype=int)
+    Rl = np.zeros(n_trials, dtype=int)
+    Nr = np.zeros(n_trials, dtype=int)
+    Nl = np.zeros(n_trials, dtype=int)
+
+    for t in range(n_trials):
+        if animal_response[t] == 0:  # left chosen
+            Rl[t] = reward_left[t]
+            Nl[t] = 1 - reward_left[t]
+        elif animal_response[t] == 1:  # right chosen
+            Rr[t] = reward_right[t]
+            Nr[t] = 1 - reward_right[t]
+
+    X_rows, y_list, used_indices = [], [], []
+
+    for t in range(lag, n_trials):
+        if animal_response[t] not in (0, 1):
             continue
 
-        try:
-            trials = nwb.trials
-            resp = np.asarray(trials["animal_response"], dtype=int)
-            rL = np.asarray(trials["rewarded_historyL"], dtype=int)
-            rR = np.asarray(trials["rewarded_historyR"], dtype=int)
+        row = []
+        for i in range(1, lag+1):
+            row.append(Rr[t-i] - Rl[t-i])   # Rewarded diff
+        for i in range(1, lag+1):
+            row.append(Nr[t-i] - Nl[t-i])   # Unrewarded diff
 
-            valid_mask = (resp == 0) | (resp == 1)
-            valid_idx = np.where(valid_mask)[0]
-            if valid_idx.size <= lag and pad_mode is None:
-                continue
+        X_rows.append(row)
+        y_list.append(animal_response[t])
+        used_indices.append(t)
 
-            resp_c, rL_c, rR_c = resp[valid_mask], rL[valid_mask], rR[valid_mask]
-            Rl = (resp_c == 0) & (rL_c == 1)
-            Rr = (resp_c == 1) & (rR_c == 1)
-            Nl = (resp_c == 0) & (rL_c == 0)
-            Nr = (resp_c == 1) & (rR_c == 0)
+    if len(X_rows) == 0:
+        raise ValueError("No valid trials for logistic regression.")
 
-            n_valid = resp_c.size
-            start_t = 0 if pad_mode == "zero" else lag
+    X = np.array(X_rows, float)
+    y = np.array(y_list, int)
+    used_indices = np.array(used_indices, int)
 
-            for t in range(start_t, n_valid):
-                row: List[int] = []
-                for i in range(1, lag + 1):
-                    idx = t - i
-                    row.append(0 if idx < 0 else int(Rr[idx]) - int(Rl[idx]))
-                for i in range(1, lag + 1):
-                    idx = t - i
-                    row.append(0 if idx < 0 else int(Nr[idx]) - int(Nl[idx]))
+    # Add intercept and fit
+    X_const = sm.add_constant(X)
+    model = sm.Logit(y, X_const)
+    result = model.fit(disp=False)
+    print(result.summary())
 
-                X_all.append(row)
-                y_all.append(int(resp_c[t]))
-                idx_all.append((sess_id << 32) + int(valid_idx[t]))
-        except Exception as err:
-            # Catch and report any error for this session, then continue
-            print(f"[log-reg] ✖ error processing session {item}: {err}")
-            # Skip to the next item without aborting the whole routine
-            continue
-        finally:
-            if opened_here and hasattr(nwb, "io"):
-                try:
-                    nwb.io.close()
-                except Exception:
-                    pass
+    pred_p_right = result.predict(X_const)
+    pred_p_left = 1 - pred_p_right
 
-    if not X_all:
-        print("[log-reg] ✖ no analysable rows across sessions")
-        return None
-
-    X_arr = sm.add_constant(np.asarray(X_all, dtype=float))
-    y_arr = np.asarray(y_all, dtype=int)
-    idx_arr = np.asarray(idx_all, dtype=int)
-    return X_arr, y_arr, idx_arr
-
-def fit_choice_logistic_regression(
-    X: np.ndarray,
-    y: np.ndarray,
-    *,
-    trial_indices: Optional[np.ndarray] = None,
-    **glm_kwargs,
-) -> Optional[Tuple[BinaryResults, Dict[str, Any]]]:
-    """Fit a logistic regression on the provided design matrix."""
-
-    if X.ndim != 2 or y.ndim != 1 or X.shape[0] != y.shape[0]:
-        raise ValueError("X and y must have matching first dimension (rows)")
-
-    try:
-        result = sm.Logit(y, X).fit(disp=False, **glm_kwargs)
-    except Exception as err:
-        print(f"[log-reg] ✖ fit failed: {err}")
-        return None
-
-    p_right = result.predict()
-    p_left = 1.0 - p_right
-
-    if trial_indices is None or len(trial_indices) != len(y):
-        trial_indices = np.arange(len(y))
-
-    fit_dict: Dict[str, Any] = {
+    return {
+        "model_name": model_name,
         "fit_result": result,
-        "model_summary": result.summary().as_text(),
-        "fitted_latent_variables": {"choice_prob": [p_left, p_right]},
-        "used_trial_indices": trial_indices,
+        "used_trial_indices": used_indices,
+        "fitted_latent_variables": {
+            "choice_prob": [pred_p_left, pred_p_right]
+        },
+        "metadata": {
+            "lag": lag,
+            "column_names": ["const"]
+                           + [f"Rdiff_lag{i}" for i in range(1, lag+1)]
+                           + [f"Ndiff_lag{i}" for i in range(1, lag+1)]
+        }
     }
-    return result, fit_dict
-
-
-
 def visualize_choice_logistic_regression(
-    result: BinaryResults,
-    *,
-    lag: Optional[int] = None,
-    used_trial_indices: Optional[np.ndarray] = None,
+    fit_output: Dict[str, Any],
+    plot_coefficients: bool = True,
+    plot_predictions: bool = True,
     title_font_size: int = 16,
     label_font_size: int = 12,
-) -> None:
-    """Plot kernel coefficients and fit quality for a fitted logistic model.
+    figsize_coef: Tuple[int, int] = (13, 4),
+    figsize_pred: Tuple[int, int] = (13, 4),
+    legend_font_size: Optional[int] = 14,
+) -> Dict[str, Any]:
+    """
+    Visualize logistic regression results with improved external legends
+    and goodness-of-fit (GOF) matrix block.
 
-    Parameters
-    ----------
-    result : BinaryResults
-        Object returned by :pyclass:`statsmodels.Logit.fit`.
-    lag : int, optional
-        History length used when fitting. If *None*, it is inferred from the
-        parameter vector length, which must follow the pattern ``1 + 2·lag``.
-    used_trial_indices : np.ndarray, optional
-        Trial indices corresponding to rows in the design matrix – used for
-        the x‑axis on the probability/choice panel.
-    title_font_size / label_font_size : int, optional
-        Font sizes for figure elements.
+    New parameters:
+    --------------
+    figsize_coef : tuple
+        Size of the coefficient figure.
+
+    figsize_pred : tuple
+        Size of the prediction figure.
+
+    legend_font_size : int or None
+        Font size for external legends. If None, auto = label_font_size - 4.
     """
 
-    # ─── Infer lag automatically if not provided ──────────────────────────
-    if lag is None:
-        n_coeff = len(result.params)
-        lag = (n_coeff - 1) // 2
-        if 1 + 2 * lag != n_coeff or lag <= 0:
-            raise ValueError(
-                "Could not infer lag – parameter vector length does not match 1 + 2·lag pattern"
-            )
+    result = fit_output["fit_result"]
+    used_indices = fit_output["used_trial_indices"]
+    metadata = fit_output["metadata"]
+    lag = metadata["lag"]
 
-    # ─── Extract coefficients and CI half‑widths ──────────────────────────
+    # ------------------------------
+    # Extract goodness-of-fit stats
+    # ------------------------------
+    gof = {
+        "nobs": int(result.nobs),
+        "pseudo_r2": float(result.prsquared),
+        "llf": float(result.llf),
+        "llnull": float(result.llnull),
+        "llr_pvalue": float(result.llr_pvalue),
+        "aic": float(result.aic),
+        "bic": float(result.bic),
+        "converged": bool(getattr(result, "converged", True)),
+    }
+
     params = result.params
-    conf_int = result.conf_int(alpha=0.05)
+    conf_int = result.conf_int()
     ci_half = (conf_int[:, 1] - conf_int[:, 0]) / 2.0
 
+    # Extract coefficients
     intercept = params[0]
     intercept_ci = ci_half[0]
 
-    rewarded = params[1 : lag + 1]
-    rewarded_ci = ci_half[1 : lag + 1]
+    rewarded_coeffs = params[1:lag+1]
+    rewarded_ci = ci_half[1:lag+1]
 
-    unrewarded = params[lag + 1 : 2 * lag + 1]
-    unrewarded_ci = ci_half[lag + 1 : 2 * lag + 1]
+    unrewarded_coeffs = params[lag+1:2*lag+1]
+    unrewarded_ci = ci_half[lag+1:2*lag+1]
 
-    x_lags = np.arange(1, lag + 1)
+    x_vals = np.arange(1, lag + 1)
 
-    # ─── Coefficient plot ─────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.bar(0, intercept, width=0.4, color="lightblue", edgecolor="black", label="Intercept")
-    ax.errorbar(0, intercept, yerr=intercept_ci, fmt="none", ecolor="black", capsize=4)
+    # Legend font size (user overrides default)
+    if legend_font_size is None:
+        legend_font_size = max(6, label_font_size - 4)
 
-    ax.errorbar(
-        x_lags,
-        rewarded,
-        yerr=rewarded_ci,
-        fmt="-o",
-        color="blue",
-        ecolor="blue",
-        capsize=4,
-        label="Rewarded",
-    )
+    gof_font_size = label_font_size
 
-    ax.errorbar(
-        x_lags,
-        unrewarded,
-        yerr=unrewarded_ci,
-        fmt="-o",
-        color="red",
-        ecolor="red",
-        capsize=4,
-        label="Unrewarded",
-    )
+    out: Dict[str, Any] = {
+        "coefficients": None,
+        "predictions": None,
+        "goodness_of_fit": gof,
+    }
 
-    ax.set_xticks(np.arange(0, lag + 1))
-    ax.set_xticklabels(["0"] + [str(i) for i in x_lags])
-    ax.set_xlabel("Lag (0 = intercept)", fontsize=label_font_size)
-    ax.set_ylabel("Coefficient value", fontsize=label_font_size)
-    ax.set_title("Logistic regression coefficients (95% CI)", fontsize=title_font_size)
-    ax.legend()
-    plt.tight_layout()
-    plt.show()
+    # --------------------------------------------------
+    # 1. Coefficient plot with external compact legend
+    # --------------------------------------------------
+    if plot_coefficients:
+        fig_coef, ax_coef = plt.subplots(figsize=figsize_coef)
 
-    # ─── Probability vs. choice plot ──────────────────────────────────────
-    pred_p_right = result.predict()
-    actual_choice = result.model.endog
+        ax_coef.bar(
+            0,
+            intercept,
+            color="lightblue",
+            edgecolor="black",
+            width=0.4,
+            label="Intercept",
+        )
+        ax_coef.errorbar(0, intercept, yerr=intercept_ci, fmt="none",
+                         ecolor="black", capsize=4)
 
-    if used_trial_indices is None or len(used_trial_indices) != len(pred_p_right):
-        x_axis = np.arange(len(pred_p_right))
-    else:
-        x_axis = used_trial_indices
+        ax_coef.errorbar(
+            x_vals, rewarded_coeffs, yerr=rewarded_ci,
+            fmt="-o", color="blue", label="Rewarded"
+        )
+        ax_coef.errorbar(
+            x_vals, unrewarded_coeffs, yerr=unrewarded_ci,
+            fmt="-o", color="red", label="Unrewarded"
+        )
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(x_axis, pred_p_right, "-o", color="blue", label="Predicted P(Right)", alpha=0.7)
-    ax.scatter(x_axis, actual_choice, color="red", label="Actual choice", alpha=0.5)
-    ax.set_xlabel("Trial index (filtered)")
-    ax.set_ylabel("Probability / choice")
-    ax.set_title("Predicted probability vs. actual choice")
-    ax.legend()
-    plt.tight_layout()
-    plt.show()
+        # Axis formatting
+        ax_coef.set_xticks(np.arange(0, lag + 1))
+        ax_coef.set_xticklabels(["0"] + [str(i) for i in range(1, lag + 1)],
+                                fontsize=label_font_size)
+        ax_coef.set_xlabel("Lag [0=Intercept]", fontsize=label_font_size)
+        ax_coef.set_ylabel("Coefficient Value", fontsize=label_font_size)
+        ax_coef.set_title("Logistic Regression Coefficients (95% CI)",
+                          fontsize=title_font_size)
 
+        ax_coef.grid(True, alpha=0.3)
+        ax_coef.tick_params(axis="both", labelsize=label_font_size)
 
+        # Legend
+        handles, labels = ax_coef.get_legend_handles_labels()
+        ax_coef.legend(
+            handles, labels,
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            fontsize=legend_font_size,
+            frameon=True,
+            borderpad=0.2,
+            labelspacing=0.2,
+            handlelength=1.1,
+            handletextpad=0.3,
+            markerscale=0.6,
+            title="Predictors",
+            title_fontsize=legend_font_size,
+        )
+
+        # GOF block
+        gof_lines = [
+            f"N used:    {gof['nobs']}",
+            f"Pseudo R²: {gof['pseudo_r2']:.4f}",
+            f"LogLik:    {gof['llf']:.2f}",
+            f"Null LL:   {gof['llnull']:.2f}",
+            f"LLR p:     {gof['llr_pvalue']:.2e}",
+            f"AIC:       {gof['aic']:.1f}",
+            f"BIC:       {gof['bic']:.1f}",
+            f"Conv.:     {gof['converged']}",
+        ]
+        ax_coef.text(
+            1.02, 0.0, "\n".join(gof_lines),
+            transform=ax_coef.transAxes,
+            ha="left", va="bottom",
+            fontsize=gof_font_size,
+            family="monospace",
+        )
+
+        fig_coef.tight_layout(rect=[0.0, 0.0, 0.75, 1.0])
+        out["coefficients"] = (fig_coef, ax_coef)
+
+    # --------------------------------------------------
+    # 2. Predicted vs Actual plot
+    # --------------------------------------------------
+    if plot_predictions:
+        pred_p_right = result.predict()
+        actual = result.model.endog
+
+        fig_pred, ax_pred = plt.subplots(figsize=figsize_pred)
+
+        ax_pred.plot(
+            used_indices, pred_p_right,
+            "-o", markersize=4, color="blue", label="Pred P(Right)"
+        )
+        ax_pred.scatter(
+            used_indices, actual,
+            s=16, color="red", alpha=0.5, label="Actual (0/1)"
+        )
+
+        ax_pred.set_xlabel("Trial Index (Regression Used Trials)",
+                           fontsize=label_font_size)
+        ax_pred.set_ylabel("Probability / Choice",
+                           fontsize=label_font_size)
+        ax_pred.set_title("Predicted vs Actual Choices",
+                          fontsize=title_font_size)
+
+        ax_pred.grid(True, alpha=0.3)
+        ax_pred.tick_params(axis="both", labelsize=label_font_size)
+
+        # Legend
+        handles, labels = ax_pred.get_legend_handles_labels()
+        ax_pred.legend(
+            handles, labels,
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            fontsize=legend_font_size,
+            frameon=True,
+            borderpad=0.2,
+            labelspacing=0.2,
+            handlelength=1.2,
+            handletextpad=0.3,
+            markerscale=0.7,
+        )
+
+        fig_pred.tight_layout(rect=[0.0, 0.0, 0.78, 1.0])
+        out["predictions"] = (fig_pred, ax_pred)
+
+    return out
 

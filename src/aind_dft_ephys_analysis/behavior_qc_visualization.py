@@ -6,6 +6,10 @@ from typing import Any, Optional, Tuple
 from behavior_qc import compute_behavior_qc_from_nwb
 from general_visualization import plot_behavior_session
 
+from model_fitting import (
+    fit_choice_logistic_regression_from_nwb,
+    visualize_choice_logistic_regression,
+)
 
 # =========================================================
 # Generic 1D histogram panels
@@ -532,22 +536,31 @@ def plot_behavior_qc_summary(
     nwb_data: Any,
     response_latency_window: Optional[float] = 1.0,
     bins: int = 30,
-    figsize: Tuple[float, float] = (15.0, 22.0),
+    figsize: Tuple[float, float] = (15.0, 26.0),
     save_path: Optional[str] = None,
     psth_window_go: Tuple[float, float] = (-5.0, 2.0),
     psth_bin_width: float = 0.1,
     psth_window_start: Tuple[float, float] = (0.0, 5.0),
+    logreg_lag: int = 8,
 ):
     """
-    High-level QC visualization for one behavior session (5×4 layout).
+    High-level QC visualization for one behavior session (6×4 layout).
 
     Rows:
       0: behavior session with model      (spans all 4 columns)
       1: behavior session without model   (spans all 4 columns)
-      2: first-lick latency (all) | first-lick latency (L vs R) | ITI histogram | delay histogram
-      3: go-aligned PSTH (all)    | go-aligned PSTH (reward vs no-reward)
-         start-aligned PSTH (all) | start-aligned PSTH (by reward)
-      4: lick raster (all)        | lick raster (grouped by reward) | (unused) | (unused)
+
+      2: logistic regression coefficients | logistic predicted vs actual
+         (two panels, each occupying 1 column)
+
+      3: first-lick latency (all)         | first-lick latency (L vs R)
+         go-aligned PSTH (all)            | go-aligned PSTH (reward vs no-reward)
+
+      4: start-aligned PSTH (all)         | start-aligned PSTH (by reward)
+         lick raster (all)                | lick raster (grouped by reward)
+
+      5: ITI histogram                    | delay histogram
+         metrics summary (left)           | metrics summary (right)
     """
     # ---------------------------------------------------------
     # 1) Compute QC metrics and per-trial table
@@ -591,18 +604,42 @@ def plot_behavior_qc_summary(
     )
 
     # ---------------------------------------------------------
-    # 2) Create figure and axes via GridSpec (5×4)
+    # 1b) Logistic regression fit + figures
+    # ---------------------------------------------------------
+    logreg_fig_coef = None
+    logreg_fig_pred = None
+
+    try:
+        fit_output = fit_choice_logistic_regression_from_nwb(
+            nwb_data,
+            lag=logreg_lag,
+        )
+        viz_out = visualize_choice_logistic_regression(
+            fit_output,
+            plot_coefficients=True,
+            plot_predictions=True,
+            title_font_size=16,
+            label_font_size=14,
+        )
+        logreg_fig_coef, _ = viz_out["coefficients"]
+        logreg_fig_pred, _ = viz_out["predictions"]
+    except Exception as e:
+        print(f"Warning: logistic regression in plot_behavior_qc_summary failed: {e}")
+        logreg_fig_coef = None
+        logreg_fig_pred = None
+
+    # ---------------------------------------------------------
+    # 2) Create figure and axes via GridSpec (6×4)
     # ---------------------------------------------------------
     fig = plt.figure(figsize=figsize)
 
-    # Behavior rows taller
     gs = fig.add_gridspec(
-        5,
+        6,
         4,
-        height_ratios=[1, 1, 1.0, 1.0, 1.0],
+        height_ratios=[1.1, 1.1, 1.0, 1.0, 1.0, 1.0],
     )
 
-    axes = np.empty((5, 4), dtype=object)
+    axes = np.empty((6, 4), dtype=object)
 
     # Row 0: behavior with model spans all columns
     ax_behavior_model = fig.add_subplot(gs[0, :])
@@ -618,42 +655,95 @@ def plot_behavior_qc_summary(
     axes[1, 2] = ax_behavior_nomodel
     axes[1, 3] = ax_behavior_nomodel
 
-    # Row 2: latency + ITI + delay
-    axes[2, 0] = fig.add_subplot(gs[2, 0])
-    axes[2, 1] = fig.add_subplot(gs[2, 1])
-    axes[2, 2] = fig.add_subplot(gs[2, 2])
-    axes[2, 3] = fig.add_subplot(gs[2, 3])
+    # ------------------------
+    # Row 2: logistic regression
+    # ------------------------
 
-    ax_lat_all = axes[2, 0]
-    ax_lat_lr = axes[2, 1]
-    ax_psth_all_go = axes[2, 2]
-    ax_psth_reward_go = axes[2, 3]
+    # Create a nested GridSpec inside row 2 with custom width ratios
+    gs_log = gs[2, :].subgridspec(1, 2, width_ratios=[1, 1.0], wspace=0.05)
 
-    # Row 3: PSTHs
+    ax_log_coef = fig.add_subplot(gs_log[0, 0])   # wider panel
+    ax_log_pred = fig.add_subplot(gs_log[0, 1])   # narrower panel
+
+    # Register them in axes[] array
+    axes[2, 0] = ax_log_coef
+    axes[2, 1] = ax_log_coef
+    axes[2, 2] = ax_log_pred
+    axes[2, 3] = ax_log_pred
+
+
+
+    # Row 3: (old row2) latency + go-aligned PSTH
     axes[3, 0] = fig.add_subplot(gs[3, 0])
     axes[3, 1] = fig.add_subplot(gs[3, 1])
     axes[3, 2] = fig.add_subplot(gs[3, 2])
     axes[3, 3] = fig.add_subplot(gs[3, 3])
-    
-    ax_psth_start_all = axes[3, 0]
-    ax_psth_start_reward = axes[3, 1]
-    ax_raster_all = axes[3, 2]
-    ax_raster_reward = axes[3, 3]
 
+    ax_lat_all = axes[3, 0]
+    ax_lat_lr = axes[3, 1]
+    ax_psth_all_go = axes[3, 2]
+    ax_psth_reward_go = axes[3, 3]
 
-        # Row 4: rasters / summary panels
+    # Row 4: (old row3) start-aligned PSTHs + rasters
     axes[4, 0] = fig.add_subplot(gs[4, 0])
     axes[4, 1] = fig.add_subplot(gs[4, 1])
     axes[4, 2] = fig.add_subplot(gs[4, 2])
     axes[4, 3] = fig.add_subplot(gs[4, 3])
 
-    ax_iti = axes[4, 0]
-    ax_delay = axes[4, 1]
-    ax_unused_1 = axes[4, 2]   # will use for metrics summary
-    ax_unused_2 = axes[4, 3]   # keep empty for now
+    ax_psth_start_all = axes[4, 0]
+    ax_psth_start_reward = axes[4, 1]
+    ax_raster_all = axes[4, 2]
+    ax_raster_reward = axes[4, 3]
+
+    # Row 5: (old row4) ITI / delay / metrics summary
+    axes[5, 0] = fig.add_subplot(gs[5, 0])
+    axes[5, 1] = fig.add_subplot(gs[5, 1])
+    axes[5, 2] = fig.add_subplot(gs[5, 2])
+    axes[5, 3] = fig.add_subplot(gs[5, 3])
+
+    ax_iti = axes[5, 0]
+    ax_delay = axes[5, 1]
+    ax_unused_1 = axes[5, 2]   # metrics summary left
+    ax_unused_2 = axes[5, 3]   # metrics summary right
 
     # ---------------------------------------------------------
-    # Row 2: first-lick latency, ITI, delay
+    # Row 2: logistic regression (coeffs + predictions)
+    # ---------------------------------------------------------
+    # coeffs
+    if logreg_fig_coef is not None:
+        _embed_figure_as_image(logreg_fig_coef, ax_log_coef)
+        plt.close(logreg_fig_coef)
+    else:
+        ax_log_coef.axis("off")
+        ax_log_coef.text(
+            0.5,
+            0.5,
+            "Logistic regression unavailable",
+            ha="center",
+            va="center",
+            transform=ax_log_coef.transAxes,
+            fontsize=10,
+        )
+
+    # predicted vs actual
+    if logreg_fig_pred is not None:
+        _embed_figure_as_image(logreg_fig_pred, ax_log_pred)
+        plt.close(logreg_fig_pred)
+    else:
+        ax_log_pred.axis("off")
+        ax_log_pred.text(
+            0.5,
+            0.5,
+            "Logistic regression unavailable",
+            ha="center",
+            va="center",
+            transform=ax_log_pred.transAxes,
+            fontsize=10,
+        )
+
+
+    # ---------------------------------------------------------
+    # Row 3: first-lick latency + go-aligned PSTHs (old row2)
     # ---------------------------------------------------------
     _plot_hist_panel(
         ax_lat_all,
@@ -681,17 +771,6 @@ def plot_behavior_qc_summary(
     ax_lat_lr.grid(True, alpha=0.3)
     ax_lat_lr.legend()
 
-    plot_iti_hist(ax_iti, iti_time, bins=bins)
-    if np.isfinite(mean_iti):
-        ax_iti.set_title(f"ITI duration (mean = {mean_iti:.2f} s)")
-
-    plot_delay_hist(ax_delay, delay_time, bins=bins)
-    if np.isfinite(mean_delay):
-        ax_delay.set_title(f"Delay duration (mean = {mean_delay:.2f} s)")
-
-    # ---------------------------------------------------------
-    # Row 3: PSTHs
-    # ---------------------------------------------------------
     plot_lick_rate_psth_after_iti(
         ax_psth_all_go,
         left_licks=left_licks,
@@ -713,6 +792,9 @@ def plot_behavior_qc_summary(
         psth_bin_width=psth_bin_width,
     )
 
+    # ---------------------------------------------------------
+    # Row 4: start-aligned PSTHs + rasters (old row3)
+    # ---------------------------------------------------------
     plot_lick_rate_psth_from_start_before_go(
         ax_psth_start_all,
         left_licks=left_licks,
@@ -734,9 +816,7 @@ def plot_behavior_qc_summary(
         psth_bin_width=psth_bin_width,
     )
 
-    # ---------------------------------------------------------
-    # Row 4: lick rasters (go-aligned)
-    # ---------------------------------------------------------
+    # Lick rasters (go-aligned)
     if t_rel_all.size > 0:
         mask_left = side_all == 0
         mask_right = side_all == 1
@@ -814,20 +894,29 @@ def plot_behavior_qc_summary(
         ax_raster_reward.set_ylabel("Sorted trial index")
         ax_raster_reward.grid(True, alpha=0.3)
 
-    # ---------- NEW: grouped metrics text panels ----------
+    # ---------------------------------------------------------
+    # Row 5: ITI / delay / metrics summary (old row4)
+    # ---------------------------------------------------------
+    plot_iti_hist(ax_iti, iti_time, bins=bins)
+    if np.isfinite(mean_iti):
+        ax_iti.set_title(f"ITI duration (mean = {mean_iti:.2f} s)")
+
+    plot_delay_hist(ax_delay, delay_time, bins=bins)
+    if np.isfinite(mean_delay):
+        ax_delay.set_title(f"Delay duration (mean = {mean_delay:.2f} s)")
+
+    # ---------- grouped metrics text panels ----------
     ax_unused_1.clear()
     ax_unused_2.clear()
     ax_unused_1.axis("off")
     ax_unused_2.axis("off")
 
-    # Keys we do NOT want to display (arrays)
     skip_keys = {
         "first_lick_latency_all",
         "first_lick_latency_all_left",
         "first_lick_latency_all_right",
     }
 
-    # Format scalar metrics into strings
     clean_metrics = {}
     for key, val in metrics.items():
         if key in skip_keys:
@@ -841,7 +930,6 @@ def plot_behavior_qc_summary(
         else:
             clean_metrics[key] = str(val)
 
-    # Define logical groups using YOUR keys
     groups = {
         "Session": [
             "n_trials",
@@ -887,7 +975,6 @@ def plot_behavior_qc_summary(
         ],
     }
 
-    # Build grouped lines
     grouped_lines = []
     used_keys = set()
 
@@ -900,9 +987,8 @@ def plot_behavior_qc_summary(
         for k in available:
             grouped_lines.append(f"  {k}: {clean_metrics[k]}")
             used_keys.add(k)
-        grouped_lines.append("")  # blank line between groups
+        grouped_lines.append("")
 
-    # Any leftover metrics not covered by groups → "Other"
     leftover = [k for k in clean_metrics.keys() if k not in used_keys]
     if leftover:
         grouped_lines.append("Other:")
@@ -910,11 +996,9 @@ def plot_behavior_qc_summary(
             grouped_lines.append(f"  {k}: {clean_metrics[k]}")
         grouped_lines.append("")
 
-    # If still nothing, just bail
     if len(grouped_lines) == 0:
         grouped_lines = ["(no scalar metrics to display)"]
 
-    # Split into two panels
     mid = (len(grouped_lines) + 1) // 2
     left_text = "\n".join(grouped_lines[:mid])
     right_text = "\n".join(grouped_lines[mid:])
@@ -940,8 +1024,6 @@ def plot_behavior_qc_summary(
         fontsize=10,
         fontfamily="monospace",
     )
-
-
 
     # ---------------------------------------------------------
     # Row 0 & 1: behavior session panels (with / without model)
@@ -974,5 +1056,6 @@ def plot_behavior_qc_summary(
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
 
     return fig, axes, metrics, trial_df
+
 
 
