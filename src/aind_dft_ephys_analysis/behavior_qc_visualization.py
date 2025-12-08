@@ -1581,10 +1581,8 @@ def _fit_rpe_history_regression(
     Fit a linear regression:
 
         RPE(t) ~ bias
-                 + reward(t .. t-max_lag)
-                 + choice(t .. t-max_lag)
-
-    i.e. history includes the current trial (lag 0) and lags 1..max_lag.
+                 + reward(t) + reward(t-1) + ... + reward(t-max_lag)
+                 + choice(t) + choice(t-1) + ... + choice(t-max_lag)
 
     Parameters
     ----------
@@ -1606,8 +1604,8 @@ def _fit_rpe_history_regression(
     dict or None
         {
           "bias": float,
-          "reward_coefs": np.ndarray of shape (max_lag+1,),
-          "choice_coefs": np.ndarray of shape (max_lag+1,),
+          "reward_coefs": np.ndarray of shape (max_lag + 1,),
+          "choice_coefs": np.ndarray of shape (max_lag + 1,),
           "max_lag": int,
           "n_samples": int,
         }
@@ -1617,6 +1615,9 @@ def _fit_rpe_history_regression(
     -----
     rpe, reward and choice must have the same length. If not, a ValueError is raised.
     """
+    # ------------------------------------------------------------------
+    # 0) Basic checks and masking
+    # ------------------------------------------------------------------
     rpe = np.asarray(rpe, dtype=float).ravel()
     reward = np.asarray(reward, dtype=float).ravel()
     choice = np.asarray(choice, dtype=float).ravel()
@@ -1629,6 +1630,7 @@ def _fit_rpe_history_regression(
         )
 
     T = rpe.size
+    # Need at least more than max_lag trials to have any target with full history
     if T <= max_lag + 1:
         return None
 
@@ -1648,7 +1650,9 @@ def _fit_rpe_history_regression(
     else:
         target_valid = base_valid
 
-    # Candidate target indices: must have full history t..t-max_lag
+    # ------------------------------------------------------------------
+    # 1) Candidate indices: must have full history t, t-1, ..., t-max_lag
+    # ------------------------------------------------------------------
     candidate_indices = np.arange(T)
     candidate_indices = candidate_indices[candidate_indices >= max_lag]
     candidate_indices = candidate_indices[target_valid[candidate_indices]]
@@ -1662,8 +1666,10 @@ def _fit_rpe_history_regression(
     X = np.zeros((n_samples, 1 + 2 * n_lags), dtype=float)
     y = np.zeros(n_samples, dtype=float)
 
+    # ------------------------------------------------------------------
+    # 2) Build design matrix
+    # ------------------------------------------------------------------
     for row_idx, t in enumerate(candidate_indices):
-        # History includes current trial (lag 0) and 1..max_lag:
         # indices t, t-1, ..., t-max_lag
         lag_indices = np.arange(0, max_lag + 1)
         r_hist = reward[t - lag_indices]
@@ -1679,7 +1685,9 @@ def _fit_rpe_history_regression(
         X[row_idx, 1 + n_lags : 1 + 2 * n_lags] = c_hist
         y[row_idx] = rpe[t]
 
-    # Remove rows where y is not finite
+    # ------------------------------------------------------------------
+    # 3) Remove invalid rows and solve least-squares
+    # ------------------------------------------------------------------
     valid_rows = np.isfinite(y)
     if np.count_nonzero(valid_rows) < (max_lag + 1):
         return None
@@ -1696,10 +1704,10 @@ def _fit_rpe_history_regression(
     except np.linalg.LinAlgError:
         return None
 
-    # The parameter layout is:
-    #   [0]                → bias
-    #   [1 : 1+n_lags]     → reward(t .. t-max_lag)
-    #   [1+n_lags : ...]   → choice(t .. t-max_lag)
+    # Layout:
+    #   beta[0]                → bias
+    #   beta[1 : 1+n_lags]     → reward(t .. t-max_lag)
+    #   beta[1+n_lags : ...]   → choice(t .. t-max_lag)
     bias = float(beta[0])
     reward_coefs = beta[1 : 1 + n_lags]
     choice_coefs = beta[1 + n_lags : 1 + 2 * n_lags]
@@ -1711,6 +1719,7 @@ def _fit_rpe_history_regression(
         "max_lag": max_lag,
         "n_samples": int(n_samples),
     }
+
 
 
 def _get_reward_and_choice_from_nwb(
@@ -1779,145 +1788,11 @@ def _get_reward_and_choice_from_nwb(
 
 
 
-
-# ---------------------------------------------------------------------
-# Visualization: RPE history regression per model
-# ---------------------------------------------------------------------
-def _fit_rpe_history_regression(
-    rpe: np.ndarray,
-    reward: np.ndarray,
-    choice: np.ndarray,
-    max_lag: int,
-    target_mask: Optional[np.ndarray] = None,
-) -> Optional[Dict[str, Any]]:
-    """
-    Fit a linear regression:
-
-        RPE(t) ~ bias
-                 + reward(t-1..t-max_lag)
-                 + choice(t-1..t-max_lag)
-
-    Parameters
-    ----------
-    rpe : array-like
-        Per-trial RPE values (length T).
-    reward : array-like
-        Per-trial reward values (length T).
-    choice : array-like
-        Per-trial choice values (length T).
-    max_lag : int
-        Maximum history lag (in trials) to include.
-    target_mask : array-like of bool, optional
-        Length T. If provided, only trials t for which target_mask[t] is True
-        can be used as regression targets (RPE(t)).
-        History terms always come from the full sequences.
-
-    Returns
-    -------
-    dict or None
-        {
-          "bias": float,
-          "reward_coefs": np.ndarray of shape (max_lag,),
-          "choice_coefs": np.ndarray of shape (max_lag,),
-          "max_lag": int,
-          "n_samples": int,
-        }
-        or None if there is not enough data to fit.
-
-    Notes
-    -----
-    rpe, reward and choice must have the same length. If not, a ValueError is raised.
-    """
-    rpe = np.asarray(rpe, dtype=float).ravel()
-    reward = np.asarray(reward, dtype=float).ravel()
-    choice = np.asarray(choice, dtype=float).ravel()
-
-    # Enforce identical length
-    if not (rpe.size == reward.size == choice.size):
-        raise ValueError(
-            f"rpe, reward and choice must have the same length, got "
-            f"len(rpe)={rpe.size}, len(reward)={reward.size}, len(choice)={choice.size}"
-        )
-
-    T = rpe.size
-    if T <= max_lag + 1:
-        return None
-
-    base_valid = np.isfinite(rpe) & np.isfinite(reward) & np.isfinite(choice)
-
-    if target_mask is not None:
-        target_mask = np.asarray(target_mask, dtype=bool).ravel()
-        if target_mask.size > T:
-            target_mask = target_mask[:T]
-        elif target_mask.size < T:
-            target_mask = np.pad(
-                target_mask,
-                (0, T - target_mask.size),
-                constant_values=False,
-            )
-        target_valid = base_valid & target_mask
-    else:
-        target_valid = base_valid
-
-    candidate_indices = np.arange(T)
-    candidate_indices = candidate_indices[candidate_indices >= max_lag]
-    candidate_indices = candidate_indices[target_valid[candidate_indices]]
-
-    if candidate_indices.size == 0:
-        return None
-
-    # Build design matrix for the selected target indices
-    n_samples = candidate_indices.size
-    X = np.zeros((n_samples, 1 + 2 * max_lag), dtype=float)
-    y = np.zeros(n_samples, dtype=float)
-
-    for row_idx, t in enumerate(candidate_indices):
-        r_hist = reward[t - np.arange(1, max_lag + 1)]
-        c_hist = choice[t - np.arange(1, max_lag + 1)]
-
-        # If any history element is non-finite, skip this row
-        if not (np.all(np.isfinite(r_hist)) and np.all(np.isfinite(c_hist))):
-            continue
-
-        X[row_idx, 0] = 1.0  # bias
-        X[row_idx, 1 : 1 + max_lag] = r_hist
-        X[row_idx, 1 + max_lag : 1 + 2 * max_lag] = c_hist
-        y[row_idx] = rpe[t]
-
-    # Remove rows where y is not finite
-    valid_rows = np.isfinite(y)
-    if np.count_nonzero(valid_rows) < max_lag + 1:
-        return None
-
-    X = X[valid_rows]
-    y = y[valid_rows]
-    n_samples = y.size
-
-    if n_samples <= max_lag + 1:
-        return None
-
-    try:
-        beta, _, rank, _ = np.linalg.lstsq(X, y, rcond=None)
-    except np.linalg.LinAlgError:
-        return None
-
-    bias = float(beta[0])
-    reward_coefs = beta[1 : 1 + max_lag]
-    choice_coefs = beta[1 + max_lag : 1 + 2 * max_lag]
-
-    return {
-        "bias": bias,
-        "reward_coefs": reward_coefs,
-        "choice_coefs": choice_coefs,
-        "max_lag": max_lag,
-        "n_samples": int(n_samples),
-    }
-
 def plot_rpe_history_regression_from_nwb(
     nwb_data: Any,
     *,
     summary: Optional[pd.DataFrame] = None,
-    max_lag: int = 10,
+    max_lag: int = 8,
     panel_width: float = 3.2,
     panel_height: float = 2.3,
 ):
