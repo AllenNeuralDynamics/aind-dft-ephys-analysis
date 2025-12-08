@@ -1570,98 +1570,139 @@ def save_combined_behavior_and_qlearning_summary(
 # ---------------------------------------------------------------------
 # Helper: RPE history regression
 # ---------------------------------------------------------------------
-
 def _fit_rpe_history_regression(
     rpe: np.ndarray,
     reward: np.ndarray,
     choice: np.ndarray,
     max_lag: int,
+    target_mask: Optional[np.ndarray] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Fit a linear regression:
 
-        RPE(t) ~ bias + reward(t-1..t-max_lag) + choice(t-1..t-max_lag)
+        RPE(t) ~ bias
+                 + reward(t .. t-max_lag)
+                 + choice(t .. t-max_lag)
 
-    using ordinary least squares.
+    i.e. history includes the current trial (lag 0) and lags 1..max_lag.
 
     Parameters
     ----------
     rpe : array-like
-        Per-trial RPE values.
+        Per-trial RPE values (length T).
     reward : array-like
-        Per-trial reward outcome (e.g., 0/1).
+        Per-trial reward values (length T).
     choice : array-like
-        Per-trial choice code (e.g., -1 for left, +1 for right, 0 for no response).
+        Per-trial choice values (length T).
     max_lag : int
         Maximum history lag (in trials) to include.
+    target_mask : array-like of bool, optional
+        Length T. If provided, only trials t for which target_mask[t] is True
+        can be used as regression targets (RPE(t)).
+        History terms always come from the full sequences.
 
     Returns
     -------
     dict or None
-        Dictionary with keys:
-          - "bias": float
-          - "reward_coefs": 1D array of length max_lag
-          - "choice_coefs": 1D array of length max_lag
-          - "max_lag": int
-          - "n_samples": int
-        or None if not enough data to fit.
+        {
+          "bias": float,
+          "reward_coefs": np.ndarray of shape (max_lag+1,),
+          "choice_coefs": np.ndarray of shape (max_lag+1,),
+          "max_lag": int,
+          "n_samples": int,
+        }
+        or None if there is not enough data to fit.
+
+    Notes
+    -----
+    rpe, reward and choice must have the same length. If not, a ValueError is raised.
     """
     rpe = np.asarray(rpe, dtype=float).ravel()
     reward = np.asarray(reward, dtype=float).ravel()
     choice = np.asarray(choice, dtype=float).ravel()
 
-    # Align to common length
-    T = min(rpe.size, reward.size, choice.size)
+    # Enforce identical length
+    if not (rpe.size == reward.size == choice.size):
+        raise ValueError(
+            f"rpe, reward and choice must have the same length, got "
+            f"len(rpe)={rpe.size}, len(reward)={reward.size}, len(choice)={choice.size}"
+        )
+
+    T = rpe.size
     if T <= max_lag + 1:
         return None
 
-    rpe = rpe[:T]
-    reward = reward[:T]
-    choice = choice[:T]
+    base_valid = np.isfinite(rpe) & np.isfinite(reward) & np.isfinite(choice)
 
-    # Basic NaN filtering at the per-trial level
-    valid = np.isfinite(rpe) & np.isfinite(reward) & np.isfinite(choice)
-    if np.count_nonzero(valid) <= max_lag + 1:
+    if target_mask is not None:
+        target_mask = np.asarray(target_mask, dtype=bool).ravel()
+        if target_mask.size > T:
+            target_mask = target_mask[:T]
+        elif target_mask.size < T:
+            target_mask = np.pad(
+                target_mask,
+                (0, T - target_mask.size),
+                constant_values=False,
+            )
+        target_valid = base_valid & target_mask
+    else:
+        target_valid = base_valid
+
+    # Candidate target indices: must have full history t..t-max_lag
+    candidate_indices = np.arange(T)
+    candidate_indices = candidate_indices[candidate_indices >= max_lag]
+    candidate_indices = candidate_indices[target_valid[candidate_indices]]
+
+    if candidate_indices.size == 0:
         return None
 
-    rpe = rpe[valid]
-    reward = reward[valid]
-    choice = choice[valid]
-
-    T_valid = rpe.size
-    if T_valid <= max_lag + 1:
-        return None
-
-    # Build design matrix: one row per t >= max_lag
-    n_samples = T_valid - max_lag
-    X = np.zeros((n_samples, 1 + 2 * max_lag), dtype=float)
+    # We now include lag 0..max_lag → (max_lag+1) history terms per regressor
+    n_lags = max_lag + 1
+    n_samples = candidate_indices.size
+    X = np.zeros((n_samples, 1 + 2 * n_lags), dtype=float)
     y = np.zeros(n_samples, dtype=float)
 
-    for i in range(n_samples):
-        t = i + max_lag
+    for row_idx, t in enumerate(candidate_indices):
+        # History includes current trial (lag 0) and 1..max_lag:
+        # indices t, t-1, ..., t-max_lag
+        lag_indices = np.arange(0, max_lag + 1)
+        r_hist = reward[t - lag_indices]
+        c_hist = choice[t - lag_indices]
 
-        # Reward and choice history at lags 1..max_lag
-        r_hist = reward[t - np.arange(1, max_lag + 1)]
-        c_hist = choice[t - np.arange(1, max_lag + 1)]
+        # If any history element is non-finite, mark this row invalid
+        if not (np.all(np.isfinite(r_hist)) and np.all(np.isfinite(c_hist))):
+            y[row_idx] = np.nan
+            continue
 
-        X[i, 0] = 1.0  # bias term
-        X[i, 1 : 1 + max_lag] = r_hist
-        X[i, 1 + max_lag : 1 + 2 * max_lag] = c_hist
-        y[i] = rpe[t]
+        X[row_idx, 0] = 1.0  # bias
+        X[row_idx, 1 : 1 + n_lags] = r_hist
+        X[row_idx, 1 + n_lags : 1 + 2 * n_lags] = c_hist
+        y[row_idx] = rpe[t]
 
-    # OLS fit
+    # Remove rows where y is not finite
+    valid_rows = np.isfinite(y)
+    if np.count_nonzero(valid_rows) < (max_lag + 1):
+        return None
+
+    X = X[valid_rows]
+    y = y[valid_rows]
+    n_samples = y.size
+
+    if n_samples <= (max_lag + 1):
+        return None
+
     try:
         beta, _, rank, _ = np.linalg.lstsq(X, y, rcond=None)
     except np.linalg.LinAlgError:
         return None
 
-    if rank < X.shape[1]:
-        # Under-determined or ill-conditioned; still return, but be cautious downstream
-        pass
-
+    # The parameter layout is:
+    #   [0]                → bias
+    #   [1 : 1+n_lags]     → reward(t .. t-max_lag)
+    #   [1+n_lags : ...]   → choice(t .. t-max_lag)
     bias = float(beta[0])
-    reward_coefs = beta[1 : 1 + max_lag]
-    choice_coefs = beta[1 + max_lag : 1 + 2 * max_lag]
+    reward_coefs = beta[1 : 1 + n_lags]
+    choice_coefs = beta[1 + n_lags : 1 + 2 * n_lags]
 
     return {
         "bias": bias,
@@ -1884,8 +1925,8 @@ def plot_rpe_history_regression_from_nwb(
     Plot regression:
 
         RPE(t) ~ bias
-                 + reward(t-1..t-max_lag)
-                 + choice(t-1..t-max_lag)
+                 + reward(t .. t-max_lag)
+                 + choice(t .. t-max_lag)
 
     for each model and for several trial subsets.
 
@@ -1900,6 +1941,8 @@ def plot_rpe_history_regression_from_nwb(
         this function will NOT call generate_behavior_summary again.
     max_lag : int
         Maximum number of history lags (in trials) to include.
+        Note: lag 0 (current trial) may be included in the regression,
+        depending on how _fit_rpe_history_regression is implemented.
     panel_width, panel_height : float
         Size of each panel in inches.
 
@@ -1953,7 +1996,6 @@ def plot_rpe_history_regression_from_nwb(
     reward_all, choice_all = _get_reward_and_choice_from_nwb(nwb_data)
 
     coeffs: Dict[str, Dict[str, Any]] = {}
-    lags = np.arange(1, max_lag + 1)
 
     # =====================================================
     # 2) LOOP: models
@@ -1972,9 +2014,6 @@ def plot_rpe_history_regression_from_nwb(
                 axes[m_idx, c_idx].axis("off")
             continue
 
-        # Use the full reward_all / choice_all arrays.
-        # If lengths mismatch with rpe, _fit_rpe_history_regression
-        # will raise a ValueError and we skip those panels.
         reward = reward_all
         choice = choice_all
 
@@ -2025,10 +2064,24 @@ def plot_rpe_history_regression_from_nwb(
 
             coeffs[model_name][subset_key] = reg
 
-            reward_coefs = reg["reward_coefs"]
-            choice_coefs = reg["choice_coefs"]
+            reward_coefs = np.asarray(reg["reward_coefs"], dtype=float)
+            choice_coefs = np.asarray(reg["choice_coefs"], dtype=float)
             bias = reg["bias"]
             n_samples = reg["n_samples"]
+
+            # Make sure reward & choice history have the same effective length
+            n_lags_eff = min(reward_coefs.size, choice_coefs.size)
+            reward_coefs = reward_coefs[:n_lags_eff]
+            choice_coefs = choice_coefs[:n_lags_eff]
+
+            # If nothing left, skip this panel
+            if n_lags_eff == 0:
+                ax.axis("off")
+                continue
+
+            # Lag axis is derived from coefficient length
+            # If your regression includes lag 0, this is 0..(n_lags_eff-1)
+            lags = np.arange(n_lags_eff)
 
             # Collect for shared y-limits
             row_values.extend(list(reward_coefs))
@@ -2082,9 +2135,11 @@ def plot_rpe_history_regression_from_nwb(
     )
 
     # === GLOBAL X-LABEL (always visible) ===
-    fig.supxlabel("Lag (trials back)", fontsize=14, y=0.02)
+    fig.supxlabel("Lag index (0 = most recent)", fontsize=14, y=0.02)
 
     return fig, axes, coeffs
+
+
 
 
 
