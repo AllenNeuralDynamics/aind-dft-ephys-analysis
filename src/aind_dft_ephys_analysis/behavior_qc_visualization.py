@@ -1414,26 +1414,35 @@ def plot_qlearning_hist_and_scatter_from_nwb(
 
 
 
-
 def save_combined_behavior_and_qlearning_summary(
     nwb_data: Any,
     *,
     qc_kwargs: Optional[Dict] = None,
     q_kwargs: Optional[Dict] = None,
-    save_dir: Optional[str] = None,     # ← NEW
+    rpe_kwargs: Optional[Dict] = None,          # passed to RPE regression only
+    save_dir: Optional[str] = None,
     save_basepath: Optional[str] = "behavior_qlearning_summary",
-    formats: Sequence[str] = ("pdf", "png"),
+    formats: Sequence[str] = ("pdf", "png", "eps"),
     dpi: int = 300,
+    bins: Optional[int] = None,                 # ← NEW: shared bins for QC and Q-learning plots
 ) -> Tuple[plt.Figure, pd.DataFrame]:
-
     """
     Generate:
       1) Behavior QC figure
       2) Q-learning / Foraging latent figure
+      3) RPE history regression figure
+
     Combine them vertically and save in multiple formats.
 
     Parameters
     ----------
+    qc_kwargs : dict or None
+        Passed to plot_behavior_qc_summary.
+    q_kwargs : dict or None
+        Passed to plot_qlearning_hist_and_scatter_from_nwb.
+    rpe_kwargs : dict or None
+        Passed to plot_rpe_history_regression_from_nwb (in addition to nwb_data
+        and the shared `summary`).
     save_dir : str or None
         Directory to save into (created automatically if missing).
         If None → saves in current working directory.
@@ -1441,15 +1450,29 @@ def save_combined_behavior_and_qlearning_summary(
         Base filename *without extension*.
     formats : list[str]
         Formats to save, e.g. ("pdf","png","eps").
+    dpi : int
+        Dots per inch for saved figures.
+    bins : int or None
+        If not None, used as the 'bins' argument for both
+        plot_behavior_qc_summary and plot_qlearning_hist_and_scatter_from_nwb,
+        unless those kwargs already specify their own 'bins'.
     """
 
     if qc_kwargs is None:
         qc_kwargs = {}
     if q_kwargs is None:
         q_kwargs = {}
+    if rpe_kwargs is None:
+        rpe_kwargs = {}
+
+    # If a global 'bins' is provided, inject it into qc_kwargs and q_kwargs
+    # without overwriting explicit per-call choices.
+    if bins is not None:
+        qc_kwargs.setdefault("bins", bins)
+        q_kwargs.setdefault("bins", bins)
 
     # ----------------------------------------------------------
-    # 1. Generate the two figures
+    # 1. Generate the three figures
     # ----------------------------------------------------------
     fig_qc, _, _, _ = plot_behavior_qc_summary(
         nwb_data,
@@ -1461,52 +1484,62 @@ def save_combined_behavior_and_qlearning_summary(
         **q_kwargs,
     )
 
+    # Re-use the same summary for the RPE regression
+    fig_rpe, _, _ = plot_rpe_history_regression_from_nwb(
+        nwb_data,
+        summary=summary,
+        **rpe_kwargs,
+    )
+
     # ----------------------------------------------------------
     # 2. Compute combined figure size
     # ----------------------------------------------------------
     w_qc, h_qc = fig_qc.get_size_inches()
     w_q, h_q = fig_q.get_size_inches()
+    w_rpe, h_rpe = fig_rpe.get_size_inches()
 
-    fig_width = max(w_qc, w_q)
-    fig_height = h_qc + h_q
+    fig_width = max(w_qc, w_q, w_rpe)
+    fig_height = h_qc + h_q + h_rpe
 
     combined_fig = plt.figure(figsize=(fig_width, fig_height))
     gs = combined_fig.add_gridspec(
-        2, 1,
-        height_ratios=[h_qc, h_q]
+        3, 1,
+        height_ratios=[h_qc, h_q, h_rpe],
     )
 
     ax_top = combined_fig.add_subplot(gs[0, 0])
-    ax_bottom = combined_fig.add_subplot(gs[1, 0])
+    ax_mid = combined_fig.add_subplot(gs[1, 0])
+    ax_bottom = combined_fig.add_subplot(gs[2, 0])
 
     # ----------------------------------------------------------
     # 3. Embed the figures as images
     # ----------------------------------------------------------
     _embed_figure_as_image(fig_qc, ax_top)
-    _embed_figure_as_image(fig_q, ax_bottom)
+    _embed_figure_as_image(fig_q, ax_mid)
+    _embed_figure_as_image(fig_rpe, ax_bottom)
 
+    # Close individual figs to free memory
     plt.close(fig_qc)
     plt.close(fig_q)
+    plt.close(fig_rpe)
 
     combined_fig.suptitle(
-        "Behavior QC and model latent summaries",
+        "Behavior QC and model latent summaries\n(Q-learning / Foraging / RPE history regression)",
         fontsize=20,
-        y=0.96,        # Lower than default to avoid cutting in PDFs
+        y=0.97,  # a bit lower to avoid clipping
     )
 
-    combined_fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.95])
+    combined_fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
 
     # ----------------------------------------------------------
     # 4. Save
     # ----------------------------------------------------------
     if save_basepath is not None:
 
-        # Determine final directory
         if save_dir is None:
             save_dir = "."
         os.makedirs(save_dir, exist_ok=True)
 
-        # Full base path including directory
         full_base = os.path.join(save_dir, save_basepath)
 
         for ext in formats:
@@ -1531,3 +1564,528 @@ def save_combined_behavior_and_qlearning_summary(
             print(f"Saved: {outfile}")
 
     return combined_fig, summary
+
+
+
+# ---------------------------------------------------------------------
+# Helper: RPE history regression
+# ---------------------------------------------------------------------
+
+def _fit_rpe_history_regression(
+    rpe: np.ndarray,
+    reward: np.ndarray,
+    choice: np.ndarray,
+    max_lag: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fit a linear regression:
+
+        RPE(t) ~ bias + reward(t-1..t-max_lag) + choice(t-1..t-max_lag)
+
+    using ordinary least squares.
+
+    Parameters
+    ----------
+    rpe : array-like
+        Per-trial RPE values.
+    reward : array-like
+        Per-trial reward outcome (e.g., 0/1).
+    choice : array-like
+        Per-trial choice code (e.g., -1 for left, +1 for right, 0 for no response).
+    max_lag : int
+        Maximum history lag (in trials) to include.
+
+    Returns
+    -------
+    dict or None
+        Dictionary with keys:
+          - "bias": float
+          - "reward_coefs": 1D array of length max_lag
+          - "choice_coefs": 1D array of length max_lag
+          - "max_lag": int
+          - "n_samples": int
+        or None if not enough data to fit.
+    """
+    rpe = np.asarray(rpe, dtype=float).ravel()
+    reward = np.asarray(reward, dtype=float).ravel()
+    choice = np.asarray(choice, dtype=float).ravel()
+
+    # Align to common length
+    T = min(rpe.size, reward.size, choice.size)
+    if T <= max_lag + 1:
+        return None
+
+    rpe = rpe[:T]
+    reward = reward[:T]
+    choice = choice[:T]
+
+    # Basic NaN filtering at the per-trial level
+    valid = np.isfinite(rpe) & np.isfinite(reward) & np.isfinite(choice)
+    if np.count_nonzero(valid) <= max_lag + 1:
+        return None
+
+    rpe = rpe[valid]
+    reward = reward[valid]
+    choice = choice[valid]
+
+    T_valid = rpe.size
+    if T_valid <= max_lag + 1:
+        return None
+
+    # Build design matrix: one row per t >= max_lag
+    n_samples = T_valid - max_lag
+    X = np.zeros((n_samples, 1 + 2 * max_lag), dtype=float)
+    y = np.zeros(n_samples, dtype=float)
+
+    for i in range(n_samples):
+        t = i + max_lag
+
+        # Reward and choice history at lags 1..max_lag
+        r_hist = reward[t - np.arange(1, max_lag + 1)]
+        c_hist = choice[t - np.arange(1, max_lag + 1)]
+
+        X[i, 0] = 1.0  # bias term
+        X[i, 1 : 1 + max_lag] = r_hist
+        X[i, 1 + max_lag : 1 + 2 * max_lag] = c_hist
+        y[i] = rpe[t]
+
+    # OLS fit
+    try:
+        beta, _, rank, _ = np.linalg.lstsq(X, y, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+
+    if rank < X.shape[1]:
+        # Under-determined or ill-conditioned; still return, but be cautious downstream
+        pass
+
+    bias = float(beta[0])
+    reward_coefs = beta[1 : 1 + max_lag]
+    choice_coefs = beta[1 + max_lag : 1 + 2 * max_lag]
+
+    return {
+        "bias": bias,
+        "reward_coefs": reward_coefs,
+        "choice_coefs": choice_coefs,
+        "max_lag": max_lag,
+        "n_samples": int(n_samples),
+    }
+
+
+def _get_reward_and_choice_from_nwb(
+    nwb_data: Any,
+    max_len: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Extract per-trial reward and choice arrays from NWB.
+
+    NO-RESPONSE TRIALS ARE REMOVED:
+        animal_response == 2 or NaN → trial dropped.
+    This keeps reward and choice aligned with RPE arrays,
+    which already exclude no-response trials.
+
+    Returns reward_raw and choice arrays AFTER filtering.
+    """
+
+    # Rewarded left/right
+    rewarded_L = np.asarray(
+        nwb_data.trials["rewarded_historyL"][:],
+        dtype=bool,
+    )
+    rewarded_R = np.asarray(
+        nwb_data.trials["rewarded_historyR"][:],
+        dtype=bool,
+    )
+
+    # Raw choice codes
+    choice_raw = np.asarray(
+        nwb_data.trials["animal_response"][:],
+        dtype=float,
+    )
+
+    # ----------------------------------------------------
+    # Remove no-response trials BEFORE constructing arrays
+    # ----------------------------------------------------
+    valid_mask = np.isfinite(choice_raw) & (choice_raw != 2)
+
+    rewarded_L = rewarded_L[valid_mask]
+    rewarded_R = rewarded_R[valid_mask]
+    choice_raw = choice_raw[valid_mask]
+
+    # ----------------------------------------------------
+    # Apply max_len *after* filtering
+    # ----------------------------------------------------
+    if max_len is not None:
+        rewarded_L = rewarded_L[:max_len]
+        rewarded_R = rewarded_R[:max_len]
+        choice_raw = choice_raw[:max_len]
+
+    # ----------------------------------------------------
+    # Compute reward
+    # ----------------------------------------------------
+    reward_raw = (rewarded_L | rewarded_R).astype(float)
+
+    # ----------------------------------------------------
+    # Map choice codes
+    # 0 → -1  (left)
+    # 1 → +1  (right)
+    # ----------------------------------------------------
+    choice = np.zeros_like(choice_raw, dtype=float)
+    choice[choice_raw == 0] = -1.0
+    choice[choice_raw == 1] =  1.0
+
+    return reward_raw, choice
+
+
+
+
+# ---------------------------------------------------------------------
+# Visualization: RPE history regression per model
+# ---------------------------------------------------------------------
+def _fit_rpe_history_regression(
+    rpe: np.ndarray,
+    reward: np.ndarray,
+    choice: np.ndarray,
+    max_lag: int,
+    target_mask: Optional[np.ndarray] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fit a linear regression:
+
+        RPE(t) ~ bias
+                 + reward(t-1..t-max_lag)
+                 + choice(t-1..t-max_lag)
+
+    Parameters
+    ----------
+    rpe : array-like
+        Per-trial RPE values (length T).
+    reward : array-like
+        Per-trial reward values (length T).
+    choice : array-like
+        Per-trial choice values (length T).
+    max_lag : int
+        Maximum history lag (in trials) to include.
+    target_mask : array-like of bool, optional
+        Length T. If provided, only trials t for which target_mask[t] is True
+        can be used as regression targets (RPE(t)).
+        History terms always come from the full sequences.
+
+    Returns
+    -------
+    dict or None
+        {
+          "bias": float,
+          "reward_coefs": np.ndarray of shape (max_lag,),
+          "choice_coefs": np.ndarray of shape (max_lag,),
+          "max_lag": int,
+          "n_samples": int,
+        }
+        or None if there is not enough data to fit.
+
+    Notes
+    -----
+    rpe, reward and choice must have the same length. If not, a ValueError is raised.
+    """
+    rpe = np.asarray(rpe, dtype=float).ravel()
+    reward = np.asarray(reward, dtype=float).ravel()
+    choice = np.asarray(choice, dtype=float).ravel()
+
+    # Enforce identical length
+    if not (rpe.size == reward.size == choice.size):
+        raise ValueError(
+            f"rpe, reward and choice must have the same length, got "
+            f"len(rpe)={rpe.size}, len(reward)={reward.size}, len(choice)={choice.size}"
+        )
+
+    T = rpe.size
+    if T <= max_lag + 1:
+        return None
+
+    base_valid = np.isfinite(rpe) & np.isfinite(reward) & np.isfinite(choice)
+
+    if target_mask is not None:
+        target_mask = np.asarray(target_mask, dtype=bool).ravel()
+        if target_mask.size > T:
+            target_mask = target_mask[:T]
+        elif target_mask.size < T:
+            target_mask = np.pad(
+                target_mask,
+                (0, T - target_mask.size),
+                constant_values=False,
+            )
+        target_valid = base_valid & target_mask
+    else:
+        target_valid = base_valid
+
+    candidate_indices = np.arange(T)
+    candidate_indices = candidate_indices[candidate_indices >= max_lag]
+    candidate_indices = candidate_indices[target_valid[candidate_indices]]
+
+    if candidate_indices.size == 0:
+        return None
+
+    # Build design matrix for the selected target indices
+    n_samples = candidate_indices.size
+    X = np.zeros((n_samples, 1 + 2 * max_lag), dtype=float)
+    y = np.zeros(n_samples, dtype=float)
+
+    for row_idx, t in enumerate(candidate_indices):
+        r_hist = reward[t - np.arange(1, max_lag + 1)]
+        c_hist = choice[t - np.arange(1, max_lag + 1)]
+
+        # If any history element is non-finite, skip this row
+        if not (np.all(np.isfinite(r_hist)) and np.all(np.isfinite(c_hist))):
+            continue
+
+        X[row_idx, 0] = 1.0  # bias
+        X[row_idx, 1 : 1 + max_lag] = r_hist
+        X[row_idx, 1 + max_lag : 1 + 2 * max_lag] = c_hist
+        y[row_idx] = rpe[t]
+
+    # Remove rows where y is not finite
+    valid_rows = np.isfinite(y)
+    if np.count_nonzero(valid_rows) < max_lag + 1:
+        return None
+
+    X = X[valid_rows]
+    y = y[valid_rows]
+    n_samples = y.size
+
+    if n_samples <= max_lag + 1:
+        return None
+
+    try:
+        beta, _, rank, _ = np.linalg.lstsq(X, y, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+
+    bias = float(beta[0])
+    reward_coefs = beta[1 : 1 + max_lag]
+    choice_coefs = beta[1 + max_lag : 1 + 2 * max_lag]
+
+    return {
+        "bias": bias,
+        "reward_coefs": reward_coefs,
+        "choice_coefs": choice_coefs,
+        "max_lag": max_lag,
+        "n_samples": int(n_samples),
+    }
+
+def plot_rpe_history_regression_from_nwb(
+    nwb_data: Any,
+    *,
+    summary: Optional[pd.DataFrame] = None,
+    max_lag: int = 10,
+    panel_width: float = 3.2,
+    panel_height: float = 2.3,
+):
+    """
+    Plot regression:
+
+        RPE(t) ~ bias
+                 + reward(t-1..t-max_lag)
+                 + choice(t-1..t-max_lag)
+
+    for each model and for several trial subsets.
+
+    Uses constrained_layout and a global xlabel so the label is always visible.
+
+    Parameters
+    ----------
+    nwb_data : Any
+        NWB-like object with trials and acquisition data.
+    summary : pandas.DataFrame, optional
+        Output of generate_behavior_summary(nwb_data). If provided,
+        this function will NOT call generate_behavior_summary again.
+    max_lag : int
+        Maximum number of history lags (in trials) to include.
+    panel_width, panel_height : float
+        Size of each panel in inches.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    axes : np.ndarray of Axes, shape (n_models, n_conditions)
+    coeffs : dict
+        Nested dict: coeffs[model_name][subset_key] -> regression dict.
+    """
+
+    # ---------------------------------------------------
+    # 1) Obtain summary (or reuse provided one)
+    # ---------------------------------------------------
+    if summary is None:
+        summary = generate_behavior_summary(nwb_data)
+
+    model_configs = [
+        {"name": "QLearning_L1F1_CK1_softmax",    "label": "L1F1_CK1"},
+        {"name": "QLearning_L2F1_softmax",        "label": "L2F1"},
+        {"name": "QLearning_L2F1_CK1_softmax",    "label": "L2F1_CK1"},
+        {"name": "QLearning_L2F1_CKFull_softmax", "label": "L2F1_CKFull"},
+        {"name": "ForagingCompareThreshold",      "label": "Foraging"},
+    ]
+
+    subsets = [
+        ("all",         "All trials"),
+        ("rpe_pos",     "RPE > 0"),
+        ("rpe_neg",     "RPE < 0"),
+        ("choice_left", "Left choices"),
+        ("choice_right","Right choices"),
+    ]
+
+    n_models = len(model_configs)
+    n_conditions = len(subsets)
+
+    fig_width = panel_width * n_conditions
+    fig_height = panel_height * n_models
+
+    # Use constrained_layout so labels are preserved
+    fig, axes = plt.subplots(
+        n_models,
+        n_conditions,
+        figsize=(fig_width, fig_height),
+        squeeze=False,
+        sharex=False,
+        constrained_layout=True,
+    )
+
+    # Reward / choice from NWB (already filtered to exclude no-response trials)
+    reward_all, choice_all = _get_reward_and_choice_from_nwb(nwb_data)
+
+    coeffs: Dict[str, Dict[str, Any]] = {}
+    lags = np.arange(1, max_lag + 1)
+
+    # =====================================================
+    # 2) LOOP: models
+    # =====================================================
+    for m_idx, cfg in enumerate(model_configs):
+        model_name = cfg["name"]
+        model_label = cfg["label"]
+
+        # RPE series for this model
+        rpe = _get_model_field_array(summary, model_name, "RPE")
+        coeffs[model_name] = {}
+
+        # No RPE available → blank row
+        if rpe.size == 0:
+            for c_idx in range(n_conditions):
+                axes[m_idx, c_idx].axis("off")
+            continue
+
+        # Use the full reward_all / choice_all arrays.
+        # If lengths mismatch with rpe, _fit_rpe_history_regression
+        # will raise a ValueError and we skip those panels.
+        reward = reward_all
+        choice = choice_all
+
+        T = rpe.size
+        row_values: list[float] = []
+
+        # =====================================================
+        # 3) LOOP: subsets
+        # =====================================================
+        for c_idx, (subset_key, subset_label) in enumerate(subsets):
+            ax = axes[m_idx, c_idx]
+
+            # Target mask is always length T (same as rpe)
+            if subset_key == "all":
+                target_mask = np.ones(T, dtype=bool)
+            elif subset_key == "rpe_pos":
+                target_mask = rpe > 0
+            elif subset_key == "rpe_neg":
+                target_mask = rpe < 0
+            elif subset_key == "choice_left":
+                target_mask = choice[:T] < 0   # in case choice is longer
+            elif subset_key == "choice_right":
+                target_mask = choice[:T] > 0   # in case choice is longer
+            else:
+                target_mask = np.ones(T, dtype=bool)
+
+            # Fit regression; handle possible length mismatch gracefully
+            try:
+                reg = _fit_rpe_history_regression(
+                    rpe=rpe,
+                    reward=reward,
+                    choice=choice,
+                    max_lag=max_lag,
+                    target_mask=target_mask,
+                )
+            except ValueError as e:
+                # Length mismatch between rpe / reward / choice
+                print(
+                    f"Warning in plot_rpe_history_regression_from_nwb "
+                    f"for model {model_name}, subset {subset_key}: {e}"
+                )
+                reg = None
+
+            if reg is None:
+                ax.axis("off")
+                coeffs[model_name][subset_key] = {}
+                continue
+
+            coeffs[model_name][subset_key] = reg
+
+            reward_coefs = reg["reward_coefs"]
+            choice_coefs = reg["choice_coefs"]
+            bias = reg["bias"]
+            n_samples = reg["n_samples"]
+
+            # Collect for shared y-limits
+            row_values.extend(list(reward_coefs))
+            row_values.extend(list(choice_coefs))
+
+            # -------------------------------------------------
+            # Plot
+            # -------------------------------------------------
+            ax.axhline(0, ls="--", lw=0.7, color="k", alpha=0.7)
+
+            ax.plot(lags, reward_coefs, marker="o", label="Reward history")
+            ax.plot(lags, choice_coefs, marker="s", label="Choice history")
+
+            ax.set_xticks(lags)
+            ax.tick_params(axis="both", labelsize=8)
+
+            # Y-label only on the leftmost column
+            if c_idx == 0:
+                ax.set_ylabel(f"{model_label}\nCoefficient", fontsize=10)
+
+            ax.set_title(
+                f"{subset_label}\n"
+                f"bias = {bias:.3f}, n = {n_samples}",
+                fontsize=10,
+            )
+
+            # Legend only on the first column; remove from others
+            if c_idx == 0:
+                ax.legend(fontsize=7, framealpha=0.4, loc="upper right")
+            else:
+                leg = ax.get_legend()
+                if leg is not None:
+                    leg.remove()
+
+            ax.grid(True, alpha=0.3)
+
+        # -----------------------------------------------------
+        # 4) Shared y-limits for all subsets in this model row
+        # -----------------------------------------------------
+        if len(row_values) > 0:
+            ymin = np.min(row_values) * 1.1
+            ymax = np.max(row_values) * 1.1
+            for c_idx in range(n_conditions):
+                if axes[m_idx, c_idx].has_data():
+                    axes[m_idx, c_idx].set_ylim(ymin, ymax)
+
+    # === GLOBAL TITLE ===
+    fig.suptitle(
+        "RPE(t) ~ Reward and choice history\nPer model and subset",
+        fontsize=16,
+    )
+
+    # === GLOBAL X-LABEL (always visible) ===
+    fig.supxlabel("Lag (trials back)", fontsize=14, y=0.02)
+
+    return fig, axes, coeffs
+
+
+
+
