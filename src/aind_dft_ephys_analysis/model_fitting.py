@@ -301,6 +301,7 @@ def fit_choice_logistic_regression_from_nwb(
                            + [f"Ndiff_lag{i}" for i in range(1, lag+1)]
         }
     }
+
 def visualize_choice_logistic_regression(
     fit_output: Dict[str, Any],
     plot_coefficients: bool = True,
@@ -331,6 +332,23 @@ def visualize_choice_logistic_regression(
     used_indices = fit_output["used_trial_indices"]
     metadata = fit_output["metadata"]
     lag = metadata["lag"]
+
+    # ----------------------------------------
+    # Extract bias / intercept coefficient
+    # ----------------------------------------
+    params = result.params
+
+    # Try to be robust to different param naming
+    if hasattr(params, "index"):
+        # If there is an explicit 'const' term, use it
+        if "const" in params.index:
+            bias_val = float(params.loc["const"])
+        else:
+            # Fall back to the first parameter as bias
+            bias_val = float(params.iloc[0])
+    else:
+        # params is a plain ndarray
+        bias_val = float(params[0])
 
     # ------------------------------
     # Extract goodness-of-fit stats
@@ -406,8 +424,10 @@ def visualize_choice_logistic_regression(
                                 fontsize=label_font_size)
         ax_coef.set_xlabel("Lag [0=Intercept]", fontsize=label_font_size)
         ax_coef.set_ylabel("Coefficient Value", fontsize=label_font_size)
-        ax_coef.set_title("Logistic Regression Coefficients (95% CI)",
-                          fontsize=title_font_size)
+        ax_coef.set_title(
+            f"Logistic Regression Coefficients (bias = {bias_val:.3f}, 95% CI)",
+            fontsize=title_font_size,
+        )
 
         ax_coef.grid(True, alpha=0.3)
         ax_coef.tick_params(axis="both", labelsize=label_font_size)
