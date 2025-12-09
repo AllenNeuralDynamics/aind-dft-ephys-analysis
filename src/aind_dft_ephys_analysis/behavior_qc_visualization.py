@@ -1523,13 +1523,16 @@ def save_combined_behavior_and_qlearning_summary(
     plt.close(fig_q)
     plt.close(fig_rpe)
 
+    # Put the title closer to the panels and give subplots more vertical space
     combined_fig.suptitle(
-        "Behavior QC and model latent summaries\n(Q-learning / Foraging / RPE history regression)",
+        "Behavior QC and model latent summaries\n",
         fontsize=20,
-        y=0.97,  # a bit lower to avoid clipping
+        y=0.985,  # closer to the top edge
     )
 
-    combined_fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
+    # rect = [left, bottom, right, top]; increase "top" so axes go higher
+    combined_fig.tight_layout(rect=[0.02, 0.04, 0.98, 0.98])
+
 
     # ----------------------------------------------------------
     # 4. Save
@@ -1787,7 +1790,6 @@ def _get_reward_and_choice_from_nwb(
     return reward_raw, choice
 
 
-
 def plot_rpe_history_regression_from_nwb(
     nwb_data: Any,
     *,
@@ -1805,7 +1807,8 @@ def plot_rpe_history_regression_from_nwb(
 
     for each model and for several trial subsets.
 
-    Uses constrained_layout and a global xlabel so the label is always visible.
+    Uses tight_layout + a reserved bottom margin so the global
+    xlabel is always visible and not overlapping the panels.
 
     Parameters
     ----------
@@ -1857,14 +1860,14 @@ def plot_rpe_history_regression_from_nwb(
     fig_width = panel_width * n_conditions
     fig_height = panel_height * n_models
 
-    # Use constrained_layout so labels are preserved
+    # Turn OFF constrained_layout; we will use tight_layout + rect
     fig, axes = plt.subplots(
         n_models,
         n_conditions,
         figsize=(fig_width, fig_height),
         squeeze=False,
         sharex=False,
-        constrained_layout=True,
+        constrained_layout=False,
     )
 
     # Reward / choice from NWB (already filtered to exclude no-response trials)
@@ -1955,7 +1958,6 @@ def plot_rpe_history_regression_from_nwb(
                 continue
 
             # Lag axis is derived from coefficient length
-            # If your regression includes lag 0, this is 0..(n_lags_eff-1)
             lags = np.arange(n_lags_eff)
 
             # Collect for shared y-limits
@@ -2003,16 +2005,24 @@ def plot_rpe_history_regression_from_nwb(
                 if axes[m_idx, c_idx].has_data():
                     axes[m_idx, c_idx].set_ylim(ymin, ymax)
 
-    # === GLOBAL TITLE ===
+    # -----------------------------------------------------
+    # 5) Global layout: leave top & bottom margins
+    # -----------------------------------------------------
+    # Reserve some space at the top for the title and at the bottom for the xlabel.
+    # rect = [left, bottom, right, top] in figure coordinates.
+    fig.tight_layout(rect=[0.03, 0.08, 0.97, 0.90])
+
     fig.suptitle(
         "RPE(t) ~ Reward and choice history\nPer model and subset",
         fontsize=16,
+        y=0.96,
     )
 
-    # === GLOBAL X-LABEL (always visible) ===
-    fig.supxlabel("Lag index (0 = most recent)", fontsize=14, y=0.02)
+    # Put global x-label just below the axes, but above the bottom edge
+    fig.supxlabel("Lag index (0 = most recent)", fontsize=14, y=0.04)
 
     return fig, axes, coeffs
+
 
 
 
