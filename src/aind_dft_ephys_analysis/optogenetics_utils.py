@@ -346,34 +346,126 @@ def _collect_nwb_files(sources: Union[str, Path, Iterable[Union[str, Path]]]) ->
 def create_opto_data_frame_combined(
     sources: Union[str, Path, Iterable[Union[str, Path]]] = "/root/capsule/data/optogenetics_nwb",
     save_path: Optional[Union[str, Path]] = None,
-    show_progress: bool = True
+    show_progress: bool = True,
+    existing_data: Optional[Union[pd.DataFrame, str, Path]] = None,
 ) -> pd.DataFrame:
     """
-    Build and (optionally) save a combined per-trial DataFrame from one or more NWB files,
-    with progress output.
+    Build and (optionally) save a combined per-trial optogenetics DataFrame from
+    one or more NWB files, with optional incremental updating.
+
+    This function supports **incremental appending**:
+    if `existing_data` is provided, NWB files whose session name already exists
+    in the existing dataset will be skipped. Session identity is determined
+    **purely from the NWB filename**, without opening the file:
+
+        session_name := Path(nwb_path).stem
+
+    This value is expected to match `combined_dataframe['session']`, e.g.:
+        "778147_2025-04-08_16-06-29"
 
     Parameters
     ----------
-    sources : str | Path | Iterable[str|Path], default "/root/capsule/data/optogenetics_nwb"
-        - A folder containing .nwb files, OR
-        - A single .nwb path, OR
-        - A list/tuple of .nwb paths (and/or folders).
-    save_path : str | Path, optional
-        If provided, write the combined CSV to this path. If a directory is given,
-        the file 'combined_opto_data_frame.csv' will be created inside it.
+    sources : str | pathlib.Path | Iterable[str | pathlib.Path], optional
+        Source(s) of NWB files to process.
+
+        Accepted forms:
+        - Path to a directory containing `.nwb` files
+        - Path to a single `.nwb` file
+        - Iterable of `.nwb` file paths and/or directories
+
+        All `.nwb` files found will be considered for processing, subject to
+        filtering by `existing_data`.
+
+    save_path : str | pathlib.Path, optional
+        If provided, the combined DataFrame is written to this location.
+
+        - If a directory is given, a file named
+          `combined_opto_data_frame.csv` will be created inside it.
+        - If a `.csv` file path is given, it will be written directly.
+
+        If `None`, no file is written.
+
     show_progress : bool, default True
-        If True, display a progress bar (tqdm if available) or simple prints.
+        Whether to display progress information.
+
+        - If `tqdm` is available, a progress bar is shown.
+        - Otherwise, simple textual progress messages are printed.
+
+    existing_data : pandas.DataFrame | str | pathlib.Path, optional
+        Existing combined optogenetics dataset used for incremental updating.
+
+        Accepted forms:
+        - A pandas DataFrame already produced by this pipeline
+        - Path to an existing combined CSV file (loaded via `load_opto_data_frame`)
+        - None (default): process all NWB files from scratch
+
+        Behavior:
+        - Sessions already present in `existing_data['session']` are skipped
+        - Skipping is based **only on filename matching**, not NWB metadata
+        - The existing data is preserved and newly generated data is appended
 
     Returns
     -------
     pandas.DataFrame
-        Trials from all sessions concatenated (row-wise).
+        A DataFrame containing one row per trial across all processed sessions.
+
+        - If `existing_data` is None:
+            returns data generated from all NWB files in `sources`
+        - If `existing_data` is provided:
+            returns the concatenation of existing data and newly processed sessions
+
+    Raises
+    ------
+    FileNotFoundError
+        If no `.nwb` files are found in `sources`.
+
+    ValueError
+        - If `existing_data` is provided but does not contain a `session` column
+        - If no valid DataFrames can be generated from the input NWB files
+
+    Notes
+    -----
+    - Session identity is derived from the NWB filename stem (without `.nwb`)
+    - NWB files are **not opened** for session filtering
+    - NWB files are only read when their session is not already present
+    - This design avoids unnecessary I/O and is robust to partial or corrupt NWB files
     """
-    # Collect files
+    # --- load / normalize existing data (optional) ---
+    existing_df: Optional[pd.DataFrame] = None
+    existing_sessions: set = set()
+
+    if existing_data is not None:
+        if isinstance(existing_data, pd.DataFrame):
+            existing_df = existing_data.copy()
+        else:
+            existing_df = load_opto_data_frame(existing_data)
+
+        if "session" not in existing_df.columns:
+            raise ValueError("existing_data is provided but does not contain a 'session' column.")
+
+        existing_sessions = set(existing_df["session"].dropna().astype(str).tolist())
+
+    # --- Collect files ---
     nwb_files = _collect_nwb_files(sources)
+
+    # --- Filename-based pre-filtering (no NWB reading here) ---
+    if existing_df is not None and existing_sessions:
+        filtered_files: List[Path] = []
+        skipped = 0
+        for p in nwb_files:
+            sess_from_name = Path(p).stem
+            if sess_from_name in existing_sessions:
+                skipped += 1
+                continue
+            filtered_files.append(p)
+
+        if show_progress and skipped > 0:
+            print(f"Skipping {skipped} NWB file(s) already present in existing_data.")
+        nwb_files = filtered_files
+
     total = len(nwb_files)
 
-    # Progress helper
+    # --- Progress helper ---
     pbar = None
     use_tqdm = False
     if show_progress:
@@ -384,7 +476,8 @@ def create_opto_data_frame_combined(
         except Exception:
             print(f"Processing {total} NWB file(s)...")
 
-    combined: List[pd.DataFrame] = []
+    newly_generated: List[pd.DataFrame] = []
+
     for i, nwb_path in enumerate(nwb_files, start=1):
         if show_progress and not use_tqdm:
             print(f"[{i}/{total}] {nwb_path}")
@@ -393,7 +486,7 @@ def create_opto_data_frame_combined(
         if nwb_data is None:
             msg = f"Warning: Could not read NWB file {nwb_path}, skipping."
             if use_tqdm:
-                pbar.write(msg)  # keep tqdm bar intact
+                pbar.write(msg)
             else:
                 print(msg)
             if use_tqdm:
@@ -402,7 +495,7 @@ def create_opto_data_frame_combined(
 
         try:
             df = create_opto_data_frame(nwb_data)
-            combined.append(df)
+            newly_generated.append(df)
         except Exception as e:
             msg = f"Error processing {nwb_path}: {e}"
             if use_tqdm:
@@ -421,14 +514,21 @@ def create_opto_data_frame_combined(
     if use_tqdm and pbar is not None:
         pbar.close()
 
-    if not combined:
-        raise ValueError("No valid DataFrames were created from the input NWB files.")
+    # --- combine existing + new ---
+    if existing_df is None:
+        if not newly_generated:
+            raise ValueError("No valid DataFrames were created from the input NWB files.")
+        combined_df = pd.concat(newly_generated, ignore_index=True)
+    else:
+        if newly_generated:
+            new_df = pd.concat(newly_generated, ignore_index=True)
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        else:
+            combined_df = existing_df
 
-    combined_df = pd.concat(combined, ignore_index=True)
-
+    # --- save (optional) ---
     if save_path is not None:
         save_path = Path(save_path)
-        # If a directory is given, place default filename inside it
         if save_path.suffix.lower() != ".csv":
             save_path.mkdir(parents=True, exist_ok=True)
             save_path = save_path / "combined_opto_data_frame.csv"
@@ -442,8 +542,10 @@ def create_opto_data_frame_combined(
     return combined_df
 
 
+
+
 def load_opto_data_frame(
-    csv_path: Union[str, Path] = "/root/capsule/results/combined_opto_data_frame.csv"
+    csv_path: Union[str, Path] = "/root/capsule/scratch/combined_opto_data_frame.csv"
 ) -> pd.DataFrame:
     """
     Load a saved optogenetics combined CSV and normalize missing values so they
