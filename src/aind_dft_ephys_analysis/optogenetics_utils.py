@@ -1,8 +1,10 @@
 import os
+import re
+import unicodedata
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from collections.abc import Iterable
+from typing import Iterable, List, Union, Optional
 from typing import List, Any, Union, Optional, Dict
 
 from behavior_utils import extract_fitted_data
@@ -342,7 +344,6 @@ def _collect_nwb_files(sources: Union[str, Path, Iterable[Union[str, Path]]]) ->
         raise FileNotFoundError("No NWB files found to process.")
     return files
 
-
 def create_opto_data_frame_combined(
     sources: Union[str, Path, Iterable[Union[str, Path]]] = "/root/capsule/data/optogenetics_nwb",
     save_path: Optional[Union[str, Path]] = None,
@@ -539,6 +540,7 @@ def create_opto_data_frame_combined(
         if show_progress:
             print(f"Combined DataFrame saved to {save_path}")
 
+    combined_df=normalize_string_columns(combined_df)
     return combined_df
 
 
@@ -639,3 +641,125 @@ def find_unique_values_by_conditions(
         series = series.dropna()
 
     return series.drop_duplicates().tolist()
+
+
+def normalize_string_columns(
+    combined_dataframe: pd.DataFrame,
+    columns: Optional[Union[str, Iterable[str]]] = None,
+    *,
+    to_upper: bool = False,
+    to_lower: bool = True,
+    unify_arrows: bool = True,
+    convert_numeric: bool = True,
+    inplace: bool = False,
+) -> pd.DataFrame:
+    """
+    Normalize columns in a DataFrame to reduce visually-identical but actually-different
+    values.
+
+    If `columns` is None, all columns in the DataFrame will be normalized.
+
+    This function handles:
+    - Unicode normalization
+    - Hidden / zero-width characters
+    - Whitespace normalization
+    - Arrow normalization (e.g. →, –>)
+    - Uppercase OR lowercase normalization (mutually exclusive)
+    - Numeric normalization (e.g. "50.0" -> 50.0)
+    - Missing-value normalization (e.g. "NA", "none", "NaN" -> pd.NA)
+
+    Parameters
+    ----------
+    combined_dataframe : pandas.DataFrame
+        Input DataFrame to normalize.
+    columns : str | Iterable[str] | None, default None
+        Column name (single), list of column names, or None to normalize all columns.
+    to_upper : bool, default True
+        If True, convert strings to uppercase.
+    to_lower : bool, default False
+        If True, convert strings to lowercase.
+    unify_arrows : bool, default True
+        If True, normalize arrow variants to "->".
+    convert_numeric : bool, default True
+        If True, convert numeric-looking strings to numbers.
+    inplace : bool, default False
+        If True, modify the input DataFrame in place.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The normalized DataFrame.
+    """
+    if to_upper and to_lower:
+        raise ValueError("Only one of `to_upper` or `to_lower` can be True.")
+
+    df = combined_dataframe if inplace else combined_dataframe.copy()
+
+    # Determine which columns to normalize
+    if columns is None:
+        columns = list(df.columns)
+    elif isinstance(columns, str):
+        columns = [columns]
+    else:
+        columns = list(columns)
+
+    missing_cols = [c for c in columns if c not in df.columns]
+    if missing_cols:
+        raise KeyError(f"Columns not found in DataFrame: {missing_cols}")
+
+    whitespace_re = re.compile(r"\s+")
+    zero_width_re = re.compile(r"[\u200B\u200C\u200D\uFEFF]")
+
+    # Canonical set of missing-value strings (case-insensitive)
+    missing_strings = {
+        "NA", "N/A", "NAN", "NONE", "NULL", ""
+    }
+
+    def _normalize_value(x: object) -> object:
+        # Preserve real missing values
+        if pd.isna(x):
+            return pd.NA
+
+        # Preserve true numeric types
+        if isinstance(x, (int, float)):
+            return x
+
+        s = str(x)
+
+        # Unicode normalization
+        s = unicodedata.normalize("NFKC", s)
+
+        # Remove zero-width characters
+        s = zero_width_re.sub("", s)
+
+        # Normalize spaces
+        s = s.replace("\u00A0", " ")
+        s = whitespace_re.sub(" ", s).strip()
+
+        # Check for missing-value strings (case-insensitive)
+        if s.upper() in missing_strings:
+            return pd.NA
+
+        # Arrow normalization
+        if unify_arrows:
+            s = s.replace("→", "->").replace("⇒", "->").replace("➔", "->").replace("➜", "->")
+            s = s.replace("−", "-").replace("–", "-").replace("—", "-")
+            s = re.sub(r"-\s*>", "->", s)
+
+        # Convert numeric-looking strings to numbers
+        if convert_numeric and re.fullmatch(r"[+-]?\d+(\.\d+)?", s):
+            return float(s) if "." in s else int(s)
+
+        # Normalize casing for non-numeric strings
+        if to_upper:
+            s = s.upper()
+        elif to_lower:
+            s = s.lower()
+
+        return s
+
+    for c in columns:
+        df[c] = df[c].map(_normalize_value)
+
+    return df
+
