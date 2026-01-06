@@ -1223,7 +1223,7 @@ def plot_qlearning_hist_and_scatter_from_nwb(
       - QLearning_L1F1_CK1_softmax
       - QLearning_L2F1_softmax
       - QLearning_L2F1_CK1_softmax
-      - QLearning_L2F1_CKFull_softmax
+      - QLearning_L2F1_CKfull_softmax
       - ForagingCompareThreshold (value / RPE only)
 
     Any model-field combination that is missing or empty in `summary`
@@ -1281,7 +1281,7 @@ def plot_qlearning_hist_and_scatter_from_nwb(
             ],
         },
         {
-            "name": "QLearning_L2F1_CKFull_softmax",
+            "name": "QLearning_L2F1_CKfull_softmax",
             "label": "L2F1_CKFull",
             "hist_fields": ["QL", "QR", "chosenQ", "unchosenQ", "deltaQ", "sumQ", "RPE"],
             "scatter_pairs": [
@@ -1842,7 +1842,7 @@ def plot_rpe_history_regression_from_nwb(
         {"name": "QLearning_L1F1_CK1_softmax",    "label": "L1F1_CK1"},
         {"name": "QLearning_L2F1_softmax",        "label": "L2F1"},
         {"name": "QLearning_L2F1_CK1_softmax",    "label": "L2F1_CK1"},
-        {"name": "QLearning_L2F1_CKFull_softmax", "label": "L2F1_CKFull"},
+        {"name": "QLearning_L2F1_CKfull_softmax", "label": "L2F1_CKFull"},
         {"name": "ForagingCompareThreshold",      "label": "Foraging"},
     ]
 

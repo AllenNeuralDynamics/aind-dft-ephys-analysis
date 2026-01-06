@@ -848,7 +848,7 @@ def generate_behavior_summary(
         'QLearning_L1F1_CK1_softmax',
         'QLearning_L2F1_softmax',
         'QLearning_L2F1_CK1_softmax',
-        'QLearning_L2F1_CKFull_softmax',
+        'QLearning_L2F1_CKfull_softmax',
         'q_learning_Y1',
         'no_model'
     ],
@@ -1040,7 +1040,7 @@ def generate_behavior_summary(
 
 def generate_behavior_summary_combined(
     session_names: List[str],
-    model_alias:  Union[str, List[str]] = ['ForagingCompareThreshold','QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax','q_learning_Y1','no_model'],
+    model_alias:  Union[str, List[str]] = ['ForagingCompareThreshold','QLearning_L1F1_CK1_softmax', 'QLearning_L2F1_softmax', 'QLearning_L2F1_CK1_softmax','QLearning_L2F1_CKfull_softmax','q_learning_Y1','no_model'],
     latent_names: Optional[List[str]] = None,
     trial_types: Optional[List[str]] = None,
     save_folder: str = '/root/capsule/results',
