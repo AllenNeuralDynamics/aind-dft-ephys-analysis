@@ -643,3 +643,5 @@ def compute_behavior_qc_from_nwb(
     )
 
     return metrics, trial_df
+
+

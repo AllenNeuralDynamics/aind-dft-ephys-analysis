@@ -353,7 +353,7 @@ def extract_fitted_data(
     Extract a chosen derived time series from a behavioral model’s fitted latent variables.
 
     You must supply **either**:
-      - `fitted_latent`: the dict returned by `get_fitted_latent(...)`, and `model_alias` **or**
+      - `fitted_latent`: the dict returned by `get_fitted_latent(...)`, `model_alias` and latent_name**or**
       - all three of `session_name`, `model_alias`, and `latent_name`, so that this function can fetch it.
 
     Parameters

@@ -1,8 +1,9 @@
 import io
 import os
 import numpy as np
+import pandas as pd   
 import matplotlib.pyplot as plt
-from typing import Any, Optional, Dict, Tuple, Sequence
+from typing import Any, Optional, Dict, Tuple, Sequence, Iterable, Union, List
 
 from behavior_qc import compute_behavior_qc_from_nwb
 from general_visualization import plot_behavior_session
@@ -10,8 +11,10 @@ from model_fitting import (
     fit_choice_logistic_regression_from_nwb,
     visualize_choice_logistic_regression,
 )
-from behavior_utils import generate_behavior_summary   # ← NEW IMPORT
-import pandas as pd                                    # ← NEW IMPORT
+from behavior_utils import generate_behavior_summary, get_fitted_latent, extract_fitted_data
+from nwb_utils import NWBUtils
+
+
 
 
 # =========================================================
@@ -1793,7 +1796,6 @@ def _get_reward_and_choice_from_nwb(
 def plot_rpe_history_regression_from_nwb(
     nwb_data: Any,
     *,
-    summary: Optional[pd.DataFrame] = None,
     max_lag: int = 8,
     panel_width: float = 3.2,
     panel_height: float = 2.3,
@@ -1813,8 +1815,6 @@ def plot_rpe_history_regression_from_nwb(
     ----------
     nwb_data : Any
         NWB-like object with trials and acquisition data.
-    summary : pandas.DataFrame, optional
-        Output of generate_behavior_summary(nwb_data).
     max_lag : int
         Maximum number of history lags (in trials) to include.
     panel_width, panel_height : float
@@ -1837,8 +1837,6 @@ def plot_rpe_history_regression_from_nwb(
     # ---------------------------------------------------
     # 1) Obtain summary
     # ---------------------------------------------------
-    if summary is None:
-        summary = generate_behavior_summary(nwb_data)
 
     model_configs = [
         {"name": "QLearning_L1F1_CK1_softmax",    "label": "L1F1_CK1"},
@@ -1888,7 +1886,14 @@ def plot_rpe_history_regression_from_nwb(
         model_name = cfg["name"]
         model_label = cfg["label"]
 
-        rpe = _get_model_field_array(summary, model_name, "RPE")
+        res = get_fitted_latent(session_name=nwb_data.session_id,model_alias=model_name)
+        lat = res.get("fitted_latent_variables", {})
+        if "rpe" not in lat:
+            # No RPE saved for this model/session → skip
+            rpe=extract_fitted_data(nwb_behavior_data=nwb_data,fitted_latent=res,model_alias=model_name,latent_name='RPE')
+        else:
+            rpe = np.asarray(lat["rpe"], dtype=float).ravel()
+
         coeffs[model_name] = {}
 
         if rpe.size == 0:
@@ -1996,7 +2001,122 @@ def plot_rpe_history_regression_from_nwb(
     return fig, axes, coeffs
 
 
+def collect_behavior_model_summary(
+    sessions: Iterable[str],
+    models: Union[str, Iterable[str]] = [
+        "QLearning_L1F1_CK1_softmax",
+        "QLearning_L2F1_softmax",
+        "QLearning_L2F1_CK1_softmax",
+        "QLearning_L2F1_CKfull_softmax",
+        "ForagingCompareThreshold",
+    ],
+) -> pd.DataFrame:
+    """
+    Collect fitted Q-learning parameters, model metrics, and RPE history
+    regression summaries across sessions and models.
 
+    Model-specific columns are prefixed with the actual model name plus an underscore,
+    e.g. "QLearning_L2F1_softmax_log_likelihood".
+
+    Parameters
+    ----------
+    sessions : Iterable[str]
+        Iterable of session names.
+    models : str | Iterable[str]
+        Model alias or a list of model aliases. The same model name is used
+        for both fitted latent extraction and RPE history regression.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Wide-format DataFrame with one row per session and one block of columns per model.
+    """
+    if isinstance(models, str):
+        models = [models]
+
+    rows: List[dict] = []
+
+    for session in sessions:
+        row: dict = {"session": session}
+
+        # Read NWB once per session
+        nwb_data = NWBUtils.read_behavior_nwb(session_name=session)
+
+        # Compute RPE history regression once per session
+        _, _, fitting_results = plot_rpe_history_regression_from_nwb(
+            nwb_data=nwb_data,
+            make_figure=False,
+            show_figure=False,
+        )
+
+        for model in models:
+            prefix = f"{model}_"
+
+            try:
+                # -------------------------------
+                # Fitted latent parameters/metrics
+                # -------------------------------
+                results = get_fitted_latent(
+                    session_name=session,
+                    model_alias=model,
+                )
+
+                params = results.get("params", {})
+                metrics = results.get("results", {})
+
+                row.update({
+                    f"{prefix}learn_rate_rew": params.get("learn_rate_rew"),
+                    f"{prefix}learn_rate_unrew": params.get("learn_rate_unrew"),
+                    f"{prefix}forget_rate_unchosen": params.get("forget_rate_unchosen"),
+                    f"{prefix}choice_kernel_relative_weight": params.get("choice_kernel_relative_weight"),
+                    f"{prefix}choice_kernel_step_size": params.get("choice_kernel_step_size"),
+                    f"{prefix}biasL": params.get("biasL"),
+                    f"{prefix}softmax_inverse_temperature": params.get("softmax_inverse_temperature"),
+                    f"{prefix}learn_rate": params.get("learn_rate"),
+                    f"{prefix}forget_rate_unchosen": params.get("forget_rate_unchosen"),
+
+                    f"{prefix}log_likelihood": metrics.get("log_likelihood"),
+                    f"{prefix}AIC": metrics.get("AIC"),
+                    f"{prefix}BIC": metrics.get("BIC"),
+                    f"{prefix}LPT": metrics.get("LPT"),
+                    f"{prefix}LPT_AIC": metrics.get("LPT_AIC"),
+                    f"{prefix}LPT_BIC": metrics.get("LPT_BIC"),
+                    f"{prefix}prediction_accuracy": metrics.get("prediction_accuracy")
+                })
+
+                # ---------------------------------
+                # RPE history regression (same model)
+                # ---------------------------------
+                reward_coefs = (
+                    fitting_results
+                    .get(model, {})
+                    .get("all", {})
+                    .get("reward_coefs")
+                )
+
+                if reward_coefs is not None:
+                    reward_coefs = np.asarray(reward_coefs)
+                    row.update({
+                        f"{prefix}reward_coefs": reward_coefs,
+                    })
+                else:
+                    row.update({
+                        f"{prefix}reward_coefs": np.nan,
+
+                    })
+            except Exception as exc:
+                row[f"{prefix}error"] = str(exc)
+
+        # logistic regression
+        logistic_results=fit_choice_logistic_regression_from_nwb(nwb_data) 
+        logistic_bias=logistic_results['fit_result'].params[0]
+        row.update({
+            f"logistic_bias": logistic_bias,
+        })
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 
