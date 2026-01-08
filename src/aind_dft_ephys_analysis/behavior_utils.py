@@ -333,7 +333,8 @@ def get_fitted_latent(
     try:
         return {
             "params": row["params"],
-            "fitted_latent_variables": row["latent_variables"]
+            "fitted_latent_variables": row["latent_variables"],
+            "results": row
         }
     except KeyError:
         print("Fit‐results DataFrame missing 'params' or 'latent_variables' columns")
