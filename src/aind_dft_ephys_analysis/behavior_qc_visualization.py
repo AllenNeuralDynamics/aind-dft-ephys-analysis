@@ -1797,6 +1797,8 @@ def plot_rpe_history_regression_from_nwb(
     max_lag: int = 8,
     panel_width: float = 3.2,
     panel_height: float = 2.3,
+    make_figure: bool = True,
+    show_figure: bool = True,
 ):
     """
     Plot regression:
@@ -1807,33 +1809,33 @@ def plot_rpe_history_regression_from_nwb(
 
     for each model and for several trial subsets.
 
-    Uses tight_layout + a reserved bottom margin so the global
-    xlabel is always visible and not overlapping the panels.
-
     Parameters
     ----------
     nwb_data : Any
         NWB-like object with trials and acquisition data.
     summary : pandas.DataFrame, optional
-        Output of generate_behavior_summary(nwb_data). If provided,
-        this function will NOT call generate_behavior_summary again.
+        Output of generate_behavior_summary(nwb_data).
     max_lag : int
         Maximum number of history lags (in trials) to include.
-        Note: lag 0 (current trial) may be included in the regression,
-        depending on how _fit_rpe_history_regression is implemented.
     panel_width, panel_height : float
         Size of each panel in inches.
+    make_figure : bool, default True
+        Whether to construct the matplotlib figure and axes.
+        If False, plotting is skipped and only coefficients are returned.
+    show_figure : bool, default True
+        Whether to display the figure via plt.show(). Ignored if
+        make_figure is False.
 
     Returns
     -------
-    fig : matplotlib.figure.Figure
-    axes : np.ndarray of Axes, shape (n_models, n_conditions)
+    fig : matplotlib.figure.Figure or None
+    axes : np.ndarray of Axes or None
     coeffs : dict
         Nested dict: coeffs[model_name][subset_key] -> regression dict.
     """
 
     # ---------------------------------------------------
-    # 1) Obtain summary (or reuse provided one)
+    # 1) Obtain summary
     # ---------------------------------------------------
     if summary is None:
         summary = generate_behavior_summary(nwb_data)
@@ -1857,54 +1859,47 @@ def plot_rpe_history_regression_from_nwb(
     n_models = len(model_configs)
     n_conditions = len(subsets)
 
-    fig_width = panel_width * n_conditions
-    fig_height = panel_height * n_models
+    # ---------------------------------------------------
+    # 2) Create figure only if requested
+    # ---------------------------------------------------
+    if make_figure:
+        fig_width = panel_width * n_conditions
+        fig_height = panel_height * n_models
 
-    # Turn OFF constrained_layout; we will use tight_layout + rect
-    fig, axes = plt.subplots(
-        n_models,
-        n_conditions,
-        figsize=(fig_width, fig_height),
-        squeeze=False,
-        sharex=False,
-        constrained_layout=False,
-    )
+        fig, axes = plt.subplots(
+            n_models,
+            n_conditions,
+            figsize=(fig_width, fig_height),
+            squeeze=False,
+            sharex=False,
+            constrained_layout=False,
+        )
+    else:
+        fig = None
+        axes = None
 
-    # Reward / choice from NWB (already filtered to exclude no-response trials)
     reward_all, choice_all = _get_reward_and_choice_from_nwb(nwb_data)
-
     coeffs: Dict[str, Dict[str, Any]] = {}
 
     # =====================================================
-    # 2) LOOP: models
+    # 3) LOOP: models
     # =====================================================
     for m_idx, cfg in enumerate(model_configs):
         model_name = cfg["name"]
         model_label = cfg["label"]
 
-        # RPE series for this model
         rpe = _get_model_field_array(summary, model_name, "RPE")
         coeffs[model_name] = {}
 
-        # No RPE available → blank row
         if rpe.size == 0:
-            for c_idx in range(n_conditions):
-                axes[m_idx, c_idx].axis("off")
             continue
 
         reward = reward_all
         choice = choice_all
-
         T = rpe.size
         row_values: list[float] = []
 
-        # =====================================================
-        # 3) LOOP: subsets
-        # =====================================================
         for c_idx, (subset_key, subset_label) in enumerate(subsets):
-            ax = axes[m_idx, c_idx]
-
-            # Target mask is always length T (same as rpe)
             if subset_key == "all":
                 target_mask = np.ones(T, dtype=bool)
             elif subset_key == "rpe_pos":
@@ -1912,13 +1907,12 @@ def plot_rpe_history_regression_from_nwb(
             elif subset_key == "rpe_neg":
                 target_mask = rpe < 0
             elif subset_key == "choice_left":
-                target_mask = choice[:T] < 0   # in case choice is longer
+                target_mask = choice[:T] < 0
             elif subset_key == "choice_right":
-                target_mask = choice[:T] > 0   # in case choice is longer
+                target_mask = choice[:T] > 0
             else:
                 target_mask = np.ones(T, dtype=bool)
 
-            # Fit regression; handle possible length mismatch gracefully
             try:
                 reg = _fit_rpe_history_regression(
                     rpe=rpe,
@@ -1928,77 +1922,56 @@ def plot_rpe_history_regression_from_nwb(
                     target_mask=target_mask,
                 )
             except ValueError as e:
-                # Length mismatch between rpe / reward / choice
                 print(
                     f"Warning in plot_rpe_history_regression_from_nwb "
                     f"for model {model_name}, subset {subset_key}: {e}"
                 )
                 reg = None
 
-            if reg is None:
-                ax.axis("off")
-                coeffs[model_name][subset_key] = {}
+            coeffs[model_name][subset_key] = reg or {}
+
+            if (not make_figure) or reg is None:
                 continue
 
-            coeffs[model_name][subset_key] = reg
+            ax = axes[m_idx, c_idx]
 
             reward_coefs = np.asarray(reg["reward_coefs"], dtype=float)
             choice_coefs = np.asarray(reg["choice_coefs"], dtype=float)
-            bias = reg["bias"]
-            n_samples = reg["n_samples"]
 
-            # Make sure reward & choice history have the same effective length
             n_lags_eff = min(reward_coefs.size, choice_coefs.size)
-            reward_coefs = reward_coefs[:n_lags_eff]
-            choice_coefs = choice_coefs[:n_lags_eff]
-
-            # If nothing left, skip this panel
             if n_lags_eff == 0:
                 ax.axis("off")
                 continue
 
-            # Lag axis is derived from coefficient length
+            reward_coefs = reward_coefs[:n_lags_eff]
+            choice_coefs = choice_coefs[:n_lags_eff]
             lags = np.arange(n_lags_eff)
 
-            # Collect for shared y-limits
-            row_values.extend(list(reward_coefs))
-            row_values.extend(list(choice_coefs))
+            row_values.extend(reward_coefs)
+            row_values.extend(choice_coefs)
 
-            # -------------------------------------------------
-            # Plot
-            # -------------------------------------------------
             ax.axhline(0, ls="--", lw=0.7, color="k", alpha=0.7)
-
             ax.plot(lags, reward_coefs, marker="o", label="Reward history")
             ax.plot(lags, choice_coefs, marker="s", label="Choice history")
 
             ax.set_xticks(lags)
             ax.tick_params(axis="both", labelsize=8)
 
-            # Y-label only on the leftmost column
             if c_idx == 0:
                 ax.set_ylabel(f"{model_label}\nCoefficient", fontsize=10)
 
             ax.set_title(
                 f"{subset_label}\n"
-                f"bias = {bias:.3f}, n = {n_samples}",
+                f"bias = {reg['bias']:.3f}, n = {reg['n_samples']}",
                 fontsize=10,
             )
 
-            # Legend only on the first column; remove from others
             if c_idx == 0:
                 ax.legend(fontsize=7, framealpha=0.4, loc="upper right")
-            else:
-                leg = ax.get_legend()
-                if leg is not None:
-                    leg.remove()
 
             ax.grid(True, alpha=0.3)
 
-        # -----------------------------------------------------
-        # 4) Shared y-limits for all subsets in this model row
-        # -----------------------------------------------------
-        if len(row_values) > 0:
+        if make_figure and row_values:
             ymin = np.min(row_values) * 1.1
             ymax = np.max(row_values) * 1.1
             for c_idx in range(n_conditions):
@@ -2006,22 +1979,22 @@ def plot_rpe_history_regression_from_nwb(
                     axes[m_idx, c_idx].set_ylim(ymin, ymax)
 
     # -----------------------------------------------------
-    # 5) Global layout: leave top & bottom margins
+    # 4) Final layout & display
     # -----------------------------------------------------
-    # Reserve some space at the top for the title and at the bottom for the xlabel.
-    # rect = [left, bottom, right, top] in figure coordinates.
-    fig.tight_layout(rect=[0.03, 0.08, 0.97, 0.90])
+    if make_figure:
+        fig.tight_layout(rect=[0.03, 0.08, 0.97, 0.90])
+        fig.suptitle(
+            "RPE(t) ~ Reward and choice history\nPer model and subset",
+            fontsize=16,
+            y=0.96,
+        )
+        fig.supxlabel("Lag index (0 = most recent)", fontsize=14, y=0.04)
 
-    fig.suptitle(
-        "RPE(t) ~ Reward and choice history\nPer model and subset",
-        fontsize=16,
-        y=0.96,
-    )
-
-    # Put global x-label just below the axes, but above the bottom edge
-    fig.supxlabel("Lag index (0 = most recent)", fontsize=14, y=0.04)
+        if show_figure:
+            plt.show()
 
     return fig, axes, coeffs
+
 
 
 
