@@ -1743,6 +1743,14 @@ def _get_reward_and_choice_from_nwb(
     Returns reward_raw and choice arrays AFTER filtering.
     """
 
+    # Defensive checks
+    if nwb_data is None:
+        raise ValueError("nwb_data is None. Behavior NWB could not be loaded for this session.")
+    if not hasattr(nwb_data, "trials") or nwb_data.trials is None:
+        raise ValueError("nwb_data.trials is missing. This does not look like a valid behavior NWB.")
+
+
+
     # Rewarded left/right
     rewarded_L = np.asarray(
         nwb_data.trials["rewarded_historyL"][:],
@@ -1796,6 +1804,7 @@ def _get_reward_and_choice_from_nwb(
 def plot_rpe_history_regression_from_nwb(
     nwb_data: Any,
     *,
+    session_name: str=None,
     max_lag: int = 8,
     panel_width: float = 3.2,
     panel_height: float = 2.3,
@@ -1837,6 +1846,8 @@ def plot_rpe_history_regression_from_nwb(
     # ---------------------------------------------------
     # 1) Obtain summary
     # ---------------------------------------------------
+    if session_name is None:
+        session_name = nwb_data.session_id
 
     model_configs = [
         {"name": "QLearning_L1F1_CK1_softmax",    "label": "L1F1_CK1"},
@@ -1886,7 +1897,9 @@ def plot_rpe_history_regression_from_nwb(
         model_name = cfg["name"]
         model_label = cfg["label"]
 
-        res = get_fitted_latent(session_name=nwb_data.session_id,model_alias=model_name)
+        res = get_fitted_latent(session_name=session_name,model_alias=model_name)
+        if res is None:
+            continue
         lat = res.get("fitted_latent_variables", {})
         if "rpe" not in lat:
             # No RPE saved for this model/session → skip
@@ -2039,28 +2052,39 @@ def collect_behavior_model_summary(
     for session in sessions:
         row: dict = {"session": session}
 
-        # Read NWB once per session
-        nwb_data = NWBUtils.read_behavior_nwb(session_name=session)
+        # -----------------------------------------
+        # 1) Load NWB safely
+        # -----------------------------------------
+        try:
+            nwb_data = NWBUtils.read_behavior_nwb(session_name=session)
+        except Exception as exc:
+            row["nwb_load_error"] = f"read_behavior_nwb exception: {exc}"
+            rows.append(row)
+            continue
 
-        # Compute RPE history regression once per session
+        if nwb_data is None:
+            row["nwb_load_error"] = "read_behavior_nwb returned None (missing/invalid behavior NWB?)"
+            rows.append(row)
+            continue
+
+        # -----------------------------------------
+        # 2) RPE history regression once per session
+        # -----------------------------------------
         _, _, fitting_results = plot_rpe_history_regression_from_nwb(
             nwb_data=nwb_data,
-            make_figure=False,
-            show_figure=False,
+            session_name=session,
+            make_figure=True,
+            show_figure=True,
         )
 
+        # -----------------------------------------
+        # 3) Per-model fitted params/metrics + reg outputs
+        # -----------------------------------------
         for model in models:
             prefix = f"{model}_"
 
             try:
-                # -------------------------------
-                # Fitted latent parameters/metrics
-                # -------------------------------
-                results = get_fitted_latent(
-                    session_name=session,
-                    model_alias=model,
-                )
-
+                results = get_fitted_latent(session_name=session, model_alias=model)
                 params = results.get("params", {})
                 metrics = results.get("results", {})
 
@@ -2073,7 +2097,6 @@ def collect_behavior_model_summary(
                     f"{prefix}biasL": params.get("biasL"),
                     f"{prefix}softmax_inverse_temperature": params.get("softmax_inverse_temperature"),
                     f"{prefix}learn_rate": params.get("learn_rate"),
-                    f"{prefix}forget_rate_unchosen": params.get("forget_rate_unchosen"),
 
                     f"{prefix}log_likelihood": metrics.get("log_likelihood"),
                     f"{prefix}AIC": metrics.get("AIC"),
@@ -2081,7 +2104,7 @@ def collect_behavior_model_summary(
                     f"{prefix}LPT": metrics.get("LPT"),
                     f"{prefix}LPT_AIC": metrics.get("LPT_AIC"),
                     f"{prefix}LPT_BIC": metrics.get("LPT_BIC"),
-                    f"{prefix}prediction_accuracy": metrics.get("prediction_accuracy")
+                    f"{prefix}prediction_accuracy": metrics.get("prediction_accuracy"),
                 })
 
                 # ---------------------------------
@@ -2117,6 +2140,7 @@ def collect_behavior_model_summary(
         rows.append(row)
 
     return pd.DataFrame(rows)
+
 
 
 
