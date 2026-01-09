@@ -2022,6 +2022,10 @@ def collect_behavior_model_summary(
         "QLearning_L2F1_CK1_softmax",
         "QLearning_L2F1_CKfull_softmax",
         "ForagingCompareThreshold",
+        'QLearning_L1F0_CKfull_softmax',
+        'QLearning_L1F1_CKfull_softmax'
+
+
     ],
 ) -> pd.DataFrame:
     """
