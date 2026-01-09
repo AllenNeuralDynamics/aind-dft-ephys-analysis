@@ -2077,8 +2077,8 @@ def collect_behavior_model_summary(
         _, _, fitting_results = plot_rpe_history_regression_from_nwb(
             nwb_data=nwb_data,
             session_name=session,
-            make_figure=True,
-            show_figure=True,
+            make_figure=False,
+            show_figure=False,
         )
 
         # -----------------------------------------
