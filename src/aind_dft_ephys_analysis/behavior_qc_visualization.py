@@ -2162,6 +2162,19 @@ def collect_behavior_model_summary(
             f"logistic_bias": logistic_bias,
         })
 
+        # Inside the session iteration loop, after loading the NWB data
+        try:
+            # Extract the last element of auto_train_stage if it exists
+            if 'auto_train_stage' in nwb_data.trials.columns and len(nwb_data.trials['auto_train_stage']) > 0:
+                auto_train_stage = nwb_data.trials['auto_train_stage'][-1]
+            else:
+                auto_train_stage = np.nan  # Or None, depending on your preference
+
+            row["auto_train_stage"] = auto_train_stage
+
+        except Exception as exc:
+            row["auto_train_stage_error"] = str(exc)
+
         rows.append(row)
 
     return pd.DataFrame(rows)
