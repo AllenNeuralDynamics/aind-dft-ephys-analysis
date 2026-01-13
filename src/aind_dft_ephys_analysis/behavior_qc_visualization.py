@@ -1843,19 +1843,24 @@ def plot_rpe_history_regression_from_nwb(
         Nested dict: coeffs[model_name][subset_key] -> regression dict.
     """
 
-    # ---------------------------------------------------
-    # 1) Obtain summary
-    # ---------------------------------------------------
-    if session_name is None:
-        session_name = nwb_data.session_id
-
     model_configs = [
+        {"name": "QLearning_L1F0_CKfull_softmax", "label": "L1F0_CKFull"},
         {"name": "QLearning_L1F1_CK1_softmax",    "label": "L1F1_CK1"},
+        {"name": "QLearning_L1F1_CKfull_softmax", "label": "L1F1_CKFull"},
         {"name": "QLearning_L2F1_softmax",        "label": "L2F1"},
         {"name": "QLearning_L2F1_CK1_softmax",    "label": "L2F1_CK1"},
         {"name": "QLearning_L2F1_CKfull_softmax", "label": "L2F1_CKFull"},
         {"name": "ForagingCompareThreshold",      "label": "Foraging"},
     ]
+
+
+    # ---------------------------------------------------
+    # 1) Obtain summary
+    # ---------------------------------------------------
+    if session_name is None:
+        session_name = getattr(nwb_data, "session_id", None)
+        if session_name is None:
+            raise ValueError("session_name is None and nwb_data.session_id is missing.")
 
     subsets = [
         ("all",         "All trials"),
@@ -2015,7 +2020,7 @@ def plot_rpe_history_regression_from_nwb(
 
 
 def collect_behavior_model_summary(
-    sessions: Iterable[str],
+    sessions: Optional[Iterable[str]] = None,
     models: Union[str, Iterable[str]] = [
         "QLearning_L1F1_CK1_softmax",
         "QLearning_L2F1_softmax",
@@ -2023,10 +2028,9 @@ def collect_behavior_model_summary(
         "QLearning_L2F1_CKfull_softmax",
         "ForagingCompareThreshold",
         'QLearning_L1F0_CKfull_softmax',
-        'QLearning_L1F1_CKfull_softmax'
-
-
+        'QLearning_L1F1_CKfull_softmax',
     ],
+    session_paths: Optional[List[str]] = None,  # Ensure session_paths is a list
 ) -> pd.DataFrame:
     """
     Collect fitted Q-learning parameters, model metrics, and RPE history
@@ -2037,11 +2041,13 @@ def collect_behavior_model_summary(
 
     Parameters
     ----------
-    sessions : Iterable[str]
-        Iterable of session names.
+    sessions : Optional[Iterable[str]], optional
+        Iterable of session names. If not provided, session_paths will be used.
     models : str | Iterable[str]
         Model alias or a list of model aliases. The same model name is used
         for both fitted latent extraction and RPE history regression.
+    session_paths : Optional[List[str]], optional
+        Full paths for each session (default is None). Should be provided as a list.
 
     Returns
     -------
@@ -2053,14 +2059,30 @@ def collect_behavior_model_summary(
 
     rows: List[dict] = []
 
-    for session in sessions:
+    # If neither sessions nor session_paths is provided, return an empty DataFrame
+    if not sessions and not session_paths:
+        return pd.DataFrame()
+
+    if sessions:
+        session_iters = sessions
+        tag=1
+    elif session_paths:
+        session_iters = session_paths
+        tag=0
+
+    for session in session_iters:
+        session_name = os.path.basename(session)
         row: dict = {"session": session}
 
         # -----------------------------------------
         # 1) Load NWB safely
         # -----------------------------------------
         try:
-            nwb_data = NWBUtils.read_behavior_nwb(session_name=session)
+            # Use session_paths if provided, otherwise fall back to session name
+            if tag == 0:
+                nwb_data = NWBUtils.read_behavior_nwb(nwb_full_path=session)
+            elif tag == 1:
+                nwb_data = NWBUtils.read_behavior_nwb(session_name=session)
         except Exception as exc:
             row["nwb_load_error"] = f"read_behavior_nwb exception: {exc}"
             rows.append(row)
@@ -2076,7 +2098,7 @@ def collect_behavior_model_summary(
         # -----------------------------------------
         _, _, fitting_results = plot_rpe_history_regression_from_nwb(
             nwb_data=nwb_data,
-            session_name=session,
+            session_name=session_name,
             make_figure=False,
             show_figure=False,
         )
@@ -2088,7 +2110,7 @@ def collect_behavior_model_summary(
             prefix = f"{model}_"
 
             try:
-                results = get_fitted_latent(session_name=session, model_alias=model)
+                results = get_fitted_latent(session_name=session_name, model_alias=model)
                 params = results.get("params", {})
                 metrics = results.get("results", {})
 
@@ -2129,14 +2151,13 @@ def collect_behavior_model_summary(
                 else:
                     row.update({
                         f"{prefix}reward_coefs": np.nan,
-
                     })
             except Exception as exc:
                 row[f"{prefix}error"] = str(exc)
 
-        # logistic regression
-        logistic_results=fit_choice_logistic_regression_from_nwb(nwb_data) 
-        logistic_bias=logistic_results['fit_result'].params[0]
+        # Logistic regression
+        logistic_results = fit_choice_logistic_regression_from_nwb(nwb_data) 
+        logistic_bias = logistic_results['fit_result'].params[0]
         row.update({
             f"logistic_bias": logistic_bias,
         })
@@ -2144,6 +2165,9 @@ def collect_behavior_model_summary(
         rows.append(row)
 
     return pd.DataFrame(rows)
+
+
+
 
 
 
