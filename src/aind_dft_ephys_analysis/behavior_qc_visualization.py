@@ -1,5 +1,6 @@
 import io
 import os
+import ast
 import numpy as np
 import pandas as pd   
 import matplotlib.pyplot as plt
@@ -13,8 +14,6 @@ from model_fitting import (
 )
 from behavior_utils import generate_behavior_summary, get_fitted_latent, extract_fitted_data
 from nwb_utils import NWBUtils
-
-
 
 
 # =========================================================
@@ -2181,9 +2180,271 @@ def collect_behavior_model_summary(
 
 
 
+def plot_x_vs_y_by_stage(
+    summary,
+    models: Optional[Sequence[str]] = None,
+    *,
+    suffix_x: str = "LPT",
+    suffix_y: str = "reward_coefs_sum6",
+    stage: Optional[Union[str, Sequence[Optional[str]]]] = None,
+    min_points: int = 3,
+    alpha: float = 0.6,
+    figsize_per_panel: tuple = (4, 4),
+    show_grid: bool = True,
+    show: bool = True,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Plot LPT vs reward coefficient summary in a multi-panel figure.
+    Rows correspond to training stages, columns correspond to models.
+
+    Parameters
+    ----------
+    summary : pd.DataFrame
+        Must contain model-specific columns and 'auto_train_stage'.
+    models : sequence of str, optional
+        Model name list. If None, a default list is used.
+    suffix_x : str
+        X-axis column suffix.
+    suffix_y : str
+        Y-axis column suffix.
+    stage : str or sequence, optional
+        If provided, only these stages are plotted.
+        If None, all observed stages are plotted.
+    min_points : int
+        Minimum number of paired samples required to fit.
+    alpha : float
+        Scatter transparency.
+    figsize_per_panel : tuple
+        Size of each subplot panel (width, height).
+    show_grid : bool
+        Whether to show grid.
+    show : bool
+        Whether to call plt.show().
+
+    Returns
+    -------
+    results : dict
+        results[stage_label][model] = {"slope", "intercept", "r2", "n"}
+    """
+    if models is None:
+        models = [
+            "QLearning_L1F1_CK1_softmax",
+            "QLearning_L2F1_softmax",
+            "QLearning_L2F1_CK1_softmax",
+            "QLearning_L2F1_CKfull_softmax",
+            "ForagingCompareThreshold",
+            "QLearning_L1F0_CKfull_softmax",
+            "QLearning_L1F1_CKfull_softmax",
+        ]
+
+    if "auto_train_stage" not in summary.columns:
+        raise ValueError("summary must contain column 'auto_train_stage'.")
+
+    # Determine stages to plot
+    if stage is None:
+        stage_series = summary["auto_train_stage"]
+        stage_list = (
+            stage_series.astype(object)
+            .where(stage_series.notna(), other="None")
+            .unique()
+            .tolist()
+        )
+        stage_list = sorted(stage_list, key=str)
+    else:
+        stage_list = list(stage) if isinstance(stage, (list, tuple, set)) else [stage]
+
+    n_rows = len(stage_list)
+    n_cols = len(models)
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(figsize_per_panel[0] * n_cols, figsize_per_panel[1] * n_rows),
+        squeeze=False,
+        sharex=False,
+        sharey=False,
+    )
+
+    results: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    for i, st in enumerate(stage_list):
+        stage_label = "None" if st is None else str(st)
+
+        if stage_label == "None":
+            df_stage = summary[summary["auto_train_stage"].isna()]
+        else:
+            df_stage = summary[summary["auto_train_stage"] == st]
+
+        results[stage_label] = {}
+
+        for j, model in enumerate(models):
+            ax = axes[i, j]
+            x_col = f"{model}_{suffix_x}"
+            y_col = f"{model}_{suffix_y}"
+
+            if x_col not in df_stage.columns or y_col not in df_stage.columns:
+                ax.set_title(f"{model}\n(missing columns)")
+                ax.axis("off")
+                continue
+
+            df_xy = df_stage[[x_col, y_col]].dropna()
+            x = df_xy[x_col].to_numpy()
+            y = df_xy[y_col].to_numpy()
+            n = len(x)
+
+            if n < min_points:
+                ax.set_title(f"{model}\n(n={n}, insufficient)")
+                ax.axis("off")
+                continue
+
+            # Linear fit
+            slope, intercept = np.polyfit(x, y, 1)
+            y_pred = slope * x + intercept
+
+            ss_res = np.sum((y - y_pred) ** 2)
+            ss_tot = np.sum((y - np.mean(y)) ** 2)
+            r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+            # Plot
+            ax.scatter(x, y, alpha=alpha)
+            x_sorted = np.sort(x)
+            ax.plot(x_sorted, slope * x_sorted + intercept, linewidth=2)
+
+            ax.set_title(f"{model}\n$R^2$={r2:.3f}, n={n}")
+            ax.set_xlabel(suffix_x)
+            ax.set_ylabel(suffix_y)
+
+            if show_grid:
+                ax.grid(True)
+
+            results[stage_label][model] = {
+                "slope": float(slope),
+                "intercept": float(intercept),
+                "r2": float(r2) if np.isfinite(r2) else np.nan,
+                "n": int(n),
+            }
+
+    fig.suptitle("LPT vs Reward Coefficients (sum first 6)", y=1.02)
+    plt.tight_layout()
+
+    if show:
+        plt.show()
+
+    return results
 
 
 
+def load_behavior_model_summary_csv(
+    csv_path: str,
+    *,
+    parse_arrays: bool = True,
+    array_cols: Optional[Sequence[str]] = None,
+    keep_strings_if_parse_fails: bool = True,
+) -> pd.DataFrame:
+    """
+    Load the wide-format behavior model summary saved by:
+        summary.to_csv(output_path, index=False)
 
+    CSV stores numpy arrays as strings. This loader converts those strings back
+    into np.ndarray (object-dtype columns), handling common formats including:
+      1) Python literal lists: "[1, 2, 3]"
+      2) numpy-style strings without commas (your case): "[ 1.0  2.0\\n 3.0 ]"
+      3) "array([ ... ])"
 
+    Parameters
+    ----------
+    csv_path : str
+        Path to the saved CSV.
+    parse_arrays : bool, default True
+        If True, attempt to parse array-like columns that were written as strings.
+    array_cols : sequence of str or None, default None
+        Columns to parse as arrays. If None, auto-detect columns:
+          - endswith("_reward_coefs") or endswith("_choice_coefs") or contains("_coefs")
+    keep_strings_if_parse_fails : bool, default True
+        If parsing fails for a cell, keep the original string (True) or set NaN (False).
+
+    Returns
+    -------
+    df : pd.DataFrame
+        Loaded DataFrame with optional array columns parsed into np.ndarray objects.
+    """
+    df = pd.read_csv(csv_path)
+
+    if not parse_arrays or df.empty:
+        return df
+
+    if array_cols is None:
+        array_cols = [
+            c for c in df.columns
+            if (c.endswith("_reward_coefs") or c.endswith("_choice_coefs") or ("_coefs" in c))
+        ]
+
+    def _parse_cell(x):
+        # Preserve already-parsed arrays/lists
+        if isinstance(x, (list, tuple, np.ndarray)):
+            arr = np.asarray(x, dtype=float).ravel()
+            return arr if arr.size > 0 else np.nan
+
+        # Handle NaN/None
+        if x is None:
+            return np.nan
+        if isinstance(x, float) and np.isnan(x):
+            return np.nan
+
+        # Non-string scalar: try float
+        if not isinstance(x, str):
+            try:
+                return float(x)
+            except Exception:
+                return x if keep_strings_if_parse_fails else np.nan
+
+        s = x.strip()
+        if s == "" or s.lower() == "nan":
+            return np.nan
+
+        # Remove wrapping quotes sometimes introduced by CSV
+        if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
+            s = s[1:-1].strip()
+
+        # Case A: "array([...])"
+        s_for_eval = s
+        if s_for_eval.startswith("array(") and s_for_eval.endswith(")"):
+            s_for_eval = s_for_eval[len("array(") : -1].strip()
+
+        # Case B: Python literal list/tuple (commas present) -> ast.literal_eval
+        # This will NOT work for numpy-style "[ 1  2  3 ]" without commas.
+        if ("," in s_for_eval) or s_for_eval.startswith("(") or s_for_eval.startswith("["):
+            try:
+                obj = ast.literal_eval(s_for_eval)
+                if isinstance(obj, (list, tuple, np.ndarray)):
+                    arr = np.asarray(obj, dtype=float).ravel()
+                    return arr if arr.size > 0 else np.nan
+                # Scalar literal
+                return float(obj)
+            except Exception:
+                pass
+
+        # Case C: numpy-style space/newline separated numbers, e.g.
+        # "[ 1.0  2.0\\n 3.0 ]"
+        s_num = s_for_eval
+        if s_num.startswith("[") and s_num.endswith("]"):
+            s_num = s_num[1:-1].strip()
+
+        # First try whitespace-separated parsing
+        arr = np.fromstring(s_num, sep=" ", dtype=float)
+
+        # Fallback: sometimes values are separated by commas but ast failed
+        if arr.size == 0 and ("," in s_num):
+            arr = np.fromstring(s_num.replace(",", " "), sep=" ", dtype=float)
+
+        if arr.size > 0:
+            return arr
+
+        return s if keep_strings_if_parse_fails else np.nan
+
+    for c in array_cols:
+        if c in df.columns:
+            df[c] = df[c].apply(_parse_cell)
+
+    return df
 
