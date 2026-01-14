@@ -2448,3 +2448,233 @@ def load_behavior_model_summary_csv(
 
     return df
 
+
+def plot_summary_column_distributions(
+    summary: pd.DataFrame,
+    columns: Sequence[str],
+    *,
+    bins: int = 30,
+    figsize_per_panel: Tuple[float, float] = (4.2, 3.2),
+    ncols: int = 4,
+    titles: Optional[Dict[str, str]] = None,
+    dropna: bool = True,
+    # ---- Per-panel x-range controls ----
+    xlim_percentiles: Optional[Tuple[float, float]] = (1.0, 99.0),
+    xlim_pad_frac: float = 0.05,
+    xlim_override: Optional[Dict[str, Tuple[float, float]]] = None,
+    # ---- NEW: annotate how much data remains after range filtering ----
+    annotate_range_filter: bool = True,
+    annotate_loc: Tuple[float, float] = (0.98, 0.78),
+    show_grid: bool = True,
+    show: bool = True,
+) -> Tuple[plt.Figure, np.ndarray, Dict[str, Dict[str, Union[int, float]]]]:
+    """
+    Plot distributions (histograms) for selected columns in a summary DataFrame.
+
+    This function is intended for scalar numeric columns (one value per session/row).
+    If a column cannot be coerced to numeric (or has no finite values), its panel is disabled.
+
+    Parameters
+    ----------
+    summary : pd.DataFrame
+        Wide-format summary table.
+    columns : sequence of str
+        Column names to plot.
+    bins : int
+        Number of histogram bins.
+    figsize_per_panel : (float, float)
+        Size (width, height) per subplot panel in inches.
+    ncols : int
+        Number of subplot columns in the grid.
+    titles : dict[str, str] or None
+        Optional mapping from column name -> display title.
+    dropna : bool
+        If True, drop NaN/inf values before plotting and stats.
+    xlim_percentiles : (low, high) or None
+        If provided, per-panel x-limits are computed from these percentiles of the data.
+        Example: (1, 99). If None, no percentile-based x-limits are applied unless overridden.
+    xlim_pad_frac : float
+        Fractional padding to apply around percentile-derived limits.
+        Example: 0.05 expands the range by 5% on each side.
+    xlim_override : dict[str, (xmin, xmax)] or None
+        Per-column explicit x-limits. If provided for a column, overrides percentile behavior.
+    annotate_range_filter : bool
+        If True, annotate each panel with how many values are retained after x-range filtering.
+    annotate_loc : (float, float)
+        Annotation location in axes coordinates (x, y). Default places it below the stats box.
+    show_grid : bool
+        If True, show a light grid.
+    show : bool
+        If True, calls plt.show().
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    axes : np.ndarray of Axes
+    stats : dict
+        Per-column summary stats (computed on the plotted values):
+        {"n", "mean", "std", "min", "max"}.
+    """
+    if summary is None or not isinstance(summary, pd.DataFrame):
+        raise ValueError("summary must be a pandas DataFrame.")
+    if columns is None or len(columns) == 0:
+        raise ValueError("columns must be a non-empty sequence of column names.")
+    if xlim_percentiles is not None:
+        p_lo, p_hi = xlim_percentiles
+        if not (0.0 <= p_lo < p_hi <= 100.0):
+            raise ValueError("xlim_percentiles must satisfy 0 <= low < high <= 100.")
+    if xlim_pad_frac < 0:
+        raise ValueError("xlim_pad_frac must be >= 0.")
+
+    n_plots = len(columns)
+    ncols = max(1, int(ncols))
+    nrows = int(np.ceil(n_plots / ncols))
+
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows),
+        squeeze=False,
+        sharex=False,
+        sharey=False,
+    )
+
+    stats: Dict[str, Dict[str, Union[int, float]]] = {}
+    xlim_override = xlim_override or {}
+
+    for idx, col in enumerate(columns):
+        r = idx // ncols
+        c = idx % ncols
+        ax = axes[r, c]
+
+        if col not in summary.columns:
+            ax.axis("off")
+            ax.set_title(f"{col}\n(missing)", fontsize=10)
+            continue
+
+        # Coerce to numeric; non-numeric becomes NaN
+        values_all = pd.to_numeric(summary[col], errors="coerce").to_numpy(dtype=float)
+
+        if dropna:
+            values_all = values_all[np.isfinite(values_all)]
+
+        if values_all.size == 0:
+            ax.axis("off")
+            ax.set_title(f"{col}\n(no numeric data)", fontsize=10)
+            continue
+
+        # -------------------------------------------------
+        # Decide x-range for THIS panel
+        # -------------------------------------------------
+        xmin = xmax = None
+
+        if col in xlim_override:
+            xmin, xmax = xlim_override[col]
+            if (xmin is None) or (xmax is None) or (not np.isfinite(xmin)) or (not np.isfinite(xmax)) or (xmax <= xmin):
+                raise ValueError(f"xlim_override for '{col}' must be finite and satisfy xmin < xmax.")
+        elif xlim_percentiles is not None:
+            p_lo, p_hi = xlim_percentiles
+            lo = float(np.percentile(values_all, p_lo))
+            hi = float(np.percentile(values_all, p_hi))
+
+            # Fallback if degenerate
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                lo = float(np.nanmin(values_all))
+                hi = float(np.nanmax(values_all))
+
+            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                pad = (hi - lo) * float(xlim_pad_frac)
+                xmin, xmax = lo - pad, hi + pad
+
+        # -------------------------------------------------
+        # Drop out-of-range values BEFORE binning and edges
+        # -------------------------------------------------
+        if xmin is not None and xmax is not None and xmax > xmin:
+            values_plot = values_all[(values_all >= xmin) & (values_all <= xmax)]
+        else:
+            values_plot = values_all
+
+        # -------------------------------------------------
+        # Plot histogram using ONLY in-range values
+        # -------------------------------------------------
+        if values_plot.size >= 2:
+            if xmin is not None and xmax is not None and xmax > xmin:
+                bin_edges = np.linspace(xmin, xmax, bins + 1)
+                ax.hist(values_plot, bins=bin_edges)
+                ax.set_xlim(xmin, xmax)
+            else:
+                ax.hist(values_plot, bins=bins)
+        else:
+            ax.axis("off")
+            ax.set_title(f"{col}\n(insufficient in-range data)", fontsize=10)
+            continue
+
+        # Titles/labels
+        title = titles.get(col, col) if titles is not None else col
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel(col, fontsize=9)
+        ax.set_ylabel("Count", fontsize=9)
+        ax.tick_params(axis="both", labelsize=8)
+        if show_grid:
+            ax.grid(True, alpha=0.3)
+
+        # Stats are computed on the plotted values (post filtering)
+        col_stats = {
+            "n": int(values_plot.size),
+            "mean": float(np.nanmean(values_plot)),
+            "std": float(np.nanstd(values_plot)),
+            "min": float(np.nanmin(values_plot)),
+            "max": float(np.nanmax(values_plot)),
+        }
+        stats[col] = col_stats
+
+        # Stats annotation
+        ax.text(
+            0.98,
+            0.98,
+            f"n={col_stats['n']}\nmean={col_stats['mean']:.3g}\nstd={col_stats['std']:.3g}",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+            family="monospace",
+            alpha=0.9,
+        )
+
+        # -------------------------------------------------
+        # NEW: annotate how much data survived the range filter
+        # -------------------------------------------------
+        if annotate_range_filter and (values_all.size > 0):
+            kept = int(values_plot.size)
+            total = int(values_all.size)
+            frac = kept / total if total > 0 else np.nan
+
+            if xmin is not None and xmax is not None and np.isfinite(xmin) and np.isfinite(xmax):
+                range_str = f"[{xmin:.3g}, {xmax:.3g}]"
+            else:
+                range_str = "full range"
+
+            ax.text(
+                annotate_loc[0],
+                annotate_loc[1],
+                f"kept={kept}/{total} ({frac:.1%})\nrange={range_str}",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8,
+                family="monospace",
+                alpha=0.7,
+            )
+
+    # Turn off unused axes
+    for idx in range(n_plots, nrows * ncols):
+        r = idx // ncols
+        c = idx % ncols
+        axes[r, c].axis("off")
+
+    fig.tight_layout()
+
+    if show:
+        plt.show()
+
+    return fig, axes, stats
