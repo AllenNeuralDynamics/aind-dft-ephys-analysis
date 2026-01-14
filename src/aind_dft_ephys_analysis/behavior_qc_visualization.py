@@ -2186,45 +2186,103 @@ def plot_x_vs_y_by_stage(
     *,
     suffix_x: str = "LPT",
     suffix_y: str = "reward_coefs_sum6",
+    x_col: Optional[str] = None,
+    y_col: Optional[str] = None,
     stage: Optional[Union[str, Sequence[Optional[str]]]] = None,
     min_points: int = 3,
     alpha: float = 0.6,
     figsize_per_panel: tuple = (4, 4),
+    xlim_percentiles: Optional[Tuple[float, float]] = None,
+    ylim_percentiles: Optional[Tuple[float, float]] = None,
     show_grid: bool = True,
     show: bool = True,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
-    Plot LPT vs reward coefficient summary in a multi-panel figure.
+    Plot x vs y in a multi-panel figure.
     Rows correspond to training stages, columns correspond to models.
+
+    This function visualizes the relationship between two summary metrics
+    (x and y) across different behavioral models and training stages.
+    For each stage–model combination, paired observations are filtered,
+    optionally trimmed by percentile thresholds, and then used to fit
+    a simple linear regression that is overlaid on a scatter plot.
 
     Parameters
     ----------
     summary : pd.DataFrame
-        Must contain model-specific columns and 'auto_train_stage'.
+        Summary table containing model-specific metrics and the column
+        'auto_train_stage'.
     models : sequence of str, optional
-        Model name list. If None, a default list is used.
-    suffix_x : str
-        X-axis column suffix.
-    suffix_y : str
-        Y-axis column suffix.
-    stage : str or sequence, optional
-        If provided, only these stages are plotted.
-        If None, all observed stages are plotted.
-    min_points : int
-        Minimum number of paired samples required to fit.
-    alpha : float
-        Scatter transparency.
-    figsize_per_panel : tuple
-        Size of each subplot panel (width, height).
-    show_grid : bool
-        Whether to show grid.
-    show : bool
-        Whether to call plt.show().
+        List of model names. Each model corresponds to one column in the
+        multi-panel figure. If None, a default model list is used.
+    suffix_x : str, default "LPT"
+        Suffix used to construct the x-axis column name as
+        f"{model}_{suffix_x}" when `x_col` is not provided.
+    suffix_y : str, default "reward_coefs_sum6"
+        Suffix used to construct the y-axis column name as
+        f"{model}_{suffix_y}" when `y_col` is not provided.
+    x_col : str, optional
+        Explicit column name to use for the x-axis. If provided, this column
+        is used for all models and overrides `suffix_x`. If None, the x-axis
+        column is constructed separately for each model using `suffix_x`.
+    y_col : str, optional
+        Explicit column name to use for the y-axis. If provided, this column
+        is used for all models and overrides `suffix_y`. If None, the y-axis
+        column is constructed separately for each model using `suffix_y`.
+    stage : str or sequence of str or None, optional
+        Training stage or stages to include, matched against the
+        'auto_train_stage' column. If None, all observed stages are plotted.
+        Missing stages (NaN) are labeled as "None".
+    min_points : int, default 3
+        Minimum number of paired (x, y) observations required to perform
+        linear regression and generate a plot for a given model–stage panel.
+    alpha : float, default 0.6
+        Transparency level for scatter points.
+    figsize_per_panel : tuple of (float, float), default (4, 4)
+        Size (width, height) of each subplot panel in inches.
+        The total figure size scales with the number of models and stages.
+    xlim_percentiles : tuple of (float, float), optional
+        Fractional percentile range (low, high) in the interval [0, 1] used
+        to filter x-axis values before plotting and linear fitting.
+        For example, (0.05, 0.95) keeps the central 90% of x values.
+        Values must satisfy 0 <= low < high <= 1.
+        If None, no percentile-based filtering is applied to x.
+    ylim_percentiles : tuple of (float, float), optional
+        Fractional percentile range (low, high) in the interval [0, 1] used
+        to filter y-axis values before plotting and linear fitting.
+        For example, (0.05, 0.95) keeps the central 90% of y values.
+        Values must satisfy 0 <= low < high <= 1.
+        If None, no percentile-based filtering is applied to y.
+    show_grid : bool, default True
+        Whether to display a grid on each subplot.
+    show : bool, default True
+        Whether to call `plt.show()` to display the figure.
 
     Returns
     -------
     results : dict
-        results[stage_label][model] = {"slope", "intercept", "r2", "n"}
+        Nested dictionary with structure:
+        results[stage_label][model] = {
+            "slope": float,
+            "intercept": float,
+            "r2": float,
+            "n": int
+        }
+
+        where:
+        - stage_label is the training stage (or "None" for NaN),
+        - model is the model name,
+        - slope and intercept define the fitted linear regression,
+        - r2 is the coefficient of determination,
+        - n is the number of data points used in the fit.
+
+    Notes
+    -----
+    - NaN values are removed before any filtering or fitting.
+    - Percentile-based filtering (if specified) is applied before checking
+      `min_points` and affects both visualization and regression.
+    - x and y percentile filters are applied independently; if both are
+      provided, a data point must satisfy both constraints to be retained.
     """
     if models is None:
         models = [
@@ -2239,6 +2297,17 @@ def plot_x_vs_y_by_stage(
 
     if "auto_train_stage" not in summary.columns:
         raise ValueError("summary must contain column 'auto_train_stage'.")
+
+    # Validate percentile inputs (fractions in [0, 1])
+    if xlim_percentiles is not None:
+        lo, hi = xlim_percentiles
+        if not (0 <= lo < hi <= 1):
+            raise ValueError("xlim_percentiles must satisfy 0 <= low < high <= 1.")
+
+    if ylim_percentiles is not None:
+        lo, hi = ylim_percentiles
+        if not (0 <= lo < hi <= 1):
+            raise ValueError("ylim_percentiles must satisfy 0 <= low < high <= 1.")
 
     # Determine stages to plot
     if stage is None:
@@ -2279,17 +2348,36 @@ def plot_x_vs_y_by_stage(
 
         for j, model in enumerate(models):
             ax = axes[i, j]
-            x_col = f"{model}_{suffix_x}"
-            y_col = f"{model}_{suffix_y}"
 
-            if x_col not in df_stage.columns or y_col not in df_stage.columns:
+            x_col_use = x_col if x_col is not None else f"{model}_{suffix_x}"
+            y_col_use = y_col if y_col is not None else f"{model}_{suffix_y}"
+
+            if x_col_use not in df_stage.columns or y_col_use not in df_stage.columns:
                 ax.set_title(f"{model}\n(missing columns)")
                 ax.axis("off")
                 continue
 
-            df_xy = df_stage[[x_col, y_col]].dropna()
-            x = df_xy[x_col].to_numpy()
-            y = df_xy[y_col].to_numpy()
+            df_xy = df_stage[[x_col_use, y_col_use]].dropna()
+
+            # Fractional percentile-based filtering (affects both fitting and visualization)
+            if xlim_percentiles is not None and not df_xy.empty:
+                x_lo, x_hi = np.percentile(
+                    df_xy[x_col_use].to_numpy(), [xlim_percentiles[0] * 100, xlim_percentiles[1] * 100]
+                )
+                df_xy = df_xy[
+                    (df_xy[x_col_use] >= x_lo) & (df_xy[x_col_use] <= x_hi)
+                ]
+
+            if ylim_percentiles is not None and not df_xy.empty:
+                y_lo, y_hi = np.percentile(
+                    df_xy[y_col_use].to_numpy(), [ylim_percentiles[0] * 100, ylim_percentiles[1] * 100]
+                )
+                df_xy = df_xy[
+                    (df_xy[y_col_use] >= y_lo) & (df_xy[y_col_use] <= y_hi)
+                ]
+
+            x = df_xy[x_col_use].to_numpy()
+            y = df_xy[y_col_use].to_numpy()
             n = len(x)
 
             if n < min_points:
@@ -2311,8 +2399,8 @@ def plot_x_vs_y_by_stage(
             ax.plot(x_sorted, slope * x_sorted + intercept, linewidth=2)
 
             ax.set_title(f"{model}\n$R^2$={r2:.3f}, n={n}")
-            ax.set_xlabel(suffix_x)
-            ax.set_ylabel(suffix_y)
+            ax.set_xlabel(x_col_use)
+            ax.set_ylabel(y_col_use)
 
             if show_grid:
                 ax.grid(True)
@@ -2324,13 +2412,19 @@ def plot_x_vs_y_by_stage(
                 "n": int(n),
             }
 
-    fig.suptitle(f"{suffix_x} vs {suffix_y}", y=1.02)
+    fig.suptitle(
+        f"{x_col if x_col is not None else suffix_x} vs "
+        f"{y_col if y_col is not None else suffix_y}",
+        y=1.02,
+    )
+
     plt.tight_layout()
 
     if show:
         plt.show()
 
     return results
+
 
 
 
