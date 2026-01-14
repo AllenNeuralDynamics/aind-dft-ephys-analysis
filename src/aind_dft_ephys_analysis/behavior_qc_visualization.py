@@ -2324,7 +2324,7 @@ def plot_x_vs_y_by_stage(
                 "n": int(n),
             }
 
-    fig.suptitle("LPT vs Reward Coefficients (sum first 6)", y=1.02)
+    fig.suptitle(f"{suffix_x} vs {suffix_y}", y=1.02)
     plt.tight_layout()
 
     if show:
