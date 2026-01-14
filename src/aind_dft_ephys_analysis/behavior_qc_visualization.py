@@ -15,7 +15,6 @@ from model_fitting import (
 from behavior_utils import generate_behavior_summary, get_fitted_latent, extract_fitted_data
 from nwb_utils import NWBUtils
 
-
 # =========================================================
 # Generic 1D histogram panels
 # =========================================================
@@ -2018,6 +2017,8 @@ def plot_rpe_history_regression_from_nwb(
     return fig, axes, coeffs
 
 
+
+
 def collect_behavior_model_summary(
     sessions: Optional[Iterable[str]] = None,
     models: Union[str, Iterable[str]] = [
@@ -2026,10 +2027,12 @@ def collect_behavior_model_summary(
         "QLearning_L2F1_CK1_softmax",
         "QLearning_L2F1_CKfull_softmax",
         "ForagingCompareThreshold",
-        'QLearning_L1F0_CKfull_softmax',
-        'QLearning_L1F1_CKfull_softmax',
+        "QLearning_L1F0_CKfull_softmax",
+        "QLearning_L1F1_CKfull_softmax",
     ],
-    session_paths: Optional[List[str]] = None,  # Ensure session_paths is a list
+    session_paths: Optional[List[str]] = None,
+    *,
+    reward_coef_sum_n: Union[int, Sequence[int]] = [1,2,3,4,5,6],
 ) -> pd.DataFrame:
     """
     Collect fitted Q-learning parameters, model metrics, and RPE history
@@ -2047,14 +2050,58 @@ def collect_behavior_model_summary(
         for both fitted latent extraction and RPE history regression.
     session_paths : Optional[List[str]], optional
         Full paths for each session (default is None). Should be provided as a list.
+    reward_coef_sum_n : int | Sequence[int], default 6
+        Compute additional columns that sum the first n reward coefficients for each model.
+        - If int (e.g. 6), creates: "{model}_reward_coefs_sum6"
+        - If list/tuple (e.g. [3, 6, 10]), creates:
+          "{model}_reward_coefs_sum3", "{model}_reward_coefs_sum6", "{model}_reward_coefs_sum10"
 
     Returns
     -------
     pandas.DataFrame
         Wide-format DataFrame with one row per session and one block of columns per model.
     """
+
+    def _normalize_n_list(n_in: Union[int, Sequence[int]]) -> List[int]:
+        """Normalize reward_coef_sum_n to a sorted list of unique positive ints."""
+        if isinstance(n_in, (int, np.integer)):
+            n_list = [int(n_in)]
+        else:
+            n_list = [int(v) for v in n_in]
+
+        n_list = [v for v in n_list if v > 0]
+        n_list = sorted(set(n_list))
+        return n_list
+
+    def _sum_first_n(x: object, n: int) -> float:
+        """Return sum of first n elements of x, or np.nan if invalid/too short."""
+        if x is None:
+            return np.nan
+
+        # Parse stringified lists if needed (keeps backward compatibility)
+        if isinstance(x, str):
+            try:
+                x = ast.literal_eval(x)
+            except Exception:
+                return np.nan
+
+        arr = np.asarray(x)
+
+        # Skip scalars / invalid entries
+        if arr.ndim == 0:
+            return np.nan
+
+        if arr.size < n:
+            return np.nan
+
+        return float(arr[:n].sum())
+
     if isinstance(models, str):
         models = [models]
+    else:
+        models = list(models)
+
+    n_list = _normalize_n_list(reward_coef_sum_n)
 
     rows: List[dict] = []
 
@@ -2064,10 +2111,10 @@ def collect_behavior_model_summary(
 
     if sessions:
         session_iters = sessions
-        tag=1
-    elif session_paths:
-        session_iters = session_paths
-        tag=0
+        use_paths = False
+    else:
+        session_iters = session_paths  # type: ignore[assignment]
+        use_paths = True
 
     for session in session_iters:
         session_name = os.path.basename(session)
@@ -2077,11 +2124,10 @@ def collect_behavior_model_summary(
         # 1) Load NWB safely
         # -----------------------------------------
         try:
-            # Use session_paths if provided, otherwise fall back to session name
-            if tag == 0:
+            if use_paths:
                 nwb_data = NWBUtils.read_behavior_nwb(nwb_full_path=session)
-            elif tag == 1:
-                nwb_data = NWBUtils.read_behavior_nwb(session_name=session)
+            else:
+                nwb_data = NWBUtils.read_behavior_nwb(session_name=session_name)
         except Exception as exc:
             row["nwb_load_error"] = f"read_behavior_nwb exception: {exc}"
             rows.append(row)
@@ -2144,39 +2190,40 @@ def collect_behavior_model_summary(
 
                 if reward_coefs is not None:
                     reward_coefs = np.asarray(reward_coefs)
-                    row.update({
-                        f"{prefix}reward_coefs": reward_coefs,
-                    })
+                    row[f"{prefix}reward_coefs"] = reward_coefs
                 else:
-                    row.update({
-                        f"{prefix}reward_coefs": np.nan,
-                    })
+                    row[f"{prefix}reward_coefs"] = np.nan
+
+                # ---------------------------------
+                # NEW: sum first n reward coefs
+                # ---------------------------------
+                for n in n_list:
+                    row[f"{prefix}reward_coefs_sum{n}"] = _sum_first_n(row[f"{prefix}reward_coefs"], n)
+
             except Exception as exc:
                 row[f"{prefix}error"] = str(exc)
+                # Still create sum columns (as NaN) for consistent schema
+                for n in n_list:
+                    row.setdefault(f"{prefix}reward_coefs_sum{n}", np.nan)
 
         # Logistic regression
-        logistic_results = fit_choice_logistic_regression_from_nwb(nwb_data) 
-        logistic_bias = logistic_results['fit_result'].params[0]
-        row.update({
-            f"logistic_bias": logistic_bias,
-        })
+        logistic_results = fit_choice_logistic_regression_from_nwb(nwb_data)
+        logistic_bias = logistic_results["fit_result"].params[0]
+        row["logistic_bias"] = logistic_bias
 
-        # Inside the session iteration loop, after loading the NWB data
+        # auto_train_stage (last)
         try:
-            # Extract the last element of auto_train_stage if it exists
-            if len(nwb_data.trials['auto_train_stage']) > 0:
-                auto_train_stage = nwb_data.trials['auto_train_stage'][-1]
+            if len(nwb_data.trials["auto_train_stage"]) > 0:
+                row["auto_train_stage"] = nwb_data.trials["auto_train_stage"][-1]
             else:
-                auto_train_stage = np.nan  # Or None, depending on your preference
-
-            row["auto_train_stage"] = auto_train_stage
-
+                row["auto_train_stage"] = np.nan
         except Exception as exc:
             row["auto_train_stage_error"] = str(exc)
 
         rows.append(row)
 
     return pd.DataFrame(rows)
+
 
 
 
