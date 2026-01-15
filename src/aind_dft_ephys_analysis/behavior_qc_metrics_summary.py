@@ -34,42 +34,71 @@ def collect_behavior_model_summary(
     spread_entropy_base: float = np.e,
 ) -> pd.DataFrame:
     """
-    Collect fitted Q-learning parameters, model metrics, and RPE history regression
-    summaries across sessions and models. Also computes spread metrics for deltaQ
-    (Ql - Qr) and RPE from fitted latent variables.
+    Collect fitted reinforcement-learning (Q-learning) parameters, model-level
+    goodness-of-fit metrics, and RPE history regression summaries across sessions
+    and models. In addition, this function computes multiple distributional
+    “spread” diagnostics from fitted latent variables to quantify how well
+    values and learning signals are expressed within each session.
 
-    Model-specific columns are prefixed with the actual model name plus an underscore,
-    e.g. "QLearning_L2F1_softmax_log_likelihood".
+    Specifically, spread metrics are computed for three latent signals:
+      - deltaQ = Q_left − Q_right
+            Measures trial-by-trial value separation between actions and
+            directly governs choice under softmax decision rules.
+      - sumQ   = Q_left + Q_right
+            Captures the overall value magnitude / motivational baseline
+            independent of choice direction.
+      - RPE    = reward prediction error
+            Reflects the magnitude and diversity of learning signals driving
+            value updates.
 
-    Parameters
-    ----------
-    sessions : Optional[Iterable[str]], optional
-        Iterable of session names. If not provided, session_paths will be used.
-    models : str | Iterable[str]
-        Model alias or a list of model aliases. The same model name is used
-        for both fitted latent extraction and RPE history regression.
-    session_paths : Optional[List[str]], optional
-        Full paths for each session (default is None). Should be provided as a list.
-    reward_coef_sum_n : int | Sequence[int], default [1,2,3,4,5,6]
-        Compute additional columns that sum the first n reward coefficients for each model.
-        - If int (e.g. 6), creates: "{model}_reward_coefs_sum6"
-        - If list/tuple (e.g. [3, 6, 10]), creates:
-          "{model}_reward_coefs_sum3", "{model}_reward_coefs_sum6", "{model}_reward_coefs_sum10"
-    spread_eps_mode : {"auto", "fixed"}, default "auto"
-        How to set epsilon for tie_frac:
-        - "auto": eps = 0.1 * std(values) if std > 0 else spread_eps_value
-        - "fixed": eps = spread_eps_value
-    spread_eps_value : float, default 0.05
-        Fallback or fixed epsilon for tie_frac computation.
-    spread_entropy_bins : int, default 30
-        Target histogram bins for entropy in compute_spread_stats.
-    spread_entropy_base : float, default np.e
-        Log base for entropy. np.e -> nats, 2.0 -> bits.
+    For each signal, the following categories of spread metrics are computed
+    per session × per model:
+      - Variance-based metrics (std)
+      - Robust spread metrics (IQR, MAD, P95–P5)
+      - Tie / near-zero fraction (fraction of trials where |signal| < ε),
+        which captures value collapse or indifference
+      - Distributional entropy and effective number of occupied states,
+        which quantify how broadly the signal explores its state space
+
+    Assumptions about fitted latent variables
+    -----------------------------------------
+    The fitted latent variables are retrieved from:
+        metrics['latent_variables']
+
+    and are assumed to have the following structure:
+        Q_left  = metrics['latent_variables']['q_value'][0]
+        Q_right = metrics['latent_variables']['q_value'][1]
+        RPE     = metrics['latent_variables']['rpe']
+
+    where each entry is a 1D array indexed by trial.
+
+    Interpretation notes
+    --------------------
+    - High deltaQ_tie_frac indicates weak value discrimination, even if
+      choice behavior appears stochastic or biased.
+    - High sumQ_tie_frac indicates collapse of overall value magnitude,
+      often due to low learning rate, strong forgetting, or over-regularization.
+    - High RPE_tie_frac combined with low deltaQ spread suggests under-learning,
+      whereas high RPE spread with unstable deltaQ may indicate noisy learning.
+    - Entropy complements variance-based metrics by capturing whether values
+      explore multiple states or collapse into a narrow regime.
+
+    Dependency notes
+    ----------------
+    This function assumes the following symbols are available in the runtime
+    environment:
+      - NWBUtils (behavior NWB loading)
+      - plot_rpe_history_regression_from_nwb (RPE history regression)
+      - get_fitted_latent (model fitting + latent extraction)
+      - fit_choice_logistic_regression_from_nwb (baseline logistic fit)
+      - compute_spread_stats (top-level helper for spread / entropy metrics)
 
     Returns
     -------
     pandas.DataFrame
-        Wide-format DataFrame with one row per session and one block of columns per model.
+        A wide-format DataFrame with one row per session and model-specific
+        column blocks containing fitted parameters, model metrics, and
+        latent-variable spread diagnostics.
     """
 
     def _normalize_n_list(n_in: Union[int, Sequence[int]]) -> List[int]:
@@ -189,17 +218,18 @@ def collect_behavior_model_summary(
 
                 # ---------------------------------
                 # Spread stats from fitted latent variables
-                # Ql = metrics['latent_variables']['q_value'][0]
-                # Qr = metrics['latent_variables']['q_value'][1]
-                # rpe = metrics['latent_variables']['rpe']
                 # ---------------------------------
-                latent = metrics.get("latent_variables", {})
+                latent = metrics.get("latent_variables", {}) 
                 q_value = latent.get("q_value", None)
                 rpe = latent.get("rpe", None)
 
-                # deltaQ extraction
+                # Extract Ql, Qr and derive deltaQ and sumQ
                 deltaQ = None
+                sumQ = None
                 try:
+                    Ql = None
+                    Qr = None
+
                     if q_value is not None:
                         q_arr = np.asarray(q_value, dtype=float)
 
@@ -207,17 +237,23 @@ def collect_behavior_model_summary(
                         if q_arr.ndim >= 2 and q_arr.shape[0] >= 2:
                             Ql = np.asarray(q_arr[0], dtype=float).reshape(-1)
                             Qr = np.asarray(q_arr[1], dtype=float).reshape(-1)
-                            n_min = min(Ql.size, Qr.size)
-                            deltaQ = Ql[:n_min] - Qr[:n_min]
                         elif isinstance(q_value, (list, tuple)) and len(q_value) >= 2:
                             Ql = np.asarray(q_value[0], dtype=float).reshape(-1)
                             Qr = np.asarray(q_value[1], dtype=float).reshape(-1)
-                            n_min = min(Ql.size, Qr.size)
-                            deltaQ = Ql[:n_min] - Qr[:n_min]
-                except Exception as exc:
-                    row[f"{prefix}deltaQ_error"] = f"deltaQ extraction failed: {exc}"
-                    deltaQ = None
 
+                    if Ql is not None and Qr is not None:
+                        n_min = min(Ql.size, Qr.size)
+                        Ql = Ql[:n_min]
+                        Qr = Qr[:n_min]
+                        deltaQ = Ql - Qr
+                        sumQ = Ql + Qr
+
+                except Exception as exc:
+                    row[f"{prefix}Q_extract_error"] = f"Q extraction failed: {exc}"
+                    deltaQ = None
+                    sumQ = None
+
+                # deltaQ spread
                 dQ_stats = compute_spread_stats(
                     deltaQ,
                     eps_mode=spread_eps_mode,
@@ -239,6 +275,29 @@ def collect_behavior_model_summary(
                     f"{prefix}deltaQ_entropy_bins_used": dQ_stats["entropy_bins_used"],
                 })
 
+                # sumQ spread
+                sQ_stats = compute_spread_stats(
+                    sumQ,
+                    eps_mode=spread_eps_mode,
+                    eps_value=spread_eps_value,
+                    entropy_bins=spread_entropy_bins,
+                    entropy_base=spread_entropy_base,
+                )
+                row.update({
+                    f"{prefix}sumQ_n": sQ_stats["n"],
+                    f"{prefix}sumQ_mean": sQ_stats["mean"],
+                    f"{prefix}sumQ_std": sQ_stats["std"],
+                    f"{prefix}sumQ_iqr": sQ_stats["iqr"],
+                    f"{prefix}sumQ_q95_q5": sQ_stats["q95_q5"],
+                    f"{prefix}sumQ_mad": sQ_stats["mad"],
+                    f"{prefix}sumQ_tie_frac": sQ_stats["tie_frac"],
+                    f"{prefix}sumQ_eps_used": sQ_stats["eps_used"],
+                    f"{prefix}sumQ_entropy": sQ_stats["entropy"],
+                    f"{prefix}sumQ_entropy_eff_bins": sQ_stats["entropy_eff_bins"],
+                    f"{prefix}sumQ_entropy_bins_used": sQ_stats["entropy_bins_used"],
+                })
+
+                # RPE spread
                 rpe_stats = compute_spread_stats(
                     rpe,
                     eps_mode=spread_eps_mode,
@@ -287,11 +346,17 @@ def collect_behavior_model_summary(
                 for n in n_list:
                     row.setdefault(f"{prefix}reward_coefs_sum{n}", np.nan)
 
-                # Keep schema consistent: spread columns
+                # Keep schema consistent: spread columns (deltaQ, sumQ, rpe)
                 spread_keys = [
+                    # deltaQ
                     "deltaQ_n", "deltaQ_mean", "deltaQ_std", "deltaQ_iqr", "deltaQ_q95_q5",
                     "deltaQ_mad", "deltaQ_tie_frac", "deltaQ_eps_used",
                     "deltaQ_entropy", "deltaQ_entropy_eff_bins", "deltaQ_entropy_bins_used",
+                    # sumQ
+                    "sumQ_n", "sumQ_mean", "sumQ_std", "sumQ_iqr", "sumQ_q95_q5",
+                    "sumQ_mad", "sumQ_tie_frac", "sumQ_eps_used",
+                    "sumQ_entropy", "sumQ_entropy_eff_bins", "sumQ_entropy_bins_used",
+                    # rpe
                     "rpe_n", "rpe_mean", "rpe_std", "rpe_iqr", "rpe_q95_q5",
                     "rpe_mad", "rpe_tie_frac", "rpe_eps_used",
                     "rpe_entropy", "rpe_entropy_eff_bins", "rpe_entropy_bins_used",
@@ -316,6 +381,7 @@ def collect_behavior_model_summary(
         rows.append(row)
 
     return pd.DataFrame(rows)
+
 
 
 
