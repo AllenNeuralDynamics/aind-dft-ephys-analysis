@@ -1,5 +1,9 @@
+from typing import Any, Dict, Optional, Sequence, Union, Tuple
+
 import numpy as np
-from typing import Dict, Any, Optional
+import matplotlib.pyplot as plt
+
+from behavior_utils import get_fitted_latent
 
 
 # ============================================================
@@ -720,3 +724,239 @@ def alpha_table_for_trial_memory(
 # ------------------------------------------------------------
 # table = alpha_table_for_trial_memory(N=5, mass_levels=[0.80, 0.90, 0.95], print_table=True)
 # alpha_for_model = alpha_from_mass_within_last_N(5, 0.90)
+
+
+
+
+
+
+def plot_reward_rates_vs_value_all_models(
+    *,
+    nwb_data: Any,
+    window: Union[int, Sequence[int]] = 8,
+    alpha: Union[float, Sequence[float]] = 0.2,
+    include_noresponse: bool = False,
+    model_aliases: Optional[Sequence[str]] = None,
+    drop_last_latent: bool = True,
+    point_size: float = 6.0,
+    alpha_points: float = 0.5,
+    max_points: Optional[int] = None,
+    random_state: int = 0,
+    figsize_per_panel: Tuple[float, float] = (4.0, 3.2),
+    warn_on_length_mismatch: bool = True,
+) -> None:
+    """
+    Scatter plots of selected reward-rate metrics vs model value signals.
+
+    Reward-rate metrics plotted (fixed set)
+    --------------------------------------
+    - ewma_experienced
+    - ewma_left_reward
+    - ewma_right_reward
+    - running_experienced
+    - running_left_reward
+    - running_right_reward
+
+    Model-specific y-axis
+    ---------------------
+    - QLearning* models: sumQ = q_value[0] + q_value[1]
+    - ForagingCompareThreshold: fitted_latent_variables['value']
+
+    Window/alpha sweeps
+    -------------------
+    - window can be an int or a list of ints
+    - alpha can be a float or a list of floats
+    The function plots all combinations of (window, alpha), one figure per combination.
+
+    Alignment behavior (practical + transparent)
+    --------------------------------------------
+    - Reward-rate arrays have length = n_trials.
+    - Fitted latents (q_value/value) are assumed to have noresponse trials removed upstream,
+      so we drop noresponse trials from reward-rate arrays using:
+          responded = (animal_response != 2)
+
+    - If lengths still mismatch between reward-rate (after masking) and latent:
+        * We DO NOT error.
+        * We trim both to min_len (to ensure plotting works).
+        * If warn_on_length_mismatch=True, we print a warning that tells you
+          exactly which model/metric/combination mismatched and what min_len was used.
+
+    This preserves your “it works” behavior while still surfacing hidden alignment issues.
+    """
+    # ------------------------------------------------------------
+    # Normalize window and alpha to lists
+    # ------------------------------------------------------------
+    if isinstance(window, (list, tuple, np.ndarray)):
+        windows = [int(w) for w in window]
+    else:
+        windows = [int(window)]
+
+    if isinstance(alpha, (list, tuple, np.ndarray)):
+        alphas = [float(a) for a in alpha]
+    else:
+        alphas = [float(alpha)]
+
+    if any(w <= 0 for w in windows):
+        raise ValueError(f"All window values must be positive integers. Got: {windows}")
+    if any((a <= 0.0 or a > 1.0) for a in alphas):
+        raise ValueError(f"All alpha values must be in (0, 1]. Got: {alphas}")
+
+    # ------------------------------------------------------------
+    # Default models
+    # ------------------------------------------------------------
+    if model_aliases is None:
+        model_aliases = [
+            "QLearning_L1F1_CK1_softmax",
+            "QLearning_L2F1_softmax",
+            "QLearning_L2F1_CKfull_softmax",
+            "ForagingCompareThreshold",
+            "QLearning_L2F1_CK1_softmax",
+        ]
+
+    # ------------------------------------------------------------
+    # Reward-rate keys to plot (fixed)
+    # ------------------------------------------------------------
+    rr_keys = [
+        "ewma_experienced",
+        "ewma_left_reward",
+        "ewma_right_reward",
+        "running_experienced",
+        "running_left_reward",
+        "running_right_reward",
+    ]
+
+    # ------------------------------------------------------------
+    # Drop noresponse trials to align to fitted latents
+    # ------------------------------------------------------------
+    choices = np.asarray(nwb_data.trials["animal_response"][:], dtype=int)
+    responded = choices != 2
+
+    # ------------------------------------------------------------
+    # RNG for optional subsampling
+    # ------------------------------------------------------------
+    rng = np.random.default_rng(random_state)
+
+    # ------------------------------------------------------------
+    # Cache fitted latents per model (avoid refetch per combo)
+    # ------------------------------------------------------------
+    model_latents: Dict[str, Dict[str, Any]] = {}
+    for model_alias in model_aliases:
+        try:
+            fit = get_fitted_latent(session_name=nwb_data.session_id, model_alias=model_alias)
+            latents = fit.get("fitted_latent_variables", {})
+
+            if model_alias == "ForagingCompareThreshold":
+                if "value" in latents:
+                    y = np.asarray(latents["value"], dtype=float)
+                    y_name = "value"
+                else:
+                    y = None
+                    y_name = "value"
+            else:
+                if "q_value" in latents and len(latents["q_value"]) >= 2:
+                    qL = np.asarray(latents["q_value"][0], dtype=float)
+                    qR = np.asarray(latents["q_value"][1], dtype=float)
+                    y = qL + qR
+                    y_name = "sumQ"
+                else:
+                    y = None
+                    y_name = "q_value"
+
+            if y is not None and drop_last_latent and y.size > 0:
+                y = y[:-1]
+
+            model_latents[model_alias] = {"y": y, "y_name": y_name}
+        except Exception as e:
+            model_latents[model_alias] = {"y": None, "y_name": "latent", "error": f"{type(e).__name__}: {e}"}
+
+    # ------------------------------------------------------------
+    # Loop over all (window, alpha) combinations
+    # ------------------------------------------------------------
+    for w in windows:
+        for a in alphas:
+            reward_rates = compute_all_reward_rates(
+                nwb_data=nwb_data,
+                window=w,
+                alpha=a,
+                include_noresponse=include_noresponse,
+            )
+
+            # Ensure requested keys exist (at least one)
+            present_keys = [k for k in rr_keys if k in reward_rates]
+            if len(present_keys) == 0:
+                raise ValueError(
+                    f"None of the requested reward-rate metrics were found. "
+                    f"Requested: {rr_keys}. Available: {sorted(list(reward_rates.keys()))}"
+                )
+
+            use_keys = present_keys
+            n_rows = len(model_aliases)
+            n_cols = len(use_keys)
+
+            fig_w = max(6.0, figsize_per_panel[0] * n_cols)
+            fig_h = max(3.5, figsize_per_panel[1] * n_rows)
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h), squeeze=False)
+            fig.suptitle(
+                f"Reward-rate vs latent: window={w}, alpha={a}, include_noresponse={include_noresponse}",
+                y=1.02,
+            )
+
+            for i, model_alias in enumerate(model_aliases):
+                y = model_latents[model_alias].get("y", None)
+                y_name = model_latents[model_alias].get("y_name", "latent")
+
+                if y is None:
+                    for j in range(n_cols):
+                        ax = axes[i, j]
+                        ax.axis("off")
+                        if j == 0:
+                            err = model_latents[model_alias].get("error", f"missing {y_name}")
+                            ax.text(0.02, 0.5, f"{model_alias}\n{err}", va="center")
+                    continue
+
+                for j, rr_key in enumerate(use_keys):
+                    ax = axes[i, j]
+
+                    rr_full = np.asarray(reward_rates[rr_key], dtype=float)  # length == n_trials
+                    x = rr_full[responded]  # drop noresponse trials to match latent convention
+
+                    # If lengths mismatch, warn and trim to make plotting work (your desired behavior).
+                    if x.size != y.size:
+                        min_len = min(x.size, y.size)
+                        if warn_on_length_mismatch:
+                            print(
+                                f"[WARN] Length mismatch: model='{model_alias}', metric='{rr_key}', "
+                                f"window={w}, alpha={a}: x={x.size}, y={y.size}. "
+                                f"Trimming to min_len={min_len}."
+                            )
+                        x2 = x[:min_len]
+                        y2 = y[:min_len]
+                    else:
+                        x2 = x
+                        y2 = y
+
+                    # Remove NaN/inf values (e.g., early running window can be NaN)
+                    finite = np.isfinite(x2) & np.isfinite(y2)
+                    x2 = x2[finite]
+                    y2 = y2[finite]
+
+                    # Optional subsampling for readability
+                    if max_points is not None and x2.size > max_points:
+                        idx = rng.choice(x2.size, size=max_points, replace=False)
+                        x2 = x2[idx]
+                        y2 = y2[idx]
+
+                    ax.scatter(x2, y2, s=point_size, alpha=alpha_points)
+
+                    if i == 0:
+                        ax.set_title(rr_key, fontsize=10)
+                    if j == 0:
+                        ax.set_ylabel(f"{model_alias}\n{y_name}", fontsize=10)
+                    else:
+                        ax.set_ylabel("")
+
+                    if i == n_rows - 1:
+                        ax.set_xlabel(rr_key)
+
+            plt.tight_layout()
+            plt.show()
