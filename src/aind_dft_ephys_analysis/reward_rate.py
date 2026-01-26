@@ -337,78 +337,174 @@ def alpha_from_half_life(half_life_trials: float) -> float:
 def compute_all_reward_rates(
     nwb_data,
     *,
-    window: int = 6,
-    alpha: float = 0.05,
+    window: Optional[int] = None,
+    alpha: Optional[float] = None,
     include_noresponse: bool = True,
+    metrics: Union[str, Sequence[str]] = "all",
+    include_raw: bool = True,
 ) -> Dict[str, Any]:
     """
-    Compute a bundle of reward-rate metrics with consistent omission handling.
+    Compute reward-rate metrics with configurable output families.
+
+    Parameters
+    ----------
+    window : int or None
+        Window length for running reward rate (required only if "running" is requested).
+    alpha : float or None
+        EWMA smoothing parameter (required only if "ewma" is requested).
+    include_noresponse : bool
+        Omission handling (consistent with get_reward_vectors / get_experienced_reward).
+    metrics : str or sequence of str
+        Which metric families to compute/return. Supported:
+          - "global"
+          - "running"
+          - "ewma"
+          - "all" (default) = global + running + ewma
+    include_raw : bool
+        If True, return raw vectors (reward_any/left/right, experienced_reward, choices, responded_mask).
 
     Returns
     -------
-    dict with:
-      - global_any / global_left_reward / global_right_reward
-      - running_any / running_left_reward / running_right_reward
-      - ewma_any / ewma_left_reward / ewma_right_reward
-      - running_experienced / ewma_experienced
-      - reward vectors + choices for downstream use
+    dict
+        Dictionary containing requested metrics.
     """
+
+    # ------------------------------------------------------------
+    # Normalize metrics selection
+    # ------------------------------------------------------------
+    if isinstance(metrics, str):
+        metrics_set = {metrics.lower()}
+    else:
+        metrics_set = {str(m).lower() for m in metrics}
+
+    if "all" in metrics_set:
+        metrics_set = {"global", "running", "ewma"}
+
+    allowed = {"global", "running", "ewma"}
+    unknown = sorted(metrics_set - allowed)
+    if unknown:
+        raise ValueError(f"Unknown metrics={unknown}. Allowed: {sorted(allowed)} or 'all'.")
+
+    # ------------------------------------------------------------
+    # Validate required parameters *only if needed*
+    # ------------------------------------------------------------
+    if "running" in metrics_set:
+        if window is None or window <= 0:
+            raise ValueError("`window` must be a positive int when 'running' metrics are requested.")
+
+    if "ewma" in metrics_set:
+        if alpha is None or not (0.0 < alpha <= 1.0):
+            raise ValueError("`alpha` must be in (0, 1] when 'ewma' metrics are requested.")
+
+    # ------------------------------------------------------------
+    # Shared base vectors
+    # ------------------------------------------------------------
     choices = get_choices(nwb_data)
     rewards = get_reward_vectors(nwb_data, include_noresponse=include_noresponse)
     exp = get_experienced_reward(nwb_data, include_noresponse=include_noresponse)
 
-    out: Dict[str, Any] = {}
-    out["n_trials"] = int(rewards["any"].size)
-    out["include_noresponse"] = bool(include_noresponse)
+    out: Dict[str, Any] = {
+        "n_trials": int(rewards["any"].size),
+        "include_noresponse": bool(include_noresponse),
+    }
 
-    # Global
-    out["global_any"] = reward_rate_global(
-        rewards["any"], include_noresponse=include_noresponse, choices=choices
-    )
-    out["global_left_reward"] = reward_rate_global(
-        rewards["left"], include_noresponse=include_noresponse, choices=choices
-    )
-    out["global_right_reward"] = reward_rate_global(
-        rewards["right"], include_noresponse=include_noresponse, choices=choices
-    )
+    # ------------------------------------------------------------
+    # Global metrics
+    # ------------------------------------------------------------
+    if "global" in metrics_set:
+        out["global_any"] = reward_rate_global(
+            rewards["any"], include_noresponse=include_noresponse, choices=choices
+        )
+        out["global_left_reward"] = reward_rate_global(
+            rewards["left"], include_noresponse=include_noresponse, choices=choices
+        )
+        out["global_right_reward"] = reward_rate_global(
+            rewards["right"], include_noresponse=include_noresponse, choices=choices
+        )
+        out["global_experienced"] = reward_rate_global(
+            exp, include_noresponse=include_noresponse, choices=choices
+        )
 
-    # Running (past-only)
-    out["running_any"] = reward_rate_running(
-        rewards["any"], window=window, causal=True, include_noresponse=include_noresponse, choices=choices
-    )
-    out["running_left_reward"] = reward_rate_running(
-        rewards["left"], window=window, causal=True, include_noresponse=include_noresponse, choices=choices
-    )
-    out["running_right_reward"] = reward_rate_running(
-        rewards["right"], window=window, causal=True, include_noresponse=include_noresponse, choices=choices
-    )
-    out["running_experienced"] = reward_rate_running(
-        exp, window=window, causal=True, include_noresponse=include_noresponse, choices=choices
-    )
+    # ------------------------------------------------------------
+    # Running metrics (past-only)
+    # ------------------------------------------------------------
+    if "running" in metrics_set:
+        out["running_any"] = reward_rate_running(
+            rewards["any"],
+            window=window,
+            causal=True,
+            include_noresponse=include_noresponse,
+            choices=choices,
+        )
+        out["running_left_reward"] = reward_rate_running(
+            rewards["left"],
+            window=window,
+            causal=True,
+            include_noresponse=include_noresponse,
+            choices=choices,
+        )
+        out["running_right_reward"] = reward_rate_running(
+            rewards["right"],
+            window=window,
+            causal=True,
+            include_noresponse=include_noresponse,
+            choices=choices,
+        )
+        out["running_experienced"] = reward_rate_running(
+            exp,
+            window=window,
+            causal=True,
+            include_noresponse=include_noresponse,
+            choices=choices,
+        )
 
-    # EWMA (past-only)
-    out["ewma_any"] = reward_rate_ewma(
-        rewards["any"], alpha=alpha, init=0.0, include_noresponse=include_noresponse, choices=choices
-    )
-    out["ewma_left_reward"] = reward_rate_ewma(
-        rewards["left"], alpha=alpha, init=0.0, include_noresponse=include_noresponse, choices=choices
-    )
-    out["ewma_right_reward"] = reward_rate_ewma(
-        rewards["right"], alpha=alpha, init=0.0, include_noresponse=include_noresponse, choices=choices
-    )
-    out["ewma_experienced"] = reward_rate_ewma(
-        exp, alpha=alpha, init=0.0, include_noresponse=include_noresponse, choices=choices
-    )
+    # ------------------------------------------------------------
+    # EWMA metrics (past-only)
+    # ------------------------------------------------------------
+    if "ewma" in metrics_set:
+        out["ewma_any"] = reward_rate_ewma(
+            rewards["any"],
+            alpha=alpha,
+            init=0.0,
+            include_noresponse=include_noresponse,
+            choices=choices,
+        )
+        out["ewma_left_reward"] = reward_rate_ewma(
+            rewards["left"],
+            alpha=alpha,
+            init=0.0,
+            include_noresponse=include_noresponse,
+            choices=choices,
+        )
+        out["ewma_right_reward"] = reward_rate_ewma(
+            rewards["right"],
+            alpha=alpha,
+            init=0.0,
+            include_noresponse=include_noresponse,
+            choices=choices,
+        )
+        out["ewma_experienced"] = reward_rate_ewma(
+            exp,
+            alpha=alpha,
+            init=0.0,
+            include_noresponse=include_noresponse,
+            choices=choices,
+        )
 
-    # Raw vectors
-    out["reward_any"] = rewards["any"]
-    out["reward_left"] = rewards["left"]
-    out["reward_right"] = rewards["right"]
-    out["experienced_reward"] = exp
-    out["choices"] = choices
-    out["responded_mask"] = responded_mask(choices)
+    # ------------------------------------------------------------
+    # Raw vectors (optional)
+    # ------------------------------------------------------------
+    if include_raw:
+        out["reward_any"] = rewards["any"]
+        out["reward_left"] = rewards["left"]
+        out["reward_right"] = rewards["right"]
+        out["experienced_reward"] = exp
+        out["choices"] = choices
+        out["responded_mask"] = responded_mask(choices)
 
     return out
+
+
 
 
 # ------------------------------
