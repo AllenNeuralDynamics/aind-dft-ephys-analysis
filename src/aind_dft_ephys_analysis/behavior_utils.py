@@ -473,6 +473,23 @@ def extract_fitted_data(
                     reward_rate[i] = float(window_rewards.sum()) / float(window_rewards.size)
 
             return reward_rate
+        if (
+            model_alias == "no_model"
+            and latent_name is not None
+            and latent_name.startswith("reward_rate_window_")
+        ):
+            try:
+                window_size = int(latent_name.split("_")[-1])
+            except Exception:
+                print(f"Invalid reward_rate latent_name: {latent_name}")
+                return None
+            reward_rates=compute_all_reward_rates(
+                nwb_data=nwb_behavior_data,
+                window=window_size,
+                alpha=0.2,
+                include_noresponse=False
+)
+
 
         # ------------------------------------------------------------------
         # 1) Validate inputs and fetch fit if needed (model-based latents)
@@ -926,6 +943,13 @@ def generate_behavior_summary(
     # Add reward_rate_1 ... reward_rate_39 (behavior-only, no model fit)
     latent_names += [f"reward_rate_{i}" for i in range(1, 40)]
 
+
+    # Adding different reward rates
+    window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28]
+    alpha=[0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5,0.55,0.6,0.75,0.8]
+    latent_names += [f"reward_rate_window_{i}" for i in window]
+    latent_names += [f"reward_rate_alpha_{i}" for i in alpha]
+
     if trial_types is None:
         trial_types = [
             'no_response', 'response', 'rewarded', 'unrewarded',
@@ -987,7 +1011,6 @@ def generate_behavior_summary(
         # --------------------------------------------------------------
         for ln in latent_names:
             col_name = f"{alias}-{ln}"
-
             # ---- Local fit ('q_learning_Y1') ----
             if fit_source == 'local':
                 fit_dict = local_fit_cache.get(alias)
