@@ -1652,20 +1652,20 @@ def extract_fit_variables(ds):
 
 
 
+import fnmatch
+
 def find_fit_keys_and_constructed_vars(
     ds, query_str: str
 ) -> Tuple[List[str], List[str]]:
     """
-    Find fit keys whose fit_variables contain query_str and return
-    matching keys and constructed variables (aligned by index).
+    Find fit keys whose fit_variables match query_str (supports '*' wildcard),
+    and return corresponding keys and constructed variables.
 
-    Returns
-    -------
-    keys : list of str
-        Fit keys (e.g. simple_LR-g19-s0-d0)
-    constructed_vars : list of str
-        Constructed variable strings
-        (e.g. simple_LR-<variable>-simple_LR-g19-s0-d0)
+    Constructed variable format:
+        {model}-{matched_variable}-{key_suffix}
+
+    Example:
+        simple_LR-no_model-reward_rate_window_1-running_experienced-g11-s0-d0
     """
     fit_vars = extract_fit_variables(ds)
 
@@ -1673,12 +1673,14 @@ def find_fit_keys_and_constructed_vars(
     constructed_vars = []
 
     for key, variables in fit_vars.items():
-        model = key.split("-", 1)[0]
+        # Split key into model and suffix
+        model, suffix = key.split("-", 1)
 
         for v in variables:
-            if query_str in v:
+            if fnmatch.fnmatch(v, query_str):
                 keys.append(key)
-                constructed_vars.append(f"{model}-{v}-{key}")
+                constructed_vars.append(f"{model}-{v}-{suffix}")
 
     return keys, constructed_vars
+
 
