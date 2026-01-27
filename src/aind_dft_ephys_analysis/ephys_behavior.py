@@ -1651,36 +1651,62 @@ def extract_fit_variables(ds):
     }
 
 
-
 import fnmatch
-
-def find_fit_keys_and_constructed_vars(
-    ds, query_str: str
-) -> Tuple[List[str], List[str]]:
+def find_fit_keys_and_constructed_vars(ds, query_str: str) -> Tuple[List[str], List[str]]:
     """
-    Find fit keys whose fit_variables match query_str (supports '*' wildcard),
-    and return corresponding keys and constructed variables.
-
-    Constructed variable format:
-        {model}-{matched_variable}-{key_suffix}
-
-    Example:
-        simple_LR-no_model-reward_rate_window_1-running_experienced-g11-s0-d0
+    Matching rules:
+    - If query_str contains '*': treat it as a wildcard pattern that can appear
+      anywhere inside the variable string (wrap with leading/trailing '*').
+    - If query_str contains no '*': treat it as a substring query.
+    - Also try '_' and '-' interchangeably.
     """
     fit_vars = extract_fit_variables(ds)
 
-    keys = []
-    constructed_vars = []
+    keys: List[str] = []
+    constructed_vars: List[str] = []
+
+    # Build query variants to handle '_' vs '-'
+    queries = [query_str]
+    if "_" in query_str:
+        queries.append(query_str.replace("_", "-"))
+    if "-" in query_str:
+        queries.append(query_str.replace("-", "_"))
+
+    use_wildcard = any("*" in q for q in queries)
+
+    # If wildcard mode, wrap patterns so they can match anywhere (contains-like)
+    patterns = []
+    if use_wildcard:
+        for q in queries:
+            if "*" in q:
+                p = q
+            else:
+                # If the user didn't include '*', treat it like a substring anyway
+                p = f"*{q}*"
+
+            if not p.startswith("*"):
+                p = "*" + p
+            if not p.endswith("*"):
+                p = p + "*"
+
+            patterns.append(p)
+    else:
+        patterns = queries  # substring mode
 
     for key, variables in fit_vars.items():
-        # Split key into model and suffix
         model, suffix = key.split("-", 1)
 
         for v in variables:
-            if fnmatch.fnmatch(v, query_str):
+            if use_wildcard:
+                matched = any(fnmatch.fnmatch(v, p) for p in patterns)
+            else:
+                matched = any(q in v for q in patterns)
+
+            if matched:
                 keys.append(key)
                 constructed_vars.append(f"{model}-{v}-{suffix}")
 
     return keys, constructed_vars
+
 
 
