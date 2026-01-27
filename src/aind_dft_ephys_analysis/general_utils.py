@@ -1,23 +1,12 @@
-from __future__ import annotations
-
-# ------------------------------
-# Standard library
-# ------------------------------
-import ast
-import os
 import re
-from collections import defaultdict
-from datetime import datetime
+import os
+import ast
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
-
-# ------------------------------
-# Third-party libraries
-# ------------------------------
-import numpy as np
+from datetime import datetime
+from collections import defaultdict
+from typing import List, Dict, Tuple, Optional,Any,Union
 import pandas as pd
 import xarray as xr
-
 
 
 def extract_ID_Date(session_name: str) -> Optional[Tuple[str, str]]:
@@ -216,9 +205,6 @@ def format_session_name(session_name):
     return session_name
 
 
-
-
-
 def smart_read_csv(
     filepath: Union[str, Path],
     object_columns: Optional[List[str]] = None,
@@ -231,32 +217,21 @@ def smart_read_csv(
     literal structures (lists or dicts) and converting obvious boolean and
     numeric columns.
 
-    Parsing rules
-    -------------
-    - Object columns are parsed into Python objects:
-        * Lists:
-            - Supports numeric lists containing nan/inf/-inf
-            - Falls back to literal_eval for non-numeric lists
-        * Dicts:
-            - Uses ast.literal_eval (safe)
-    - Boolean columns are converted from TRUE/FALSE/True/False.
-    - Remaining columns can be auto-converted to numeric.
-
     Parameters
     ----------
     filepath : str or Path
         Path to the CSV file to read.
     object_columns : list[str], optional
-        Columns to parse as Python objects. If None, the first row is inspected
-        for values beginning with '[' or '{'.
+        Columns to parse as Python objects.  If None, the first row is
+        inspected for values beginning with '[' or '{'.
     bool_columns : list[str], optional
-        Columns to coerce to bool. If None, detection is based on the first row
-        containing the literal strings TRUE / FALSE (case-insensitive).
+        Columns to coerce to bool.  If None, detection is based on the first
+        row containing the literal strings TRUE / FALSE.
     n_rows : int, optional
         If given, only read that many rows (handy for a quick preview).
     auto_numeric : bool, default True
-        When True, attempts to convert the remaining non-object / non-bool
-        columns to numeric dtypes.
+        When True, the function attempts to convert the remaining non-object /
+        non-bool columns to numeric dtypes.
 
     Returns
     -------
@@ -267,96 +242,45 @@ def smart_read_csv(
     path_str = str(filepath)
 
     # ------------------------------------------------------------------
-    # 1) Inspect first row to auto-detect object / bool columns
+    # 1) Inspect the first row (as strings) to auto-detect object / bool columns
     # ------------------------------------------------------------------
     sample = pd.read_csv(path_str, nrows=1, dtype=str)
 
     if object_columns is None:
         object_columns = [
             col for col, val in sample.iloc[0].items()
-            if isinstance(val, str) and val.strip().startswith(("[", "{"))
+            if isinstance(val, str) and val.strip().startswith(('[', '{'))
         ]
 
     if bool_columns is None:
-        bool_columns = []
-        for col in sample.columns:
-            v = sample.at[0, col]
-            if isinstance(v, str):
-                s = v.strip().upper()
-                if s in {"TRUE", "FALSE"}:
-                    bool_columns.append(col)
+        bool_columns = [
+            col for col in sample.columns
+            if str(sample.at[0, col]).strip() in {"TRUE", "FALSE", "True", "False"}
+        ]
 
     # ------------------------------------------------------------------
-    # 2) Regex helpers:
-    #    - strip np.float64(...)
-    #    - support nan/inf tokens
+    # 2) Regex to strip np.float64(...) → plain number inside strings
     # ------------------------------------------------------------------
     float64_re = re.compile(r"np\.float64\(\s*([^)]+?)\s*\)")
-    nan_token_re = re.compile(r"(?<![A-Za-z0-9_])nan(?![A-Za-z0-9_])", flags=re.IGNORECASE)
-    posinf_token_re = re.compile(r"(?<![A-Za-z0-9_])inf(?![A-Za-z0-9_])", flags=re.IGNORECASE)
-    neginf_token_re = re.compile(r"(?<![A-Za-z0-9_])-inf(?![A-Za-z0-9_])", flags=re.IGNORECASE)
-
-    def _try_parse_numeric_list(s: str):
-        """
-        Fast path for numeric lists (including nan/inf):
-          "[1.0, nan, 2, -inf]" -> list[float]
-        Returns None if it doesn't look parseable as numeric list.
-        """
-        st = s.strip()
-        if not (st.startswith("[") and st.endswith("]")):
-            return None
-
-        body = st[1:-1].strip()
-        if body == "":
-            return []
-
-        # np.fromstring can parse 'nan'/'inf' tokens (case-insensitive).
-        # It will stop early if there are non-numeric tokens.
-        arr = np.fromstring(body, sep=",", dtype=float)
-
-        # Heuristic: ensure we didn't silently parse only a prefix.
-        # Count commas as a proxy for expected number of elements.
-        expected_n = body.count(",") + 1
-        if arr.size == expected_n:
-            return arr.tolist()
-
-        return None
-
-    def _safe_parse(val):
-        """
-        Safely parse list/dict-like strings.
-        - First: remove np.float64 wrappers.
-        - Then: for lists, try numeric fast-path (handles nan/inf).
-        - Else: make nan/inf parseable for literal_eval, then literal_eval.
-        - If parsing fails, return original value.
-        """
-        if not isinstance(val, str):
-            return val
-
-        s = val.strip()
-        if not (s.startswith("[") or s.startswith("{")):
-            return val
-
-        clean = float64_re.sub(r"\1", s)
-
-        # Fast numeric list parse (best for your reward-rate columns)
-        if clean.startswith("["):
-            parsed = _try_parse_numeric_list(clean)
-            if parsed is not None:
-                return parsed
-
-        # Make NaN/Inf parseable by literal_eval for mixed-type lists/dicts
-        clean2 = nan_token_re.sub('float("nan")', clean)
-        clean2 = neginf_token_re.sub('float("-inf")', clean2)
-        clean2 = posinf_token_re.sub('float("inf")', clean2)
-
-        try:
-            return ast.literal_eval(clean2)
-        except (ValueError, SyntaxError):
-            return val
 
     # ------------------------------------------------------------------
-    # 3) Build converters mapping for read_csv
+    # 3) Safe parser for any object-column value
+    # ------------------------------------------------------------------
+    def _safe_parse(val: str):
+        if not isinstance(val, str):
+            return val
+        s = val.strip()
+        if not (s.startswith("[") or s.startswith("{")):
+            return val  # nothing to parse
+
+        clean = float64_re.sub(r"\1", s)
+        try:
+            return ast.literal_eval(clean)
+        except (ValueError, SyntaxError):
+            return val  # fall back to original string
+
+    # ------------------------------------------------------------------
+    # 4) Build converters mapping for read_csv
     # ------------------------------------------------------------------
     converters = {col: _safe_parse for col in object_columns}
     converters.update({
@@ -364,25 +288,27 @@ def smart_read_csv(
     })
 
     # ------------------------------------------------------------------
-    # 4) Read the CSV with converters
+    # 5) Read the CSV
     # ------------------------------------------------------------------
     df = pd.read_csv(path_str, converters=converters, nrows=n_rows)
 
     # ------------------------------------------------------------------
-    # 5) Optionally convert remaining columns to numeric
+    # 6) Optionally convert remaining non-object, non-bool columns to numeric
+    #     • Avoid deprecated errors="ignore".
+    #     • Attempt conversion column-by-column; silently skip failures.
     # ------------------------------------------------------------------
     if auto_numeric:
-        other_cols = df.columns.difference(list(object_columns) + list(bool_columns))
+        other_cols = df.columns.difference(object_columns + bool_columns)
         for col in other_cols:
             if pd.api.types.is_numeric_dtype(df[col]):
-                continue
+                continue  # already numeric, nothing to do
             try:
                 df[col] = pd.to_numeric(df[col])
             except (ValueError, TypeError):
+                # leave the original values untouched if conversion fails
                 pass
 
     return df
-
 
 
 def load_temporary_data(
