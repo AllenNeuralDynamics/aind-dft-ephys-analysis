@@ -1040,6 +1040,7 @@ def generate_behavior_summary(
                             include_noresponse=False,
                             metrics="running",
                             include_raw=False,
+                            drop_noresponse_trials=True,
                         )
 
                     rr = rr_running_cache[w]
@@ -1070,6 +1071,7 @@ def generate_behavior_summary(
                         include_noresponse=False,
                         metrics="ewma",
                         include_raw=False,
+                        drop_noresponse_trials=True,
                     )
 
                 rr = rr_ewma_cache[a]
@@ -1447,7 +1449,6 @@ def reward_rate_global(
 # ------------------------------
 # Metric 2: Running reward rate
 # ------------------------------
-
 def reward_rate_running(
     reward: np.ndarray,
     *,
@@ -1455,12 +1456,14 @@ def reward_rate_running(
     causal: bool = True,
     include_noresponse: bool,
     choices: Optional[np.ndarray] = None,
+    init: float = 0.0,
 ) -> np.ndarray:
     """
-    Sliding-window reward rate.
+    Sliding-window reward rate with explicit initialization.
 
     Definition (causal=True)
     ------------------------
+    rate[0] = init
     rate[t] = mean(reward[max(0, t-window):t])  (past-only; excludes current trial)
 
     Noresponse handling
@@ -1469,9 +1472,7 @@ def reward_rate_running(
         Window mean includes omissions as they appear in `reward` (often 0).
     - include_noresponse=False:
         Exclude omissions from each window mean.
-        You can do this either by:
-          (a) passing choices (recommended), OR
-          (b) using NaNs for omission trials in `reward` and relying on nanmean.
+        Requires `choices`, OR reward encoded with NaNs on omissions.
 
     Returns
     -------
@@ -1481,10 +1482,14 @@ def reward_rate_running(
     n = reward.size
     rate = np.full(n, np.nan, dtype=float)
 
+    # Explicit initialization (matches EWMA semantics)
+    if n > 0:
+        rate[0] = float(init)
+
     if (not include_noresponse) and (choices is not None):
         choices = np.asarray(choices, dtype=int)
 
-    for t in range(n):
+    for t in range(1, n):
         if causal:
             lo = max(0, t - window)
             hi = t
@@ -1493,20 +1498,20 @@ def reward_rate_running(
             hi = min(n, t + window // 2 + 1)
 
         if hi <= lo:
+            rate[t] = rate[t - 1]
             continue
 
         x = reward[lo:hi]
 
         if include_noresponse:
-            rate[t] = float(np.nanmean(x)) if x.size > 0 else np.nan
+            rate[t] = float(np.nanmean(x)) if x.size > 0 else rate[t - 1]
         else:
             if choices is None:
-                # Rely on NaNs to exclude omissions
-                rate[t] = float(np.nanmean(x)) if x.size > 0 else np.nan
+                rate[t] = float(np.nanmean(x)) if x.size > 0 else rate[t - 1]
             else:
                 m = responded_mask(choices[lo:hi])
                 vals = x[m]
-                rate[t] = float(np.nanmean(vals)) if vals.size > 0 else np.nan
+                rate[t] = float(np.nanmean(vals)) if vals.size > 0 else rate[t - 1]
 
     return rate
 
@@ -1589,7 +1594,6 @@ def alpha_from_half_life(half_life_trials: float) -> float:
 # ------------------------------
 # One-call wrapper
 # ------------------------------
-
 def compute_all_reward_rates(
     nwb_data,
     *,
@@ -1598,6 +1602,7 @@ def compute_all_reward_rates(
     include_noresponse: bool = True,
     metrics: Union[str, Sequence[str]] = "all",
     include_raw: bool = True,
+    drop_noresponse_trials: bool = False,
 ) -> Dict[str, Any]:
     """
     Compute reward-rate metrics with configurable output families.
@@ -1618,13 +1623,23 @@ def compute_all_reward_rates(
           - "all" (default) = global + running + ewma
     include_raw : bool
         If True, return raw vectors (reward_any/left/right, experienced_reward, choices, responded_mask).
+    drop_noresponse_trials : bool
+        If True, drop no-response trials (choice==2) from the *array-valued* outputs of:
+          - running_* arrays
+          - ewma_* arrays
+
+        Notes
+        -----
+        - This does NOT affect the scalar global_* metrics (they are already controlled by include_noresponse).
+        - This also does NOT change how the metrics are computed; it only filters the returned arrays.
+        - If you need raw vectors to be dropped as well for alignment, you can easily extend the same mask
+          to raw outputs (see the commented block near the end).
 
     Returns
     -------
     dict
         Dictionary containing requested metrics.
     """
-
     # ------------------------------------------------------------
     # Normalize metrics selection
     # ------------------------------------------------------------
@@ -1659,9 +1674,12 @@ def compute_all_reward_rates(
     rewards = get_reward_vectors(nwb_data, include_noresponse=include_noresponse)
     exp = get_experienced_reward(nwb_data, include_noresponse=include_noresponse)
 
+    resp_mask = responded_mask(choices)  # True for choice in {0,1}, False for choice==2
+
     out: Dict[str, Any] = {
         "n_trials": int(rewards["any"].size),
         "include_noresponse": bool(include_noresponse),
+        "drop_noresponse_trials": bool(drop_noresponse_trials),
     }
 
     # ------------------------------------------------------------
@@ -1748,6 +1766,19 @@ def compute_all_reward_rates(
         )
 
     # ------------------------------------------------------------
+    # Optionally drop no-response trials from running/ewma arrays
+    # ------------------------------------------------------------
+    if drop_noresponse_trials:
+        # Only filter array-valued outputs from running_* and ewma_* families.
+        for k in list(out.keys()):
+            if k.startswith("running_") or k.startswith("ewma_"):
+                v = out.get(k, None)
+                if isinstance(v, np.ndarray) and v.ndim == 1 and v.shape[0] == resp_mask.shape[0]:
+                    out[k] = v[resp_mask]
+
+        out["n_trials_after_drop"] = int(resp_mask.sum())
+
+    # ------------------------------------------------------------
     # Raw vectors (optional)
     # ------------------------------------------------------------
     if include_raw:
@@ -1756,9 +1787,21 @@ def compute_all_reward_rates(
         out["reward_right"] = rewards["right"]
         out["experienced_reward"] = exp
         out["choices"] = choices
-        out["responded_mask"] = responded_mask(choices)
+        out["responded_mask"] = resp_mask
+
+        # If you ever want raw vectors also dropped when drop_noresponse_trials=True,
+        # uncomment the block below to keep everything aligned by default:
+        #
+        # if drop_noresponse_trials:
+        #     out["reward_any"] = out["reward_any"][resp_mask]
+        #     out["reward_left"] = out["reward_left"][resp_mask]
+        #     out["reward_right"] = out["reward_right"][resp_mask]
+        #     out["experienced_reward"] = out["experienced_reward"][resp_mask]
+        #     out["choices"] = out["choices"][resp_mask]
+        #     out["responded_mask"] = out["responded_mask"][resp_mask]
 
     return out
+
 
 
 
