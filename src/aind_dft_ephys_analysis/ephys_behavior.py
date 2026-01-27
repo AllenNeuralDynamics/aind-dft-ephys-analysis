@@ -1006,7 +1006,7 @@ def correlation_results_summary(
                         tvalues: Dict[str, float] = fit.get("tvalues", {})
 
                         # ── behaviour-specific metrics ─────────────────
-                        base_vars = {k.split(".")[0] for k in params if k.split(".")[0] != "const"}
+                        base_vars = {k for k in params if k.split(".")[0] != "const"}
                         for var in base_vars:
                             lag_keys = [k for k in params if k.startswith(var)]
                             if not lag_keys:
@@ -1628,6 +1628,57 @@ def get_qc_passed_units_metadata_combined(
 
 
 
+def extract_fit_variables(ds):
+    """
+    Extract fit variables from the 'fit_metadata' field of an xarray Dataset.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Dataset containing a 'fit_metadata' variable stored as a JSON string.
+
+    Returns
+    -------
+    dict
+        Dictionary mapping model keys to their corresponding fit_variables.
+    """
+    fit_meta_str = ds["fit_metadata"].values[0]
+    fit_meta = json.loads(fit_meta_str)
+
+    return {
+        key: val.get("fit_variables", [])
+        for key, val in fit_meta.items()
+    }
 
 
+
+def find_fit_keys_and_constructed_vars(
+    ds, query_str: str
+) -> Tuple[List[str], List[str]]:
+    """
+    Find fit keys whose fit_variables contain query_str and return
+    matching keys and constructed variables (aligned by index).
+
+    Returns
+    -------
+    keys : list of str
+        Fit keys (e.g. simple_LR-g19-s0-d0)
+    constructed_vars : list of str
+        Constructed variable strings
+        (e.g. simple_LR-<variable>-simple_LR-g19-s0-d0)
+    """
+    fit_vars = extract_fit_variables(ds)
+
+    keys = []
+    constructed_vars = []
+
+    for key, variables in fit_vars.items():
+        model = key.split("-", 1)[0]
+
+        for v in variables:
+            if query_str in v:
+                keys.append(key)
+                constructed_vars.append(f"{model}-{v}-{key}")
+
+    return keys, constructed_vars
 
