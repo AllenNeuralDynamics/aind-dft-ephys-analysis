@@ -13,22 +13,77 @@ from create_psth import load_zarr
 from plot_raster import plot_raster_and_quantile_psth_by_latent
 
 # ---- Shared config (edit if needed) ----
-PSTH_DIR    = Path("/root/capsule/scratch/psth")
-RESULTS_DIR = Path("/root/capsule/scratch")
+PSTH_DIR    = Path("/root/capsule/scratch/psth_results")
+RESULTS_DIR = Path("/root/capsule/scratch/behavior_summary")
 OUTDIR      = Path("/root/capsule/scratch/raster_plot")
 
-LATENTS      = [
-    "QLearning_L2F1_softmax-deltaQ-1",
-    "QLearning_L2F1_softmax-reward",
-    "QLearning_L2F1_softmax-sumQ-1",
-]
-LATENT_NAMES = ["deltaQ-1", "reward", "sumQ-1"]
+# ============================================================
+# LATENTS and Latent_NAMES
+# ============================================================
 
+LATENTS = []
+Latent_NAMES = []
 
-LATENTS      = [
-    "QLearning_L2F1_softmax-reward",
+# --------------------------------------------------
+# Model-based latents (existing)
+# --------------------------------------------------
+model_latents = [
+    ("ForagingCompareThreshold-value-1", "Foraging-value-1"),
+    ("ForagingCompareThreshold-RPE", "Foraging-RPE"),
 ]
-LATENT_NAMES = [ "reward"]
+
+for latent, name in model_latents:
+    LATENTS.append(latent)
+    Latent_NAMES.append(name)
+
+# --------------------------------------------------
+# no_model — running-window reward rate (window = 1–30)
+# --------------------------------------------------
+WINDOWS = range(1, 31)
+RUN_TYPES = [
+    ("running_experienced", "experienced"),
+    ("running_left_reward", "left"),
+    ("running_right_reward", "right"),
+]
+
+for w in WINDOWS:
+    for suffix, short_name in RUN_TYPES:
+        LATENTS.append(
+            f"no_model-reward_rate_window_{w}-{suffix}"
+        )
+        Latent_NAMES.append(
+            f"rr_window_{w}_{short_name}"
+        )
+
+# --------------------------------------------------
+# no_model — EWMA reward rate (alpha-based)
+# --------------------------------------------------
+ALPHAS = [
+    0.05, 0.1, 0.15, 0.2, 0.25,
+    0.3, 0.35, 0.4, 0.45, 0.5,
+    0.55, 0.6, 0.75, 0.8, 0.85, 0.9
+]
+
+EWMA_TYPES = [
+    ("ewma_experienced", "experienced"),
+    ("ewma_left_reward", "left"),
+    ("ewma_right_reward", "right"),
+]
+
+for a in ALPHAS:
+    a_str = str(a).rstrip("0").rstrip(".")
+    for suffix, short_name in EWMA_TYPES:
+        LATENTS.append(
+            f"no_model-reward_rate_alpha_{a}-{suffix}"
+        )
+        Latent_NAMES.append(
+            f"rr_alpha_{a_str}_{short_name}"
+        )
+
+# --------------------------------------------------
+# Sanity check
+# --------------------------------------------------
+assert len(LATENTS) == len(Latent_NAMES)
 
 
 ALIGN_TO = "go_cue"
@@ -59,7 +114,7 @@ def process_session(session: str) -> str:
 
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        for col, lname in zip(LATENTS, LATENT_NAMES):
+        for col, lname in zip(LATENTS, Latent_NAMES):
 
             if col == "QLearning_L2F1_softmax-reward":
                 raster_colormap=True
