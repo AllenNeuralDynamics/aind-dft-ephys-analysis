@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Sequence, Tuple, Optional, Union, Literal, List, Dict
 
+import math
 import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
@@ -760,3 +761,393 @@ def plot_raster_and_quantile_psth_by_latent(
                 del unit_psth
             if unit_rast is not None:
                 del unit_rast
+
+
+
+
+
+
+def plot_trial_mean_activity_vs_latent_per_unit(
+    source: Union[str, Path, xr.DataArray, xr.Dataset],
+    *,
+    latent_values: Sequence[float],
+    latent_trial_ids: Sequence[int],
+    activity_window: Tuple[float, float],
+    unit_ids: Optional[Sequence[int]] = None,
+    align_to_event: Optional[str] = None,
+    time_window: Optional[Tuple[float, float]] = None,
+    figsize: Tuple[float, float] = (5.5, 4.5),
+    dpi: int = 300,
+    consolidated: bool = True,
+    save_path: Optional[Union[str, Path]] = None,
+    title_prefix: str = "",
+    save_prefix: Optional[str] = None,
+    latent_name: Optional[str] = None,
+    activity_name: str = "Trial mean firing rate (spk/s)",
+    show: bool = True,
+    overwrite: bool = True,
+    fit_kind: Literal["linear"] = "linear",
+    show_identity: bool = False,
+    annotate: bool = True,                         # NEW: add annotation box
+    annotation_loc: Literal[
+        "upper left", "upper right", "lower left", "lower right"
+    ] = "upper left",                              # NEW: annotation location
+) -> None:
+    """
+    For each unit, compute trial-wise mean neural activity within `activity_window`,
+    scatter-plot it against a trial-wise latent variable, fit a line, and show
+    goodness-of-fit in the title.
+
+    Notes
+    -----
+    - Uses PSTH data (trial x time) to compute trial mean activity.
+    - Saves one figure per unit if `save_path` is provided.
+    - Output folder is:
+        base_dir / subfolder_name
+      where:
+        subfolder_name = f"{save_prefix.rstrip('_')}_activity_window_<w0>_<w1>"
+        (or "activity_window_<w0>_<w1>" if save_prefix is None)
+      and filenames are:
+        f"{save_prefix or ''}unit_{unit}_latent_scatter.png"
+
+    Parameters
+    ----------
+    source
+        Path to a Zarr PSTH dataset or an already loaded xarray object containing PSTH/raster.
+        Must be compatible with `load_psth_raster_subset`.
+    latent_values
+        Latent variable values, one per trial.
+    latent_trial_ids
+        Trial IDs corresponding to `latent_values`.
+    activity_window
+        Time interval (seconds) to average neural activity within each trial.
+    unit_ids
+        Which units to plot. If None, plot all units in the dataset.
+    align_to_event
+        Alignment key when multiple alignments exist.
+    time_window
+        Optional overall time slicing passed to loader (can reduce IO).
+        This does not replace `activity_window`; it just limits loaded data.
+    figsize, dpi
+        Matplotlib figure size and output DPI.
+    consolidated
+        Passed to the Zarr loader.
+    save_path
+        Directory or file-like path used to derive base output folder.
+    title_prefix
+        Prefix used in figure title.
+    save_prefix
+        Used for:
+        1) folder naming (with activity window appended)
+        2) filename prefix: `f"{save_prefix or ''}unit_{unit}_latent_scatter.png"`
+    latent_name
+        Label for x-axis (defaults to 'Latent value').
+    activity_name
+        Label for y-axis.
+    show
+        If True, display figures. If False, suppress display and close after saving.
+    overwrite
+        If False and target file exists, skip that unit.
+    fit_kind
+        Currently only 'linear' is supported.
+    show_identity
+        If True, also plot y=x line (only meaningful if units are comparable).
+    """
+
+    # -----------------------------
+    # 1) Validate inputs
+    # -----------------------------
+    latent_values = np.asarray(latent_values, dtype=np.float32)
+    latent_trial_ids = np.asarray(latent_trial_ids, dtype=np.int64)
+
+    if latent_values.shape[0] != latent_trial_ids.shape[0]:
+        raise ValueError("`latent_values` and `latent_trial_ids` must have the same length.")
+    if latent_trial_ids.size != np.unique(latent_trial_ids).size:
+        raise ValueError("`latent_trial_ids` contains duplicates; must be one-to-one.")
+
+    w0, w1 = float(activity_window[0]), float(activity_window[1])
+    if w1 <= w0:
+        raise ValueError("`activity_window` must satisfy activity_window[1] > activity_window[0].")
+
+    # -----------------------------
+    # 2) Load PSTH subset
+    # -----------------------------
+    # NOTE: This function must exist in your codebase.
+    psth_da, _raster_da = load_psth_raster_subset(
+        source,
+        trial_ids=None,
+        unit_ids=unit_ids,
+        align_to_event=align_to_event,
+        time_window=time_window,
+        consolidated=consolidated,
+    )
+
+    trial_dim = next(d for d in psth_da.dims if d.startswith("trial_"))
+    trial_coord = next(c for c in psth_da.coords if c.startswith("trial_index_"))
+
+    all_trial_ids_in_ds = psth_da.coords[trial_coord].values.astype(np.int64)
+    unit_indices = psth_da.coords["unit_index"].values.astype(np.int64)
+    times = np.asarray(psth_da.coords["time"].values, dtype=np.float32)
+
+    # -----------------------------
+    # 3) Align latent values to trials present in dataset
+    # -----------------------------
+    present_mask = np.isin(latent_trial_ids, all_trial_ids_in_ds)
+    if not np.any(present_mask):
+        raise ValueError("None of `latent_trial_ids` are present in the dataset.")
+
+    latent_trial_ids = latent_trial_ids[present_mask]
+    latent_values = latent_values[present_mask]
+
+    pos_idx = pd.Index(all_trial_ids_in_ds).get_indexer(latent_trial_ids)
+    keep = pos_idx >= 0
+
+    psth_da = psth_da.isel({trial_dim: pos_idx[keep]})
+    lat = latent_values[keep]
+
+    # -----------------------------
+    # 4) Time mask for trial-mean activity
+    # -----------------------------
+    tmask = (times >= w0) & (times <= w1)
+    if not np.any(tmask):
+        raise ValueError(
+            f"`activity_window`={activity_window} selects no time points. "
+            f"Dataset time range is [{float(np.nanmin(times)):.3f}, {float(np.nanmax(times)):.3f}]."
+        )
+
+    # -----------------------------
+    # 5) Prepare output directory ONCE
+    # -----------------------------
+    def _fmt_time_for_path(t: float) -> str:
+        """
+        Format a float time value into a filesystem-safe token.
+        Examples:
+          -0.25 -> m0p25
+           0.0  -> 0p0
+           1.5  -> 1p5
+        """
+        s = f"{t:.6g}"
+        s = s.replace("-", "m").replace(".", "p")
+        return s
+
+    out_dir: Optional[Path] = None
+    if save_path is not None:
+        save_target = Path(save_path)
+
+        if save_target.suffix == "" or save_target.is_dir():
+            base_dir = save_target
+        else:
+            base_dir = save_target.parent
+
+        if save_prefix:
+            prefix = save_prefix.rstrip("_")
+            subfolder_name = (
+                f"{prefix}_activity_window_"
+                f"{_fmt_time_for_path(w0)}_"
+                f"{_fmt_time_for_path(w1)}"
+            )
+        else:
+            subfolder_name = (
+                f"activity_window_"
+                f"{_fmt_time_for_path(w0)}_"
+                f"{_fmt_time_for_path(w1)}"
+            )
+
+        out_dir = base_dir / subfolder_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    unit_list = list(unit_indices) if unit_ids is None else list(unit_ids)
+
+    # -----------------------------
+    # 6) Helpers: linear fit + R^2 + p-value
+    # -----------------------------
+    def _p_value_from_t(t_stat: float, df: int) -> float:
+        """
+        Two-sided p-value for t-statistic.
+        Uses SciPy if available; otherwise uses a normal approximation (good for df ~ 30+).
+
+        This keeps the function robust in minimal environments.
+        """
+        if not np.isfinite(t_stat) or df <= 0:
+            return np.nan
+
+        try:
+            # SciPy is preferred when available.
+            from scipy.stats import t as student_t  # type: ignore
+
+            return float(2.0 * student_t.sf(abs(float(t_stat)), df=df))
+        except Exception:
+            # Normal approximation: p ≈ 2 * (1 - Phi(|t|))
+            # Phi via erfc: 1 - Phi(z) = 0.5 * erfc(z / sqrt(2))
+            z = abs(float(t_stat))
+            return float(math.erfc(z / math.sqrt(2.0)))
+
+    def _linear_fit_stats(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float, float]:
+        """
+        Fit y = a*x + b.
+
+        Returns
+        -------
+        a : float
+            Slope
+        b : float
+            Intercept
+        r2 : float
+            Coefficient of determination
+        p_val : float
+            Two-sided p-value for slope (a)
+        """
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+
+        n = int(x.size)
+        if n < 3:
+            return np.nan, np.nan, np.nan, np.nan
+
+        x_mean = float(np.mean(x))
+        y_mean = float(np.mean(y))
+
+        sxx = float(np.sum((x - x_mean) ** 2))
+        if sxx <= 0:
+            return np.nan, np.nan, np.nan, np.nan
+
+        sxy = float(np.sum((x - x_mean) * (y - y_mean)))
+        a = sxy / sxx
+        b = y_mean - a * x_mean
+
+        y_hat = a * x + b
+        ss_res = float(np.sum((y - y_hat) ** 2))
+        ss_tot = float(np.sum((y - y_mean) ** 2))
+
+        r2 = np.nan
+        if ss_tot > 0:
+            r2 = 1.0 - ss_res / ss_tot
+
+        # Slope significance: t = a / SE(a), df = n - 2
+        df = n - 2
+        if df <= 0:
+            return float(a), float(b), float(r2), np.nan
+
+        mse = ss_res / df
+        se_a = math.sqrt(mse / sxx) if (mse >= 0 and sxx > 0) else np.nan
+        if not np.isfinite(se_a) or se_a <= 0:
+            p_val = np.nan
+        else:
+            t_stat = a / se_a
+            p_val = _p_value_from_t(t_stat, df=df)
+
+        return float(a), float(b), float(r2), float(p_val)
+
+    def _annotation_xy(loc: str) -> Tuple[float, float, str, str]:
+        """
+        Map a location string to (x, y, ha, va) in Axes coordinates.
+        """
+        if loc == "upper left":
+            return 0.03, 0.97, "left", "top"
+        if loc == "upper right":
+            return 0.97, 0.97, "right", "top"
+        if loc == "lower left":
+            return 0.03, 0.03, "left", "bottom"
+        if loc == "lower right":
+            return 0.97, 0.03, "right", "bottom"
+        return 0.03, 0.97, "left", "top"
+
+    # -----------------------------
+    # 7) Plot per unit
+    # -----------------------------
+    for unit in unit_list:
+        fp: Optional[Path] = None
+        if out_dir is not None:
+            filename = f"{save_prefix or ''}unit_{unit}_latent_scatter.png"
+            fp = out_dir / filename
+            if fp.exists() and not overwrite:
+                print(f"Skipping Unit {unit} (file exists, overwrite=False): {fp}")
+                continue
+
+        where = np.where(unit_indices == unit)[0]
+        if where.size == 0:
+            continue
+        upos = int(where[0])
+
+        fig = None
+        try:
+            # unit_psth: (trial, time)
+            unit_psth = psth_da.isel(unit=upos)
+            unit_psth_np = np.asarray(unit_psth.values, dtype=np.float32)  # (n_trials, n_time)
+
+            # Trial mean activity in activity_window
+            trial_mean = np.nanmean(unit_psth_np[:, tmask], axis=1)
+
+            # Match finite pairs
+            x = np.asarray(lat, dtype=np.float32)
+            y = np.asarray(trial_mean, dtype=np.float32)
+            ok = np.isfinite(x) & np.isfinite(y)
+            n_ok = int(np.sum(ok))
+
+            if n_ok < 3:
+                a = b = r2 = p_val = np.nan
+            else:
+                if fit_kind != "linear":
+                    raise ValueError(f"Unsupported fit_kind={fit_kind!r}. Only 'linear' is supported.")
+                a, b, r2, p_val = _linear_fit_stats(x[ok], y[ok])
+
+            fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+            ax.scatter(x[ok], y[ok], s=16, alpha=0.8)
+
+            # Fit line
+            if np.isfinite(a) and np.isfinite(b) and n_ok >= 2:
+                x_min = float(np.nanmin(x[ok]))
+                x_max = float(np.nanmax(x[ok]))
+                xs = np.linspace(x_min, x_max, 100, dtype=np.float32)
+                ys = a * xs + b
+                ax.plot(xs, ys, linewidth=2.0)
+
+            # Optional identity line
+            if show_identity and n_ok > 0:
+                x_min = float(np.nanmin(x[ok]))
+                x_max = float(np.nanmax(x[ok]))
+                xs = np.linspace(x_min, x_max, 100, dtype=np.float32)
+                ax.plot(xs, xs, linewidth=1.0, linestyle="--")
+
+            ax.set_xlabel(latent_name or "Latent value")
+            ax.set_ylabel(activity_name)
+
+            # Title 
+            base_title = f"{title_prefix} Unit {unit}".strip() if title_prefix else f"Unit {unit}"
+            ax.set_title(base_title)
+
+
+            # Annotation box (same content as title line, but easier to read)
+            if annotate and np.isfinite(a) and np.isfinite(b):
+                x0, y0, ha, va = _annotation_xy(annotation_loc)
+                text = (
+                    f"y = {a:.3g}x + {b:.3g}\n"
+                    f"R² = {r2:.3f}\n"
+                    f"p = {p_val:.2e}\n"
+                    f"N = {n_ok}"
+                )
+                ax.text(
+                    x0,
+                    y0,
+                    text,
+                    transform=ax.transAxes,
+                    ha=ha,
+                    va=va,
+                    fontsize=9,
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="none"),
+                )
+
+            ax.grid(True, alpha=0.25)
+            plt.tight_layout()
+
+            if fp is not None:
+                fig.savefig(fp, dpi=dpi, bbox_inches="tight")
+                print(f"Saved Unit {unit} scatter to {fp}")
+
+            if show:
+                plt.show()
+
+        finally:
+            if fig is not None:
+                plt.close(fig)
