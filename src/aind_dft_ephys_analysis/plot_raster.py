@@ -389,6 +389,7 @@ def plot_raster_and_quantile_psth_by_latent(
     save_prefix: Optional[str] = None,
     latent_name: Optional[str] = None,  # colorbar label
     show: bool = True,                  # control figure display
+    overwrite: bool = True,             # overwrite existing figure files
 ) -> None:
     """
     Plot per-unit rasters and binned PSTH summaries using a trial-wise latent value.
@@ -452,6 +453,9 @@ def plot_raster_and_quantile_psth_by_latent(
         Custom label for the colorbar. Defaults to 'Latent value' if not provided.
     show : bool, default True
         If True, display each figure. If False, suppress display and close after saving.
+    overwrite : bool, default True
+        If True, overwrite an existing figure file. If False and the target file exists,
+        skip that unit (do not generate a figure).
     """
     # -----------------------------
     # 1) Validate inputs
@@ -467,6 +471,7 @@ def plot_raster_and_quantile_psth_by_latent(
     # -----------------------------
     # 2) Load PSTH & raster subset
     # -----------------------------
+    # NOTE: This function must exist in your codebase.
     psth_da, raster_da = load_psth_raster_subset(
         source,
         trial_ids=None,
@@ -492,8 +497,11 @@ def plot_raster_and_quantile_psth_by_latent(
 
     latent_trial_ids = latent_trial_ids[present_mask]
     latent_values = latent_values[present_mask]
+
+    # Map requested trial IDs onto dataset trial positions
     pos_idx = pd.Index(all_trial_ids_in_ds).get_indexer(latent_trial_ids)
     keep = pos_idx >= 0
+
     psth_da = psth_da.isel({trial_dim: pos_idx[keep]})
     raster_da = raster_da.isel({trial_dim: pos_idx[keep]})
     lat = latent_values[keep]
@@ -540,8 +548,10 @@ def plot_raster_and_quantile_psth_by_latent(
     if bin_label == "center":
         bin_tick_vals = list(0.5 * (edges[:-1] + edges[1:]))
     else:
-        bin_tick_vals = [float(np.nanmean(lat[bin_idx == i])) if np.any(bin_idx == i) else np.nan
-                         for i in range(n_bins)]
+        bin_tick_vals = [
+            float(np.nanmean(lat[bin_idx == i])) if np.any(bin_idx == i) else np.nan
+            for i in range(n_bins)
+        ]
 
     latent_min = float(np.nanmin(lat_finite))
     latent_max = float(np.nanmax(lat_finite))
@@ -574,6 +584,17 @@ def plot_raster_and_quantile_psth_by_latent(
     # 5) Plot per unit
     # -----------------------------
     for unit in unit_list:
+        fp: Optional[Path] = None
+
+        # File naming + overwrite logic (fast per-unit)
+        if out_dir is not None:
+            filename = f"{save_prefix or ''}unit_{unit}.png"
+            fp = out_dir / filename
+
+            if fp.exists() and not overwrite:
+                print(f"Skipping Unit {unit} (file exists, overwrite=False): {fp}")
+                continue
+
         where = np.where(unit_indices == unit)[0]
         if where.size == 0:
             continue
@@ -606,9 +627,12 @@ def plot_raster_and_quantile_psth_by_latent(
             sorted_trials = trial_ids_arr[order]
             sorted_bins = bin_idx[order]
 
-        fig, (ax_rast, ax_psth) = plt.subplots(
-            2, 1, figsize=figsize, sharex=True, gridspec_kw={'height_ratios': [1, 1.3]}
-        )
+            fig, (ax_rast, ax_psth) = plt.subplots(
+                2, 1,
+                figsize=figsize,
+                sharex=True,
+                gridspec_kw={"height_ratios": [1, 1.3]},
+            )
 
             # -----------------------------
             # Raster
@@ -638,44 +662,60 @@ def plot_raster_and_quantile_psth_by_latent(
 
                 color = colors[b] if raster_colormap else "black"
                 ax_rast.vlines(spikes, y, y + 0.9, color=color, alpha=0.8, linewidth=0.6)
-        ax_rast.axvline(0.0, color="k", ls="--", lw=0.8)
-        ttl = f"{title_prefix} Unit {unit}" if title_prefix else f"Unit {unit}"
-        order_str = "ascending" if sort_order_bool else "descending"
-        ax_rast.set_title(f"{ttl} (sorted {order_str})")
-        ax_rast.set_ylabel("Trials (sorted by latent)")
 
-        # PSTH summaries by bin
-        ymax = 0.0
-        for b in range(n_bins):
-            sel = (bin_idx == b)
-            if not np.any(sel):
-                continue
-            data = unit_psth.isel({trial_dim: sel}).values
-            center = np.nanmedian(data, axis=0) if quantile_stat == "median" else np.nanmean(data, axis=0)
-            lower = upper = None
-            if ci == "sem":
-                n = np.sum(np.isfinite(data), axis=0)
-                std = np.nanstd(data, axis=0, ddof=1)
-                sem = np.where(n > 0, std / np.sqrt(np.maximum(n, 1)), np.nan)
-                lower, upper = center - sem, center + sem
-            elif ci == "iqr":
-                q25 = np.nanpercentile(data, 25, axis=0)
-                q75 = np.nanpercentile(data, 75, axis=0)
-                lower, upper = q25, q75
-            ax_psth.plot(times, center, color=colors[b], linewidth=1.5)
-            if lower is not None and upper is not None:
-                ax_psth.fill_between(times, lower, upper, color=colors[b], alpha=0.25)
-            fmax = np.nanmax(upper if upper is not None else center)
-            if np.isfinite(fmax):
-                ymax = max(ymax, float(fmax))
-        ax_psth.axvline(0.0, color="k", ls="--", lw=0.8)
-        ax_psth.set_ylabel("Firing rate (spk/s)")
-        ax_psth.set_xlabel("Time (s)")
-        if time_window is not None:
-            ax_rast.set_xlim(*time_window)
-            ax_psth.set_xlim(*time_window)
-        if ymax > 0:
-            ax_psth.set_ylim(0, ymax * 1.05)
+            ax_rast.axvline(0.0, color="k", ls="--", lw=0.8)
+
+            ttl = f"{title_prefix} Unit {unit}" if title_prefix else f"Unit {unit}"
+            order_str = "ascending" if ascending else "descending"
+            ax_rast.set_title(f"{ttl} (sorted {order_str})")
+            ax_rast.set_ylabel("Trials (sorted by latent)")
+
+            # -----------------------------
+            # PSTH summaries by bin
+            # -----------------------------
+            ymax = 0.0
+            for b in range(n_bins):
+                sel = (bin_idx == b)
+                if not np.any(sel):
+                    continue
+
+                data = unit_psth_np[sel, :]
+
+                if quantile_stat == "median":
+                    center = np.nanmedian(data, axis=0)
+                else:
+                    center = np.nanmean(data, axis=0)
+
+                lower = upper = None
+                if ci == "sem":
+                    n = np.sum(np.isfinite(data), axis=0)
+                    std = np.nanstd(data, axis=0, ddof=1)
+                    sem = np.where(n > 0, std / np.sqrt(np.maximum(n, 1)), np.nan)
+                    lower, upper = center - sem, center + sem
+                elif ci == "iqr":
+                    q25 = np.nanpercentile(data, 25, axis=0)
+                    q75 = np.nanpercentile(data, 75, axis=0)
+                    lower, upper = q25, q75
+
+                ax_psth.plot(times, center, color=colors[b], linewidth=1.5)
+
+                if lower is not None and upper is not None:
+                    ax_psth.fill_between(times, lower, upper, color=colors[b], alpha=0.25)
+
+                fmax = np.nanmax(upper if upper is not None else center)
+                if np.isfinite(fmax):
+                    ymax = max(ymax, float(fmax))
+
+            ax_psth.axvline(0.0, color="k", ls="--", lw=0.8)
+            ax_psth.set_ylabel("Firing rate (spk/s)")
+            ax_psth.set_xlabel("Time (s)")
+
+            if time_window is not None:
+                ax_rast.set_xlim(*time_window)
+                ax_psth.set_xlim(*time_window)
+
+            if ymax > 0:
+                ax_psth.set_ylim(0, ymax * 1.05)
 
             plt.tight_layout()
 
@@ -696,19 +736,12 @@ def plot_raster_and_quantile_psth_by_latent(
                     cbar.set_ticklabels([f"{v:.2f}" for v in ticks])
                 cbar.ax.tick_params(size=0)
 
-        # Save / Show / Close
-        if save_path:
-            save_target = Path(save_path)
-            if save_target.suffix == "" or save_target.is_dir():
-                save_target.mkdir(parents=True, exist_ok=True)
-                filename = f"{save_prefix or ''}unit_{unit}.png"
-                fp = save_target / filename
-            else:
-                base = save_target.with_suffix("")
-                filename = f"{save_prefix or ''}{base.name}_unit_{unit}.png"
-                fp = base.parent / filename
-            fig.savefig(fp, dpi=dpi, bbox_inches="tight")
-            print(f"Saved Unit {unit} figure to {fp}")
+            # -----------------------------
+            # Save / Show
+            # -----------------------------
+            if fp is not None:
+                fig.savefig(fp, dpi=dpi, bbox_inches="tight")
+                print(f"Saved Unit {unit} figure to {fp}")
 
             if show:
                 plt.show()
