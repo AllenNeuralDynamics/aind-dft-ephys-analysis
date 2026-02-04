@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 from typing import Any, Optional, Tuple, Dict, List, Union, Sequence
 from scipy.optimize import minimize
@@ -519,3 +521,429 @@ def visualize_choice_logistic_regression(
 
     return out
 
+
+
+
+
+from typing import Any, Optional, Dict, Union
+from pathlib import Path
+import json
+
+import numpy as np
+from scipy.optimize import minimize
+
+
+def fit_compare_to_threshold_model(
+    nwb_behavior_data: Any,
+    model_name: str = "compare_to_threshold",
+    *,
+    reset_on_switch: bool = True,
+    include_bias: bool = True,
+    save_results: bool = False,
+    save_folder: Optional[Union[str, Path]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fit a "compare-to-threshold" behavior model to a two-choice task stored in NWB.
+
+    -------------------------------------------------------------------------
+    REQUIRED TRIAL COLUMNS IN THE NWB
+    -------------------------------------------------------------------------
+      - trials['animal_response']   0 = left, 1 = right, 2 = no response
+      - trials['rewarded_historyL'] 0/1 reward delivered on left
+      - trials['rewarded_historyR'] 0/1 reward delivered on right
+
+    -------------------------------------------------------------------------
+    SESSION METADATA (SAVED INTO RESULTS)
+    -------------------------------------------------------------------------
+      - session_id is extracted from: nwb_behavior_data.session_id
+      - auto_train_stage is extracted from: nwb_behavior_data.trials[0]['auto_train_stage'][0]
+        (best-effort; returned as "unknown" if missing)
+
+    -------------------------------------------------------------------------
+    MODEL SUMMARY
+    -------------------------------------------------------------------------
+    1) Experienced reward r(t) is binary (0/1) and comes from the chosen side:
+        if chose left:  r(t) = rewarded_historyL[t]
+        if chose right: r(t) = rewarded_historyR[t]
+
+    2) Single latent value update (EWMA / delta rule):
+        v(t+1) = v(t) + alpha * (r(t) - v(t))
+
+    3) Compare to threshold:
+        d(t) = v(t) - threshold
+
+    4) Choice mapping:
+        P(Right) = sigmoid( beta * d(t) + bias )
+
+    Free parameters:
+      - include_bias=True  => alpha, threshold, beta, bias  (k=4)
+      - include_bias=False => alpha, threshold, beta        (k=3; bias fixed to 0)
+
+    -------------------------------------------------------------------------
+    RESET OPTION
+    -------------------------------------------------------------------------
+    reset_on_switch:
+        If True, whenever choice(t) != choice(t-1) between consecutive *valid*
+        trials (after removing no-response), reset v(t) to threshold at the
+        start of trial t (before computing P(Right)).
+        If False, do not reset.
+
+    -------------------------------------------------------------------------
+    SAVING RESULTS (JSON ONLY)
+    -------------------------------------------------------------------------
+    save_results:
+        If True, save a single JSON file into save_folder.
+
+    save_folder:
+        Output directory. Must be provided when save_results=True.
+
+    Saved file:
+      - <save_folder>/<session_id>__<model_name>_fit_results.json
+
+    Note:
+      - The JSON includes fitted_latent_variables as lists (JSON-serializable).
+      - Arrays are not saved as .npz per user request.
+
+    -------------------------------------------------------------------------
+    RETURNS
+    -------------------------------------------------------------------------
+    On success: dict with
+      - model_name
+      - session_id
+      - auto_train_stage
+      - fitted_params
+      - neg_log_likelihood (NLL)
+      - log_likelihood (LL)
+      - aic, bic
+      - n_trials_used, n_parameters
+      - fitted_latent_variables:
+            value: v(t), length n_trials+1, includes v(0)
+            decision_variable: d(t), length n_trials
+            choice_prob: [P(Left), P(Right)], each length n_trials
+      - success = True
+
+    On failure: None
+    """
+
+    # ------------------------------------------------------------------
+    # 0) Extract session_id and auto_train_stage (best-effort)
+    # ------------------------------------------------------------------
+    session_id = getattr(nwb_behavior_data, "session_id", None)
+    if session_id is None:
+        session_id = "session_unknown"
+
+    try:
+        # Per user request: trials[0]['auto_train_stage'][0]
+        auto_train_stage = nwb_behavior_data.trials[0]["auto_train_stage"][0]
+    except Exception:
+        auto_train_stage = "unknown"
+
+    # ------------------------------------------------------------------
+    # 1) Validate saving options (JSON-only saving)
+    # ------------------------------------------------------------------
+    if save_results:
+        if save_folder is None:
+            raise ValueError("save_folder must be provided when save_results=True.")
+        save_folder = Path(save_folder)
+        save_folder.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 2) Extract trial vectors from NWB
+    # ------------------------------------------------------------------
+    # animal_response: 0=left, 1=right, 2=no response
+    animal_response = np.asarray(nwb_behavior_data.trials["animal_response"][:])
+
+    # Reward delivery on each side (0/1)
+    reward_left = np.asarray(nwb_behavior_data.trials["rewarded_historyL"][:], dtype=float)
+    reward_right = np.asarray(nwb_behavior_data.trials["rewarded_historyR"][:], dtype=float)
+
+    # ------------------------------------------------------------------
+    # 3) Remove no-response trials (animal_response == 2)
+    # ------------------------------------------------------------------
+    valid_mask = animal_response != 2
+    animal_response = animal_response[valid_mask]
+    reward_left = reward_left[valid_mask]
+    reward_right = reward_right[valid_mask]
+
+    n_trials = int(len(animal_response))
+    if n_trials == 0:
+        print("No valid trials after removing 'no response'.")
+        return None
+
+    # ------------------------------------------------------------------
+    # 4) Build experienced reward r(t) from chosen side
+    # ------------------------------------------------------------------
+    # r(t) is the reward the animal actually experienced given its choice.
+    r = np.zeros(n_trials, dtype=float)
+    chose_left = animal_response == 0
+    chose_right = animal_response == 1
+    r[chose_left] = reward_left[chose_left]
+    r[chose_right] = reward_right[chose_right]
+
+    # ------------------------------------------------------------------
+    # 5) Detect switching between consecutive valid trials
+    # ------------------------------------------------------------------
+    switched = np.zeros(n_trials, dtype=bool)
+    if n_trials >= 2:
+        switched[1:] = (animal_response[1:] != animal_response[:-1])
+
+    # ------------------------------------------------------------------
+    # 6) Numerically stable sigmoid helper
+    # ------------------------------------------------------------------
+    def _sigmoid(x: float) -> float:
+        """
+        Numerically stable sigmoid. Clipping avoids exp overflow.
+        """
+        x = float(np.clip(x, -60.0, 60.0))
+        return 1.0 / (1.0 + np.exp(-x))
+
+    # ------------------------------------------------------------------
+    # 7) Negative log-likelihood (NLL) for optimization
+    # ------------------------------------------------------------------
+    def _neg_log_lik(params: np.ndarray) -> float:
+        """
+        Compute total NLL over valid trials for the current parameter vector.
+
+        Parameterization:
+          - include_bias=True:  params = [alpha, threshold, beta, bias]
+          - include_bias=False: params = [alpha, threshold, beta] and bias=0
+
+        Trial loop order:
+          (a) optionally reset v to threshold if switching at trial t
+          (b) compute d = v - threshold
+          (c) compute p_right = sigmoid(beta*d + bias)
+          (d) add -log(p_right) or -log(1-p_right) depending on observed choice
+          (e) update v <- v + alpha*(r(t) - v)
+        """
+        if include_bias:
+            alpha, threshold, beta, bias = params
+        else:
+            alpha, threshold, beta = params
+            bias = 0.0
+
+        v = 0.0
+        nll = 0.0
+        eps = 1e-12  # protects against log(0)
+
+        for t in range(n_trials):
+            # Optional reset at the start of a switched trial
+            if reset_on_switch and switched[t]:
+                v = threshold
+
+            d = v - threshold
+            p_right = _sigmoid(beta * d + bias)
+
+            if animal_response[t] == 1:  # chose right
+                nll -= np.log(p_right + eps)
+            else:  # chose left
+                nll -= np.log(1.0 - p_right + eps)
+
+            # Update value after observing reward
+            v = v + alpha * (r[t] - v)
+
+        return float(nll)
+
+    # ------------------------------------------------------------------
+    # 8) Optimization configuration
+    # ------------------------------------------------------------------
+    # Bounds:
+    #   alpha in [0,1] (stable EWMA update)
+    #   threshold in [0,1] (assuming v stays in [0,1] when r is 0/1)
+    #   beta > 0 (steepness)
+    #   bias in [-10,10] (optional offset)
+    if include_bias:
+        init_params = np.array([0.2, 0.5, 5.0, 0.0], dtype=float)
+        bounds = [(0, 1.0), (-1.0, 1.0), (1e-3, 50), (-5, 5)]
+        param_names = ["alpha", "threshold", "beta", "bias"]
+    else:
+        init_params = np.array([0.2, 0.5, 5.0], dtype=float)
+        bounds = [(0, 1.0), (-1.0, 1.0), (1e-3, 200.0)]
+        param_names = ["alpha", "threshold", "beta"]
+
+    # ------------------------------------------------------------------
+    # 9) Run optimizer (L-BFGS-B)
+    # ------------------------------------------------------------------
+    result = minimize(_neg_log_lik, init_params, bounds=bounds, method="L-BFGS-B")
+    if not result.success:
+        print("Compare-to-threshold optimisation failed:", result.message)
+        return None
+
+    # Convert fitted vector into a named dict
+    fitted_params = dict(zip(param_names, map(float, result.x)))
+    if not include_bias:
+        # Always include bias key for downstream consistency
+        fitted_params["bias"] = 0.0
+
+    # ------------------------------------------------------------------
+    # 10) Compute LL / AIC / BIC from fitted NLL
+    # ------------------------------------------------------------------
+    neg_log_likelihood = float(result.fun)
+    log_likelihood = -neg_log_likelihood
+
+    # Number of fitted parameters used by the optimizer
+    k = int(len(param_names))
+
+    # Number of observations (valid trials)
+    n = int(n_trials)
+
+    # AIC = 2k - 2LL ; BIC = k*log(n) - 2LL
+    aic = 2.0 * float(k) - 2.0 * float(log_likelihood)
+    bic = float(k) * float(np.log(n)) - 2.0 * float(log_likelihood)
+
+    # ------------------------------------------------------------------
+    # 11) Forward simulation with fitted parameters to generate latents
+    # ------------------------------------------------------------------
+    alpha = float(fitted_params["alpha"])
+    threshold = float(fitted_params["threshold"])
+    beta = float(fitted_params["beta"])
+    bias = float(fitted_params["bias"])
+
+    # Latent arrays:
+    #   value: includes initial v(0), so length is n_trials+1
+    #   decision_variable and choice probabilities are defined per trial start, so length n_trials
+    v_vals = np.zeros(n_trials + 1, dtype=float)
+    d_vals = np.zeros(n_trials, dtype=float)
+    p_right = np.zeros(n_trials, dtype=float)
+
+    v = 0.0
+    for t in range(n_trials):
+        if reset_on_switch and switched[t]:
+            v = threshold
+
+        d = v - threshold
+        d_vals[t] = d
+        p_right[t] = _sigmoid(beta * d + bias)
+
+        v = v + alpha * (r[t] - v)
+        v_vals[t + 1] = v
+
+    p_left = 1.0 - p_right
+
+    # ------------------------------------------------------------------
+    # 12) Assemble results (JSON-friendly)
+    # ------------------------------------------------------------------
+    # Important: JSON cannot serialize NumPy arrays, so convert to Python lists.
+    fitted_latent_variables = {
+        "value": v_vals.tolist(),
+        "decision_variable": d_vals.tolist(),
+        "choice_prob": [p_left.tolist(), p_right.tolist()],
+    }
+
+    output: Dict[str, Any] = {
+        "model_name": model_name,
+        "session_id": session_id,
+        "auto_train_stage": auto_train_stage,
+        "fitted_params": fitted_params,
+        "neg_log_likelihood": neg_log_likelihood,
+        "log_likelihood": float(log_likelihood),
+        "aic": float(aic),
+        "bic": float(bic),
+        "n_trials_used": n,
+        "n_parameters": k,
+        "fitted_latent_variables": fitted_latent_variables,
+        "success": True,
+        "metadata": {
+            "reset_on_switch": bool(reset_on_switch),
+            "include_bias": bool(include_bias),
+            "note": (
+                "Reward r(t) is experienced reward on the chosen side; no-response trials removed. "
+                "If reset_on_switch is True, value is reset to threshold at the start of switched trials."
+            ),
+        },
+    }
+
+    # ------------------------------------------------------------------
+    # 13) Optional saving (JSON only)
+    # ------------------------------------------------------------------
+    if save_results:
+        # Sanitize session_id for filename use
+        safe_session = "".join(
+            ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(session_id)
+        )
+        prefix = f"{safe_session}__{model_name}"
+
+        # Save a single JSON file containing everything (including latents)
+        json_path = save_folder / f"{prefix}_fit_results.json"
+        with open(json_path, "w") as f:
+            json.dump(output, f, indent=2)
+
+    return output
+
+
+
+def visualize_compare_to_threshold_model(
+    fit_output: Dict[str, Any],
+    *,
+    title_font_size: int = 16,
+    label_font_size: int = 12,
+    legend_font_size: Optional[int] = 12,
+    figsize_value: Tuple[int, int] = (13, 4),
+    figsize_pred: Tuple[int, int] = (13, 4),
+) -> Dict[str, Any]:
+    """
+    Visualize the compare-to-threshold model output.
+
+    Produces two figures:
+      1) Value trajectory v(t) with threshold line
+      2) Predicted P(Right) over trials with actual choices overlay
+
+    Expected fields in fit_output:
+        - fitted_params: contains threshold
+        - fitted_latent_variables: value (len n+1), choice_prob (len n)
+        - metadata: may contain options
+    """
+
+    fitted_params = fit_output["fitted_params"]
+    threshold = float(fitted_params["threshold"])
+
+    latents = fit_output["fitted_latent_variables"]
+    v_vals = np.asarray(latents["value"], dtype=float)                 # len n+1
+    p_left, p_right = latents["choice_prob"]
+    p_right = np.asarray(p_right, dtype=float)                         # len n
+    n_trials = int(len(p_right))
+
+    if legend_font_size is None:
+        legend_font_size = max(6, label_font_size - 2)
+
+    out: Dict[str, Any] = {"value": None, "predictions": None}
+
+    # --------------------------------------------------
+    # 1) Value vs threshold
+    # --------------------------------------------------
+    fig_v, ax_v = plt.subplots(figsize=figsize_value)
+    ax_v.plot(np.arange(len(v_vals)), v_vals, "-o", markersize=3, label="Value v(t)")
+    ax_v.axhline(threshold, linestyle="--", label=f"Threshold = {threshold:.3f}")
+
+    ax_v.set_xlabel("t (value index; includes t=0)", fontsize=label_font_size)
+    ax_v.set_ylabel("Value", fontsize=label_font_size)
+    ax_v.set_title("Compare-to-Threshold: Value Trajectory", fontsize=title_font_size)
+    ax_v.grid(True, alpha=0.3)
+    ax_v.tick_params(axis="both", labelsize=label_font_size)
+    ax_v.legend(loc="upper left", fontsize=legend_font_size, frameon=True)
+    fig_v.tight_layout()
+    out["value"] = (fig_v, ax_v)
+
+    # --------------------------------------------------
+    # 2) Predicted P(Right) and actual choice (if provided)
+    # --------------------------------------------------
+    fig_p, ax_p = plt.subplots(figsize=figsize_pred)
+    ax_p.plot(np.arange(n_trials), p_right, "-o", markersize=3, label="Pred P(Right)")
+
+    # If caller also saved actual choices in metadata (optional), overlay them.
+    # This keeps the visualizer flexible without requiring NWB access here.
+    actual = fit_output.get("actual_choice_valid", None)
+    if actual is not None:
+        actual = np.asarray(actual, dtype=float)
+        if len(actual) == n_trials:
+            ax_p.scatter(np.arange(n_trials), actual, s=16, alpha=0.5, label="Actual (0/1)")
+
+    ax_p.set_xlabel("Valid trial index", fontsize=label_font_size)
+    ax_p.set_ylabel("Probability / Choice", fontsize=label_font_size)
+    ax_p.set_title("Compare-to-Threshold: Predicted vs Actual", fontsize=title_font_size)
+    ax_p.grid(True, alpha=0.3)
+    ax_p.tick_params(axis="both", labelsize=label_font_size)
+    ax_p.legend(loc="upper left", fontsize=legend_font_size, frameon=True)
+    fig_p.tight_layout()
+    out["predictions"] = (fig_p, ax_p)
+
+    return out
