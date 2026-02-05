@@ -525,6 +525,7 @@ def visualize_choice_logistic_regression(
 
 
 
+
 import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
@@ -539,50 +540,53 @@ def fit_compare_to_threshold_model(
     *,
     reset_on_switch: bool = True,
     include_bias: bool = True,
+    # Reset behavior (IMPORTANT)
+    # - "prior_fixed": reset v to reset_value_fixed
+    # - "prior_fit":   fit reset_value as an extra parameter
+    # - "threshold":   reset v to threshold (allowed; can be weakly/non-identifiable in some datasets)
+    reset_mode: str = "threshold",
+    reset_value_fixed: float = 0.4,
     save_results: bool = False,
     save_folder: Optional[Union[str, Path]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Fit a "compare-to-threshold" STAY/SWITCH (patch-leaving) model to a two-choice task stored in NWB.
 
-    Model summary (stay/switch form)
-    --------------------------------
-    1) Experienced reward r(t) is binary (0/1) and comes from the chosen side.
+    Generative interpretation (causal order)
+    ---------------------------------------
+    Let v be the current "patch quality" estimate for the patch you were in on trial t-1.
 
-    2) Single latent value update (EWMA / delta rule):
-        v(t+1) = v(t) + alpha * (r(t) - v(t))
+    For each trial t:
+      1) Compute decision probability from current v:
+            d(t) = v - threshold
+            P(stay_t) = sigmoid(beta * d(t) + bias)
 
-    3) Compare to threshold:
-        d(t) = v(t) - threshold
+         Map stay -> choice based on previous choice:
+           - if previous was Right: P(Right_t)=P(stay_t)
+           - if previous was Left:  P(Right_t)=1-P(stay_t)
 
-    4) STAY probability:
-        P(stay at t) = sigmoid( beta * d(t) + bias )
+         For t==0: P(Right_0)=sigmoid(bias) if include_bias else 0.5
 
-       Choice mapping (for t >= 1):
-         - If previous choice was Right:
-             P(Right) = P(stay)
-         - If previous choice was Left:
-             P(Right) = 1 - P(stay)
+      2) Score likelihood of observed choice at t.
 
-       For t == 0 (no previous choice):
-         - P(Right at t=0) = sigmoid(bias) if include_bias else 0.5
+      3) If the observed choice at t is a SWITCH relative to t-1 (between consecutive valid trials),
+         then you have ENTERED a new patch at trial t. Reset v before incorporating reward from trial t:
+           - reset_mode="prior_fixed": v <- reset_value_fixed
+           - reset_mode="prior_fit":   v <- reset_value (fitted)
+           - reset_mode="threshold":   v <- threshold
 
-    Free parameters:
-      - include_bias=True  => alpha, threshold, beta, bias
-      - include_bias=False => alpha, threshold, beta (bias fixed to 0)
+      4) Observe reward r(t) on the chosen side and update:
+            v <- v + alpha * (r(t) - v)
 
-    Reset option
-    ------------
-    reset_on_switch:
-        If True, whenever choice(t) != choice(t-1) between consecutive valid trials,
-        reset v(t) to threshold at the start of trial t (before computing P(stay)).
+    Notes on reset_mode="threshold"
+    -------------------------------
+    This is allowed, but threshold can become weakly identified in some datasets.
     """
 
     # ------------------------------------------------------------------
-    # 0) Extract session_id and auto_train_stage (best-effort)
+    # 0) Basic metadata
     # ------------------------------------------------------------------
     session_id = getattr(nwb_behavior_data, "session_id", None) or "session_unknown"
-
     try:
         auto_train_stage = nwb_behavior_data.trials[0]["auto_train_stage"][0]
     except Exception:
@@ -605,7 +609,7 @@ def fit_compare_to_threshold_model(
     reward_right = np.asarray(nwb_behavior_data.trials["rewarded_historyR"][:], dtype=float)
 
     # ------------------------------------------------------------------
-    # 3) Remove no-response trials (animal_response == 2)
+    # 3) Remove no-response trials
     # ------------------------------------------------------------------
     valid_mask = animal_response != 2
     animal_response = animal_response[valid_mask]
@@ -618,7 +622,7 @@ def fit_compare_to_threshold_model(
         return None
 
     # ------------------------------------------------------------------
-    # 4) Build experienced reward r(t) from chosen side
+    # 4) Experienced reward r(t) from chosen side
     # ------------------------------------------------------------------
     r = np.zeros(n_trials, dtype=float)
     chose_left = animal_response == 0
@@ -627,92 +631,206 @@ def fit_compare_to_threshold_model(
     r[chose_right] = reward_right[chose_right]
 
     # ------------------------------------------------------------------
-    # 5) Detect switching between consecutive valid trials
+    # 5) Switch indicator between consecutive valid trials
     # ------------------------------------------------------------------
     switched = np.zeros(n_trials, dtype=bool)
     if n_trials >= 2:
         switched[1:] = animal_response[1:] != animal_response[:-1]
 
     # ------------------------------------------------------------------
-    # 6) Numerically stable sigmoid helper
+    # 6) Sigmoid helper
     # ------------------------------------------------------------------
     def _sigmoid(x: float) -> float:
         x = float(np.clip(x, -60.0, 60.0))
         return 1.0 / (1.0 + np.exp(-x))
 
     # ------------------------------------------------------------------
-    # 7) Negative log-likelihood (NLL) for optimization
+    # 7) Reset mode validation
     # ------------------------------------------------------------------
-    def _neg_log_lik(params: np.ndarray) -> float:
+    if reset_mode not in ("prior_fixed", "prior_fit", "threshold"):
+        raise ValueError("reset_mode must be one of {'prior_fixed','prior_fit','threshold'}.")
+
+    reset_value_bounds = (-1.0, 2.0)
+
+    # ------------------------------------------------------------------
+    # 8) JSON cleaning helper (fix NaN bug)
+    # ------------------------------------------------------------------
+    def _clean_for_json(obj: Any) -> Any:
+        """
+        Recursively convert NaN/Inf to None so json.dump produces valid JSON.
+        """
+        if isinstance(obj, dict):
+            return {k: _clean_for_json(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_clean_for_json(v) for v in obj]
+        if isinstance(obj, float):
+            if np.isnan(obj) or np.isinf(obj):
+                return None
+            return obj
+        return obj
+
+    # ------------------------------------------------------------------
+    # 9) Parameter unpacking
+    # ------------------------------------------------------------------
+    def _unpack_params(params: np.ndarray) -> Dict[str, float]:
+        idx = 0
+        alpha = float(params[idx]); idx += 1
+        threshold = float(params[idx]); idx += 1
+        beta = float(params[idx]); idx += 1
+
         if include_bias:
-            alpha, threshold, beta, bias = params
+            bias = float(params[idx]); idx += 1
         else:
-            alpha, threshold, beta = params
             bias = 0.0
 
-        v = 0.0
-        nll = 0.0
+        if reset_mode == "prior_fit":
+            reset_value = float(params[idx]); idx += 1
+        elif reset_mode == "prior_fixed":
+            reset_value = float(reset_value_fixed)
+        else:
+            # threshold mode: reset_value is not a parameter and not used; keep as NaN internally
+            reset_value = float("nan")
+
+        return {
+            "alpha": alpha,
+            "threshold": threshold,
+            "beta": beta,
+            "bias": bias,
+            "reset_value": reset_value,
+        }
+
+    # ------------------------------------------------------------------
+    # 10) NLL and per-trial log-likelihood (causal order)
+    # ------------------------------------------------------------------
+    def _run_sequence(params: np.ndarray, *, return_ll_per_trial: bool) -> Dict[str, Any]:
+        p = _unpack_params(params)
+
+        alpha = p["alpha"]
+        threshold = p["threshold"]
+        beta = p["beta"]
+        bias = p["bias"]
+        reset_value = p["reset_value"]
+
+        if reset_mode == "threshold":
+            v = threshold
+        else:
+            v = reset_value  # prior_fixed/prior_fit
+
         eps = 1e-12
+        ll_per_trial = np.zeros(n_trials, dtype=float) if return_ll_per_trial else None
+
+        nll = 0.0
 
         for t in range(n_trials):
-            # Reset at the start of a switched trial (generative stay/switch interpretation)
-            if reset_on_switch and switched[t]:
-                v = threshold
-
+            # 1) Decision probability from current v (old patch estimate)
             d = v - threshold
             p_stay = _sigmoid(beta * d + bias)
 
-            # Map p_stay -> P(Right) using previous choice (t >= 1 only)
             if t == 0:
-                # No previous choice: initial side bias only
                 p_right = _sigmoid(bias) if include_bias else 0.5
             else:
-                prev_choice = int(animal_response[t - 1])  # 0=L, 1=R
-                if prev_choice == 1:
-                    p_right = p_stay
-                else:
-                    p_right = 1.0 - p_stay
+                prev_choice = int(animal_response[t - 1])
+                p_right = p_stay if prev_choice == 1 else (1.0 - p_stay)
 
-            # Likelihood of observed choice
+            # 2) Score observed choice at t
             if animal_response[t] == 1:
-                nll -= np.log(p_right + eps)
+                p_obs = p_right
             else:
-                nll -= np.log(1.0 - p_right + eps)
+                p_obs = 1.0 - p_right
 
-            # Update after reward
+            ll_t = float(np.log(p_obs + eps))
+            nll -= ll_t
+            if ll_per_trial is not None:
+                ll_per_trial[t] = ll_t
+
+            # 3) Reset on switch before reward update
+            if reset_on_switch and switched[t]:
+                if reset_mode == "threshold":
+                    v = threshold
+                else:
+                    v = reset_value
+
+            # 4) Reward update
             v = v + alpha * (r[t] - v)
 
-        return float(nll)
+        out: Dict[str, Any] = {"nll": float(nll)}
+        if ll_per_trial is not None:
+            out["ll_per_trial"] = ll_per_trial
+        return out
+
+    def _neg_log_lik(params: np.ndarray) -> float:
+        return float(_run_sequence(params, return_ll_per_trial=False)["nll"])
 
     # ------------------------------------------------------------------
-    # 8) Optimization configuration
+    # 11) Optimization setup
     # ------------------------------------------------------------------
+    init_params_list = []
+    bounds_list = []
+    param_names = []
+
+    # alpha
+    init_params_list.append(0.2)
+    bounds_list.append((0.0, 1.0))
+    param_names.append("alpha")
+
+    # threshold
+    init_params_list.append(0.5)
+    bounds_list.append((-1.0, 1.0))
+    param_names.append("threshold")
+
+    # beta (allow negative)
+    init_params_list.append(5.0)
+    bounds_list.append((-200.0, 200.0))
+    param_names.append("beta")
+
+    # bias
     if include_bias:
-        init_params = np.array([0.2, 0.5, 5.0, 0.0], dtype=float)
-        bounds = [(0.0, 1.0), (-1.0, 1.0), (1e-3, 50.0), (-5.0, 5.0)]
-        param_names = ["alpha", "threshold", "beta", "bias"]
-    else:
-        init_params = np.array([0.2, 0.5, 5.0], dtype=float)
-        bounds = [(0.0, 1.0), (-1.0, 1.0), (1e-3, 200.0)]
-        param_names = ["alpha", "threshold", "beta"]
+        init_params_list.append(0.0)
+        bounds_list.append((-5.0, 5.0))
+        param_names.append("bias")
+
+    # reset_value (only if prior_fit)
+    if reset_mode == "prior_fit":
+        init_params_list.append(float(reset_value_fixed))
+        bounds_list.append(reset_value_bounds)
+        param_names.append("reset_value")
+
+    init_params = np.asarray(init_params_list, dtype=float)
+    bounds = list(bounds_list)
 
     # ------------------------------------------------------------------
-    # 9) Run optimizer (L-BFGS-B)
+    # 12) Optimize
     # ------------------------------------------------------------------
     result = minimize(_neg_log_lik, init_params, bounds=bounds, method="L-BFGS-B")
     if not result.success:
         print("Compare-to-threshold (stay) optimisation failed:", result.message)
         return None
 
-    fitted_params = dict(zip(param_names, map(float, result.x)))
-    if not include_bias:
-        fitted_params["bias"] = 0.0
+    p_fit = _unpack_params(np.asarray(result.x, dtype=float))
+
+    fitted_params: Dict[str, float] = {
+        "alpha": float(p_fit["alpha"]),
+        "threshold": float(p_fit["threshold"]),
+        "beta": float(p_fit["beta"]),
+        "bias": float(p_fit["bias"]) if include_bias else 0.0,
+    }
+    if reset_mode == "prior_fit":
+        fitted_params["reset_value"] = float(p_fit["reset_value"])
+    elif reset_mode == "prior_fixed":
+        fitted_params["reset_value"] = float(reset_value_fixed)
+    else:
+        # Keep NaN internally but will be converted to None in JSON output
+        fitted_params["reset_value"] = float("nan")
 
     # ------------------------------------------------------------------
-    # 10) Compute LL / AIC / BIC
+    # 13) LL / AIC / BIC + per-trial log-likelihood
     # ------------------------------------------------------------------
-    neg_log_likelihood = float(result.fun)
+    seq_out = _run_sequence(np.asarray(result.x, dtype=float), return_ll_per_trial=True)
+    neg_log_likelihood = float(seq_out["nll"])
+    ll_per_trial = np.asarray(seq_out["ll_per_trial"], dtype=float)
+
     log_likelihood = -neg_log_likelihood
+    log_likelihood_per_trial = (float(log_likelihood) / float(n_trials)) if n_trials > 0 else float("nan")
 
     k = int(len(param_names))
     n = int(n_trials)
@@ -721,22 +839,30 @@ def fit_compare_to_threshold_model(
     bic = float(k) * float(np.log(n)) - 2.0 * float(log_likelihood)
 
     # ------------------------------------------------------------------
-    # 11) Forward simulation to generate latents
+    # 14) Forward simulation with latents (aligned, with explicit reset step)
     # ------------------------------------------------------------------
-    alpha = float(fitted_params["alpha"])
-    threshold = float(fitted_params["threshold"])
-    beta = float(fitted_params["beta"])
-    bias = float(fitted_params["bias"])
+    alpha = fitted_params["alpha"]
+    threshold = fitted_params["threshold"]
+    beta = fitted_params["beta"]
+    bias = fitted_params["bias"]
 
-    v_vals = np.zeros(n_trials + 1, dtype=float)  # includes v(0)
+    if reset_mode == "threshold":
+        reset_value = float("nan")
+        v = threshold
+    else:
+        reset_value = fitted_params["reset_value"]
+        v = reset_value
+
+    v_pre = np.zeros(n_trials, dtype=float)
+    v_after_reset = np.zeros(n_trials, dtype=float)
+    v_post = np.zeros(n_trials, dtype=float)
+
     d_vals = np.zeros(n_trials, dtype=float)
     p_stay_vals = np.zeros(n_trials, dtype=float)
     p_right_vals = np.zeros(n_trials, dtype=float)
 
-    v = 0.0
     for t in range(n_trials):
-        if reset_on_switch and switched[t]:
-            v = threshold
+        v_pre[t] = v
 
         d = v - threshold
         d_vals[t] = d
@@ -751,21 +877,32 @@ def fit_compare_to_threshold_model(
 
         p_right_vals[t] = p_right
 
-        v = v + alpha * (r[t] - v)
-        v_vals[t + 1] = v
+        v_tmp = v
+        if reset_on_switch and switched[t]:
+            if reset_mode == "threshold":
+                v_tmp = threshold
+            else:
+                v_tmp = reset_value
+
+        v_after_reset[t] = v_tmp
+
+        v = v_tmp + alpha * (r[t] - v_tmp)
+        v_post[t] = v
 
     p_left_vals = 1.0 - p_right_vals
 
-    # ------------------------------------------------------------------
-    # 12) Assemble results (JSON-friendly)
-    # ------------------------------------------------------------------
     fitted_latent_variables = {
-        "value": v_vals.tolist(),
+        "value_pre": v_pre.tolist(),
+        "value_after_reset": v_after_reset.tolist(),
+        "value_post": v_post.tolist(),
         "decision_variable": d_vals.tolist(),
         "p_stay": p_stay_vals.tolist(),
         "choice_prob": [p_left_vals.tolist(), p_right_vals.tolist()],
     }
 
+    # ------------------------------------------------------------------
+    # 15) Output (include per-trial log-likelihood vector and mean)
+    # ------------------------------------------------------------------
     output: Dict[str, Any] = {
         "model_name": model_name,
         "session_id": session_id,
@@ -773,36 +910,39 @@ def fit_compare_to_threshold_model(
         "fitted_params": fitted_params,
         "neg_log_likelihood": neg_log_likelihood,
         "log_likelihood": float(log_likelihood),
+        "log_likelihood_per_trial": float(log_likelihood_per_trial),
+        "log_likelihood_by_trial": ll_per_trial.tolist(),
         "aic": float(aic),
         "bic": float(bic),
-        "n_trials_used": n,
-        "n_parameters": k,
+        "n_trials_used": int(n_trials),
+        "n_parameters": int(k),
         "fitted_latent_variables": fitted_latent_variables,
         "success": True,
         "metadata": {
             "reset_on_switch": bool(reset_on_switch),
             "include_bias": bool(include_bias),
+            "reset_mode": reset_mode,
+            "reset_value_fixed": float(reset_value_fixed),
             "note": (
-                "Stay/switch model: P(stay)=sigmoid(beta*(v-threshold)+bias). "
-                "For t>=1, P(Right)=P(stay) if previous choice was Right else 1-P(stay). "
-                "For t=0, P(Right)=sigmoid(bias) (or 0.5 if no bias). "
-                "Reward r(t) is experienced reward on the chosen side; no-response trials removed. "
-                "If reset_on_switch is True, value is reset to threshold at the start of switched trials."
+                "Causal order per trial: compute decision from current v -> score observed choice -> "
+                "if switched, reset v (to prior or threshold) -> update v with experienced reward. "
+                "NaN/Inf are converted to null in saved JSON for strict JSON compliance."
             ),
         },
     }
 
     # ------------------------------------------------------------------
-    # 13) Optional saving (JSON only)
+    # 16) Optional saving (JSON only, strict JSON compliance)
     # ------------------------------------------------------------------
     if save_results:
         safe_session = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(session_id))
         prefix = f"{safe_session}__{model_name}"
         json_path = Path(save_folder) / f"{prefix}_fit_results.json"
         with open(json_path, "w") as f:
-            json.dump(output, f, indent=2)
+            json.dump(_clean_for_json(output), f, indent=2, allow_nan=False)
 
     return output
+
 
 
 
