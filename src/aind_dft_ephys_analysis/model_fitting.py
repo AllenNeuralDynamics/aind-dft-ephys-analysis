@@ -523,9 +523,6 @@ def visualize_choice_logistic_regression(
 
 
 
-
-
-
 import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
@@ -534,54 +531,226 @@ import numpy as np
 from scipy.optimize import minimize
 
 
-def fit_compare_to_threshold_model(
+def fit_compare_to_threshold_model_different_learning_rate(
     nwb_behavior_data: Any,
-    model_name: str = "compare_to_threshold_stay",
+    model_name: str = "compare_to_threshold_stay_diff_lr",
     *,
-    reset_on_switch: bool = True,
-    include_bias: bool = True,
-    # Reset behavior (IMPORTANT)
+    reset_on_switch: bool = False,
+    # Bias terms
+    include_stay_bias: bool = False,
+    include_side_bias: bool = False,
+    # Reset behavior
     # - "prior_fixed": reset v to reset_value_fixed
     # - "prior_fit":   fit reset_value as an extra parameter
-    # - "threshold":   reset v to threshold (allowed; can be weakly/non-identifiable in some datasets)
+    # - "threshold":   reset v to CURRENT threshold (time-varying if adaptive threshold enabled)
     reset_mode: str = "threshold",
     reset_value_fixed: float = 0.4,
+    # Different learning rates for value (reward vs no reward)
+    fit_separate_learning_rates: bool = False,
+    reward_eps: float = 0.0,  # For binary rewards (0/1), keep reward_eps=0.0
+    alpha_reward_fixed: float = 0.2,
+    alpha_noreward_fixed: float = 0.2,
+    # Adaptive threshold (NEW)
+    # If adaptive_threshold=True, threshold becomes a latent updated each trial using RW-like rule:
+    #   threshold <- threshold + eta * (r(t) - threshold)
+    # You can choose to fit separate etas for reward/no-reward, or tie them to value learning rates.
+    adaptive_threshold: bool = False,
+    fit_separate_threshold_learning_rates: bool = False,
+    tie_threshold_lrs_to_value_lrs: bool = False,
+    eta_reward_fixed: float = 0.05,
+    eta_noreward_fixed: float = 0.05,
+    # Initial threshold handling
+    # - If adaptive_threshold=True, the fitted "threshold" parameter is interpreted as threshold_0 (initial).
+    # - If adaptive_threshold=False, threshold is a static parameter as before.
     save_results: bool = False,
     save_folder: Optional[Union[str, Path]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Fit a "compare-to-threshold" STAY/SWITCH (patch-leaving) model to a two-choice task stored in NWB.
+    Fit a compare-to-threshold STAY/SWITCH (patch-leaving) model with:
 
-    Generative interpretation (causal order)
-    ---------------------------------------
-    Let v be the current "patch quality" estimate for the patch you were in on trial t-1.
+    (A) Asymmetric learning for the latent patch value v
+        - alpha_reward:   learning rate used on rewarded trials (r(t)=1)
+        - alpha_noreward: learning rate used on non-rewarded trials (r(t)=0)
 
-    For each trial t:
-      1) Compute decision probability from current v:
-            d(t) = v - threshold
-            P(stay_t) = sigmoid(beta * d(t) + bias)
+    (B) Optional adaptive (time-varying) decision threshold
+        - threshold(t) is treated as a latent state that can also be updated each trial
+            using a Rescorla–Wagner-like rule, with learning rates:
+            - eta_reward   (rewarded trials)
+            - eta_noreward (non-rewarded trials)
 
-         Map stay -> choice based on previous choice:
-           - if previous was Right: P(Right_t)=P(stay_t)
-           - if previous was Left:  P(Right_t)=1-P(stay_t)
+    This model is designed for a two-choice task in which “STAY” means repeating the
+    previous choice (same side as t-1) and “SWITCH” means choosing the opposite side.
 
-         For t==0: P(Right_0)=sigmoid(bias) if include_bias else 0.5
+    ---------------------------------------------------------------------------
+    Causal order per trial t (IMPORTANT)
+    ---------------------------------------------------------------------------
 
-      2) Score likelihood of observed choice at t.
+    The model is strictly causal: decisions on trial t are computed from latent
+    states available BEFORE observing the outcome (reward) of trial t.
 
-      3) If the observed choice at t is a SWITCH relative to t-1 (between consecutive valid trials),
-         then you have ENTERED a new patch at trial t. Reset v before incorporating reward from trial t:
-           - reset_mode="prior_fixed": v <- reset_value_fixed
-           - reset_mode="prior_fit":   v <- reset_value (fitted)
-           - reset_mode="threshold":   v <- threshold
+    We distinguish three “moments” of the latent value:
+    - v_pre(t):         value estimate at the start of trial t (carried from t-1)
+    - v_after_reset(t): value after applying a reset on switch at trial t (if any)
+    - v_post(t):        value after updating with the outcome of trial t
 
-      4) Observe reward r(t) on the chosen side and update:
-            v <- v + alpha * (r(t) - v)
+    If adaptive_threshold=True, we similarly track:
+    - threshold_pre(t):  threshold at the start of trial t
+    - threshold_post(t): threshold after updating with the outcome of trial t
 
-    Notes on reset_mode="threshold"
-    -------------------------------
-    This is allowed, but threshold can become weakly identified in some datasets.
+    ---------------------------------------------------------------------------
+    1) Decision stage (pre-reset, pre-outcome)
+    ---------------------------------------------------------------------------
+
+    At the START of trial t, the animal has:
+    - v_pre(t): current patch-value estimate
+    - threshold_pre(t): current decision threshold (static if adaptive_threshold=False)
+
+    Compute a decision variable:
+        d(t) = v_pre(t) - threshold_pre(t)
+
+    Interpretation:
+    - d(t) > 0: current patch is estimated ABOVE threshold → tendency to STAY
+    - d(t) < 0: current patch is estimated BELOW threshold → tendency to SWITCH
+
+    Convert d(t) into a probability of STAY using a logistic function:
+        P(stay_t) = sigmoid( beta * d(t) + stay_bias )
+
+    Parameters:
+    - beta: controls sensitivity to d(t). Larger |beta| → more deterministic choices.
+    - stay_bias: value-independent tendency to STAY (stickiness/perseveration).
+        * stay_bias > 0 increases baseline staying
+        * stay_bias < 0 increases baseline switching
+
+    Important: This is a STAY/SWITCH model. There is no inherent left/right preference
+    at this stage; the probability is for repeating the previous action.
+
+    ---------------------------------------------------------------------------
+    2) Map STAY probability to RIGHT-choice probability (+ optional side_bias)
+    ---------------------------------------------------------------------------
+
+    Because the observed data are left/right choices (0=Left, 1=Right), we map the
+    stay probability onto P(Right) conditional on the PREVIOUS choice:
+
+    Let prev_choice = choice(t-1):
+    - If prev_choice == Right (1):
+            base_P(Right_t) = P(stay_t)
+        (staying means choosing Right again)
+
+    - If prev_choice == Left (0):
+            base_P(Right_t) = 1 - P(stay_t)
+        (staying means choosing Left again, so Right corresponds to switching)
+
+    For the first valid trial (t==0), there is no previous choice, so the model uses:
+            base_P(Right_0) = 0.5
+
+    Optional TRUE side bias (persistent Right/Left preference):
+    If include_side_bias=True, we apply side_bias in log-odds space:
+        logit(P(Right_t)) = logit(base_P(Right_t)) + side_bias
+
+    Interpretation:
+    - side_bias > 0 shifts choices toward Right regardless of previous choice
+    - side_bias < 0 shifts choices toward Left regardless of previous choice
+
+    This is different from stay_bias:
+    - stay_bias affects repeating vs switching
+    - side_bias affects Right vs Left preference
+
+    ---------------------------------------------------------------------------
+    3) Likelihood evaluation (bookkeeping only)
+    ---------------------------------------------------------------------------
+
+    Using P(Right_t), we evaluate the log-likelihood of the observed choice on trial t.
+    This affects parameter fitting but does NOT alter latent states; it is purely
+    for optimization.
+
+    ---------------------------------------------------------------------------
+    4) Reset on SWITCH (state transition before outcome update)
+    ---------------------------------------------------------------------------
+
+    If the observed choice at trial t differs from trial t-1, we interpret this as
+    entering a NEW patch at trial t (a state transition). If reset_on_switch=True,
+    we reset the value BEFORE incorporating the reward outcome of trial t.
+
+    Reset options:
+    - reset_mode="prior_fixed":
+            v_after_reset(t) <- reset_value_fixed
+
+    - reset_mode="prior_fit":
+            v_after_reset(t) <- reset_value (estimated from data)
+
+    - reset_mode="threshold":
+            v_after_reset(t) <- threshold_pre(t)
+
+    Important when adaptive_threshold=True:
+    - threshold_pre(t) can change over time, so “reset to threshold” means
+        reset to the CURRENT threshold on that trial (not a constant).
+
+    If no switch occurs (or reset_on_switch=False):
+    - v_after_reset(t) = v_pre(t)
+
+    Interpretation:
+    - This reset represents the animal’s prior belief about the new patch at the
+        moment it enters it, before seeing any evidence (reward) from that patch.
+
+    ---------------------------------------------------------------------------
+    5) Outcome observation and learning update (value and optional threshold)
+    ---------------------------------------------------------------------------
+
+    After the choice is made and (if applicable) the reset is applied, the animal
+    observes the reward outcome r(t) on the chosen side.
+
+    In your task:
+    - r(t) is binary: r(t) ∈ {0, 1}
+        * r(t)=1 means rewarded
+        * r(t)=0 means not rewarded
+
+    The code uses:
+        if r(t) > reward_eps: rewarded else non-rewarded
+    For binary rewards, set reward_eps = 0.0 so:
+        r(t)=1 → rewarded, r(t)=0 → non-rewarded
+
+    (A) Update value v with asymmetric learning rates:
+        If rewarded (r(t)=1):
+            v_post(t) = v_after_reset(t) + alpha_reward * ( r(t) - v_after_reset(t) )
+        If non-rewarded (r(t)=0):
+            v_post(t) = v_after_reset(t) + alpha_noreward * ( r(t) - v_after_reset(t) )
+
+    Interpretation:
+    - alpha_reward governs how strongly the animal increases value after success
+    - alpha_noreward governs how strongly the animal decreases value after omission
+
+    (B) Optional adaptive threshold update (RW-like):
+    If adaptive_threshold=True, threshold is also updated after observing r(t):
+
+        If rewarded:
+            threshold_post(t) = threshold_pre(t) + eta_reward   * ( r(t) - threshold_pre(t) )
+        If non-rewarded:
+            threshold_post(t) = threshold_pre(t) + eta_noreward * ( r(t) - threshold_pre(t) )
+
+    Interpretation:
+    - eta_reward / eta_noreward control how quickly the criterion (threshold)
+        adapts based on recent outcomes.
+    - This can capture behavior where animals modulate their “leaving criterion”
+        over time rather than keeping it fixed.
+
+    Finally, trial t+1 begins with:
+    - v_pre(t+1) = v_post(t)
+    - threshold_pre(t+1) = threshold_post(t)  (if adaptive_threshold=True)
+        or threshold_pre(t+1) = threshold_pre(t) (if adaptive_threshold=False)
+
+    ---------------------------------------------------------------------------
+    Notes and key distinctions
+    ---------------------------------------------------------------------------
+
+    - stay_bias (stickiness) ≠ side_bias (Right/Left preference).
+    - Reset happens AFTER the choice at trial t is observed (switch detected),
+    but BEFORE learning from r(t), ensuring causality.
+    - With adaptive_threshold=True and reset_mode="threshold", resetting v to the
+    threshold means resetting to the current (time-varying) threshold on that trial.
+    - For your binary reward case, keep reward_eps=0.0 to make the rewarded/no-rewarded
+    split exactly match r(t)=1 vs r(t)=0.
     """
+
 
     # ------------------------------------------------------------------
     # 0) Basic metadata
@@ -638,27 +807,18 @@ def fit_compare_to_threshold_model(
         switched[1:] = animal_response[1:] != animal_response[:-1]
 
     # ------------------------------------------------------------------
-    # 6) Sigmoid helper
+    # 6) Helpers
     # ------------------------------------------------------------------
     def _sigmoid(x: float) -> float:
         x = float(np.clip(x, -60.0, 60.0))
         return 1.0 / (1.0 + np.exp(-x))
 
-    # ------------------------------------------------------------------
-    # 7) Reset mode validation
-    # ------------------------------------------------------------------
-    if reset_mode not in ("prior_fixed", "prior_fit", "threshold"):
-        raise ValueError("reset_mode must be one of {'prior_fixed','prior_fit','threshold'}.")
+    def _logit(p: float) -> float:
+        p = float(np.clip(p, 1e-12, 1.0 - 1e-12))
+        return float(np.log(p / (1.0 - p)))
 
-    reset_value_bounds = (-1.0, 2.0)
-
-    # ------------------------------------------------------------------
-    # 8) JSON cleaning helper (fix NaN bug)
-    # ------------------------------------------------------------------
     def _clean_for_json(obj: Any) -> Any:
-        """
-        Recursively convert NaN/Inf to None so json.dump produces valid JSON.
-        """
+        """Recursively convert NaN/Inf to None so json.dump produces valid JSON."""
         if isinstance(obj, dict):
             return {k: _clean_for_json(v) for k, v in obj.items()}
         if isinstance(obj, (list, tuple)):
@@ -670,67 +830,123 @@ def fit_compare_to_threshold_model(
         return obj
 
     # ------------------------------------------------------------------
-    # 9) Parameter unpacking
+    # 7) Validate reset_mode
+    # ------------------------------------------------------------------
+    if reset_mode not in ("prior_fixed", "prior_fit", "threshold"):
+        raise ValueError("reset_mode must be one of {'prior_fixed','prior_fit','threshold'}.")
+
+    reset_value_bounds = (-1.0, 2.0)
+
+    # ------------------------------------------------------------------
+    # 8) Parameter unpacking
     # ------------------------------------------------------------------
     def _unpack_params(params: np.ndarray) -> Dict[str, float]:
         idx = 0
-        alpha = float(params[idx]); idx += 1
-        threshold = float(params[idx]); idx += 1
+
+        # Value learning rates
+        if fit_separate_learning_rates:
+            alpha_reward = float(params[idx]); idx += 1
+            alpha_noreward = float(params[idx]); idx += 1
+        else:
+            alpha_reward = float(alpha_reward_fixed)
+            alpha_noreward = float(alpha_noreward_fixed)
+
+        # Threshold (static or initial threshold_0)
+        threshold0 = float(params[idx]); idx += 1
+
+        # Decision sensitivity
         beta = float(params[idx]); idx += 1
 
-        if include_bias:
-            bias = float(params[idx]); idx += 1
+        # Stay bias
+        if include_stay_bias:
+            stay_bias = float(params[idx]); idx += 1
         else:
-            bias = 0.0
+            stay_bias = 0.0
 
+        # Side bias
+        if include_side_bias:
+            side_bias = float(params[idx]); idx += 1
+        else:
+            side_bias = 0.0
+
+        # Threshold learning rates (etas)
+        # If not adaptive_threshold, these are unused.
+        if adaptive_threshold:
+            if tie_threshold_lrs_to_value_lrs:
+                eta_reward = alpha_reward
+                eta_noreward = alpha_noreward
+            else:
+                if fit_separate_threshold_learning_rates:
+                    eta_reward = float(params[idx]); idx += 1
+                    eta_noreward = float(params[idx]); idx += 1
+                else:
+                    eta_reward = float(eta_reward_fixed)
+                    eta_noreward = float(eta_noreward_fixed)
+        else:
+            eta_reward = 0.0
+            eta_noreward = 0.0
+
+        # Reset value (if prior_fit)
         if reset_mode == "prior_fit":
             reset_value = float(params[idx]); idx += 1
         elif reset_mode == "prior_fixed":
             reset_value = float(reset_value_fixed)
         else:
-            # threshold mode: reset_value is not a parameter and not used; keep as NaN internally
             reset_value = float("nan")
 
         return {
-            "alpha": alpha,
-            "threshold": threshold,
+            "alpha_reward": alpha_reward,
+            "alpha_noreward": alpha_noreward,
+            "threshold0": threshold0,
             "beta": beta,
-            "bias": bias,
+            "stay_bias": stay_bias,
+            "side_bias": side_bias,
+            "eta_reward": eta_reward,
+            "eta_noreward": eta_noreward,
             "reset_value": reset_value,
         }
 
     # ------------------------------------------------------------------
-    # 10) NLL and per-trial log-likelihood (causal order)
+    # 9) NLL and per-trial log-likelihood (causal order)
     # ------------------------------------------------------------------
     def _run_sequence(params: np.ndarray, *, return_ll_per_trial: bool) -> Dict[str, Any]:
         p = _unpack_params(params)
 
-        alpha = p["alpha"]
-        threshold = p["threshold"]
+        alpha_reward = p["alpha_reward"]
+        alpha_noreward = p["alpha_noreward"]
+        threshold = p["threshold0"]  # current threshold (static or adaptive)
         beta = p["beta"]
-        bias = p["bias"]
+        stay_bias = p["stay_bias"]
+        side_bias = p["side_bias"]
+        eta_reward = p["eta_reward"]
+        eta_noreward = p["eta_noreward"]
         reset_value = p["reset_value"]
 
+        # Initialize v
         if reset_mode == "threshold":
-            v = threshold
+            v = threshold  # if adaptive, this uses threshold0 at start
         else:
             v = reset_value  # prior_fixed/prior_fit
 
         eps = 1e-12
         ll_per_trial = np.zeros(n_trials, dtype=float) if return_ll_per_trial else None
-
         nll = 0.0
 
         for t in range(n_trials):
-            # 1) Decision probability from current v (old patch estimate)
+            # 1) Decision from current v and current threshold (pre-reset, pre-outcome)
             d = v - threshold
-            p_stay = _sigmoid(beta * d + bias)
+            p_stay = _sigmoid(beta * d + stay_bias)
 
             if t == 0:
-                p_right = _sigmoid(bias) if include_bias else 0.5
+                base_p_right = 0.5
             else:
-                prev_choice = int(animal_response[t - 1])
-                p_right = p_stay if prev_choice == 1 else (1.0 - p_stay)
+                prev_choice = int(animal_response[t - 1])  # 0=L, 1=R
+                base_p_right = p_stay if prev_choice == 1 else (1.0 - p_stay)
+
+            if include_side_bias:
+                p_right = _sigmoid(_logit(base_p_right) + side_bias)
+            else:
+                p_right = base_p_right
 
             # 2) Score observed choice at t
             if animal_response[t] == 1:
@@ -743,15 +959,21 @@ def fit_compare_to_threshold_model(
             if ll_per_trial is not None:
                 ll_per_trial[t] = ll_t
 
-            # 3) Reset on switch before reward update
+            # 3) Reset value on switch before outcome update
             if reset_on_switch and switched[t]:
                 if reset_mode == "threshold":
-                    v = threshold
+                    v = threshold  # NOTE: current threshold (adaptive if enabled)
                 else:
                     v = reset_value
 
-            # 4) Reward update
-            v = v + alpha * (r[t] - v)
+            # 4) Outcome update with different learning rates (binary rewards: reward_eps=0.0)
+            lr_v = alpha_reward if (r[t] > reward_eps) else alpha_noreward
+            v = v + lr_v * (r[t] - v)
+
+            # 5) Optional adaptive threshold update (RW-like)
+            if adaptive_threshold:
+                lr_th = eta_reward if (r[t] > reward_eps) else eta_noreward
+                threshold = threshold + lr_th * (r[t] - threshold)
 
         out: Dict[str, Any] = {"nll": float(nll)}
         if ll_per_trial is not None:
@@ -762,32 +984,53 @@ def fit_compare_to_threshold_model(
         return float(_run_sequence(params, return_ll_per_trial=False)["nll"])
 
     # ------------------------------------------------------------------
-    # 11) Optimization setup
+    # 10) Optimization setup
     # ------------------------------------------------------------------
     init_params_list = []
     bounds_list = []
     param_names = []
 
-    # alpha
-    init_params_list.append(0.2)
-    bounds_list.append((0.0, 1.0))
-    param_names.append("alpha")
+    # Value learning rates
+    if fit_separate_learning_rates:
+        init_params_list.append(float(alpha_reward_fixed))
+        bounds_list.append((0.0, 1.0))
+        param_names.append("alpha_reward")
 
-    # threshold
+        init_params_list.append(float(alpha_noreward_fixed))
+        bounds_list.append((0.0, 1.0))
+        param_names.append("alpha_noreward")
+
+    # threshold (static or initial threshold0)
     init_params_list.append(0.5)
     bounds_list.append((-1.0, 1.0))
-    param_names.append("threshold")
+    param_names.append("threshold0")
 
-    # beta (allow negative)
+    # beta
     init_params_list.append(5.0)
     bounds_list.append((-200.0, 200.0))
     param_names.append("beta")
 
-    # bias
-    if include_bias:
+    # stay_bias
+    if include_stay_bias:
         init_params_list.append(0.0)
         bounds_list.append((-5.0, 5.0))
-        param_names.append("bias")
+        param_names.append("stay_bias")
+
+    # side_bias
+    if include_side_bias:
+        init_params_list.append(0.0)
+        bounds_list.append((-5.0, 5.0))
+        param_names.append("side_bias")
+
+    # Threshold learning rates (etas)
+    if adaptive_threshold and (not tie_threshold_lrs_to_value_lrs) and fit_separate_threshold_learning_rates:
+        init_params_list.append(float(eta_reward_fixed))
+        bounds_list.append((0.0, 1.0))
+        param_names.append("eta_reward")
+
+        init_params_list.append(float(eta_noreward_fixed))
+        bounds_list.append((0.0, 1.0))
+        param_names.append("eta_noreward")
 
     # reset_value (only if prior_fit)
     if reset_mode == "prior_fit":
@@ -799,31 +1042,37 @@ def fit_compare_to_threshold_model(
     bounds = list(bounds_list)
 
     # ------------------------------------------------------------------
-    # 12) Optimize
+    # 11) Optimize
     # ------------------------------------------------------------------
     result = minimize(_neg_log_lik, init_params, bounds=bounds, method="L-BFGS-B")
     if not result.success:
-        print("Compare-to-threshold (stay) optimisation failed:", result.message)
+        print("Compare-to-threshold (diff LR + adaptive threshold) optimisation failed:", result.message)
         return None
 
     p_fit = _unpack_params(np.asarray(result.x, dtype=float))
 
     fitted_params: Dict[str, float] = {
-        "alpha": float(p_fit["alpha"]),
-        "threshold": float(p_fit["threshold"]),
+        "alpha_reward": float(p_fit["alpha_reward"]),
+        "alpha_noreward": float(p_fit["alpha_noreward"]),
+        "threshold0": float(p_fit["threshold0"]),
         "beta": float(p_fit["beta"]),
-        "bias": float(p_fit["bias"]) if include_bias else 0.0,
+        "stay_bias": float(p_fit["stay_bias"]) if include_stay_bias else 0.0,
+        "side_bias": float(p_fit["side_bias"]) if include_side_bias else 0.0,
+        "adaptive_threshold": bool(adaptive_threshold),
+        "tie_threshold_lrs_to_value_lrs": bool(tie_threshold_lrs_to_value_lrs),
+        "eta_reward": float(p_fit["eta_reward"]) if adaptive_threshold else 0.0,
+        "eta_noreward": float(p_fit["eta_noreward"]) if adaptive_threshold else 0.0,
     }
+
     if reset_mode == "prior_fit":
         fitted_params["reset_value"] = float(p_fit["reset_value"])
     elif reset_mode == "prior_fixed":
         fitted_params["reset_value"] = float(reset_value_fixed)
     else:
-        # Keep NaN internally but will be converted to None in JSON output
-        fitted_params["reset_value"] = float("nan")
+        fitted_params["reset_value"] = float("nan")  # will be converted to null in JSON output
 
     # ------------------------------------------------------------------
-    # 13) LL / AIC / BIC + per-trial log-likelihood
+    # 12) LL / AIC / BIC + per-trial log-likelihood
     # ------------------------------------------------------------------
     seq_out = _run_sequence(np.asarray(result.x, dtype=float), return_ll_per_trial=True)
     neg_log_likelihood = float(seq_out["nll"])
@@ -834,17 +1083,20 @@ def fit_compare_to_threshold_model(
 
     k = int(len(param_names))
     n = int(n_trials)
-
     aic = 2.0 * float(k) - 2.0 * float(log_likelihood)
     bic = float(k) * float(np.log(n)) - 2.0 * float(log_likelihood)
 
     # ------------------------------------------------------------------
-    # 14) Forward simulation with latents (aligned, with explicit reset step)
+    # 13) Forward simulation with latents (aligned; includes threshold trajectory if adaptive)
     # ------------------------------------------------------------------
-    alpha = fitted_params["alpha"]
-    threshold = fitted_params["threshold"]
+    alpha_reward = fitted_params["alpha_reward"]
+    alpha_noreward = fitted_params["alpha_noreward"]
+    threshold = fitted_params["threshold0"]
     beta = fitted_params["beta"]
-    bias = fitted_params["bias"]
+    stay_bias = fitted_params["stay_bias"]
+    side_bias = fitted_params["side_bias"]
+    eta_reward = fitted_params["eta_reward"]
+    eta_noreward = fitted_params["eta_noreward"]
 
     if reset_mode == "threshold":
         reset_value = float("nan")
@@ -857,37 +1109,64 @@ def fit_compare_to_threshold_model(
     v_after_reset = np.zeros(n_trials, dtype=float)
     v_post = np.zeros(n_trials, dtype=float)
 
+    th_pre = np.zeros(n_trials, dtype=float)
+    th_post = np.zeros(n_trials, dtype=float)
+
     d_vals = np.zeros(n_trials, dtype=float)
     p_stay_vals = np.zeros(n_trials, dtype=float)
+    base_p_right_vals = np.zeros(n_trials, dtype=float)
     p_right_vals = np.zeros(n_trials, dtype=float)
+    lr_value_used = np.zeros(n_trials, dtype=float)
+    lr_thresh_used = np.zeros(n_trials, dtype=float)
 
     for t in range(n_trials):
+        th_pre[t] = threshold
         v_pre[t] = v
 
+        # Decision
         d = v - threshold
         d_vals[t] = d
-        p_stay = _sigmoid(beta * d + bias)
+
+        p_stay = _sigmoid(beta * d + stay_bias)
         p_stay_vals[t] = p_stay
 
         if t == 0:
-            p_right = _sigmoid(bias) if include_bias else 0.5
+            base_p_right = 0.5
         else:
             prev_choice = int(animal_response[t - 1])
-            p_right = p_stay if prev_choice == 1 else (1.0 - p_stay)
+            base_p_right = p_stay if prev_choice == 1 else (1.0 - p_stay)
+        base_p_right_vals[t] = base_p_right
 
+        if include_side_bias:
+            p_right = _sigmoid(_logit(base_p_right) + side_bias)
+        else:
+            p_right = base_p_right
         p_right_vals[t] = p_right
 
+        # Reset on switch
         v_tmp = v
         if reset_on_switch and switched[t]:
             if reset_mode == "threshold":
-                v_tmp = threshold
+                v_tmp = threshold  # current threshold (adaptive if enabled)
             else:
                 v_tmp = reset_value
-
         v_after_reset[t] = v_tmp
 
-        v = v_tmp + alpha * (r[t] - v_tmp)
+        # Value update
+        lr_v = alpha_reward if (r[t] > reward_eps) else alpha_noreward
+        lr_value_used[t] = lr_v
+        v = v_tmp + lr_v * (r[t] - v_tmp)
         v_post[t] = v
+
+        # Threshold update
+        if adaptive_threshold:
+            lr_th = eta_reward if (r[t] > reward_eps) else eta_noreward
+        else:
+            lr_th = 0.0
+        lr_thresh_used[t] = lr_th
+        if adaptive_threshold:
+            threshold = threshold + lr_th * (r[t] - threshold)
+        th_post[t] = threshold
 
     p_left_vals = 1.0 - p_right_vals
 
@@ -895,13 +1174,18 @@ def fit_compare_to_threshold_model(
         "value_pre": v_pre.tolist(),
         "value_after_reset": v_after_reset.tolist(),
         "value_post": v_post.tolist(),
+        "threshold_pre": th_pre.tolist(),
+        "threshold_post": th_post.tolist(),
         "decision_variable": d_vals.tolist(),
         "p_stay": p_stay_vals.tolist(),
+        "base_p_right": base_p_right_vals.tolist(),
         "choice_prob": [p_left_vals.tolist(), p_right_vals.tolist()],
+        "learning_rate_value_used": lr_value_used.tolist(),
+        "learning_rate_threshold_used": lr_thresh_used.tolist(),
     }
 
     # ------------------------------------------------------------------
-    # 15) Output (include per-trial log-likelihood vector and mean)
+    # 14) Output
     # ------------------------------------------------------------------
     output: Dict[str, Any] = {
         "model_name": model_name,
@@ -920,19 +1204,27 @@ def fit_compare_to_threshold_model(
         "success": True,
         "metadata": {
             "reset_on_switch": bool(reset_on_switch),
-            "include_bias": bool(include_bias),
+            "include_stay_bias": bool(include_stay_bias),
+            "include_side_bias": bool(include_side_bias),
             "reset_mode": reset_mode,
             "reset_value_fixed": float(reset_value_fixed),
+            "fit_separate_learning_rates": bool(fit_separate_learning_rates),
+            "reward_eps": float(reward_eps),
+            "adaptive_threshold": bool(adaptive_threshold),
+            "fit_separate_threshold_learning_rates": bool(fit_separate_threshold_learning_rates),
+            "tie_threshold_lrs_to_value_lrs": bool(tie_threshold_lrs_to_value_lrs),
+            "eta_reward_fixed": float(eta_reward_fixed),
+            "eta_noreward_fixed": float(eta_noreward_fixed),
             "note": (
-                "Causal order per trial: compute decision from current v -> score observed choice -> "
-                "if switched, reset v (to prior or threshold) -> update v with experienced reward. "
-                "NaN/Inf are converted to null in saved JSON for strict JSON compliance."
+                "Causal order per trial: decision from current v and current threshold -> score choice -> "
+                "if switched, reset v (to prior or current threshold) -> update v with alpha_reward/alpha_noreward -> "
+                "optional update of threshold with eta_reward/eta_noreward using RW-like rule."
             ),
         },
     }
 
     # ------------------------------------------------------------------
-    # 16) Optional saving (JSON only, strict JSON compliance)
+    # 15) Optional saving (JSON only, strict JSON compliance)
     # ------------------------------------------------------------------
     if save_results:
         safe_session = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(session_id))
@@ -942,6 +1234,9 @@ def fit_compare_to_threshold_model(
             json.dump(_clean_for_json(output), f, indent=2, allow_nan=False)
 
     return output
+
+
+
 
 
 
