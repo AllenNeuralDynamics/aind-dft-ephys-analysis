@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-import numpy as np
-from typing import Any, Optional, Tuple, Dict, List, Union, Sequence
-from scipy.optimize import minimize
+from pathlib import Path
+from typing import Any, Optional, Union, Dict, List, Tuple, Sequence
 
+import json
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Optional, Dict
+
 from scipy.optimize import minimize
+
 import statsmodels.api as sm
-from statsmodels.discrete.discrete_model import BinaryResults 
+from statsmodels.discrete.discrete_model import BinaryResults
+
 from nwb_utils import NWBUtils
+
+
 
 
 def fit_q_learning_model(
@@ -523,14 +527,6 @@ def visualize_choice_logistic_regression(
 
 
 
-import json
-from pathlib import Path
-from typing import Any, Dict, Optional, Union
-
-import numpy as np
-from scipy.optimize import minimize
-
-
 def fit_compare_to_threshold_model_different_learning_rate(
     nwb_behavior_data: Any,
     model_name: str = "compare_to_threshold_stay_diff_lr",
@@ -564,6 +560,8 @@ def fit_compare_to_threshold_model_different_learning_rate(
     # - If adaptive_threshold=False, threshold is a static parameter as before.
     save_results: bool = False,
     save_folder: Optional[Union[str, Path]] = None,
+    overwrite: bool = False,
+
 ) -> Optional[Dict[str, Any]]:
     """
     Fit a compare-to-threshold STAY/SWITCH (patch-leaving) model with:
@@ -762,13 +760,25 @@ def fit_compare_to_threshold_model_different_learning_rate(
         auto_train_stage = "unknown"
 
     # ------------------------------------------------------------------
-    # 1) Validate saving options (JSON-only saving)
+    # 1) Validate saving options (JSON-only saving) + early skip
     # ------------------------------------------------------------------
     if save_results:
         if save_folder is None:
             raise ValueError("save_folder must be provided when save_results=True.")
         save_folder = Path(save_folder)
         save_folder.mkdir(parents=True, exist_ok=True)
+
+        safe_session = "".join(
+            ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(session_id)
+        )
+        prefix = f"{safe_session}__{model_name}"
+        json_path = save_folder / f"{prefix}_fit_results.json"
+
+        # ---- EARLY EXIT ----
+        if json_path.exists() and not overwrite:
+            print(f"[SKIP] Session already fitted, overwrite=False: {json_path}")
+            return None
+
 
     # ------------------------------------------------------------------
     # 2) Extract trial vectors from NWB
