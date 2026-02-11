@@ -5,6 +5,7 @@ from typing import Any, Optional, Union, Dict, List, Tuple, Sequence
 
 import json
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
 from scipy.optimize import minimize
@@ -13,7 +14,6 @@ import statsmodels.api as sm
 from statsmodels.discrete.discrete_model import BinaryResults
 
 from nwb_utils import NWBUtils
-
 
 
 
@@ -1346,3 +1346,121 @@ def visualize_compare_to_threshold_model(
     return out
 
 
+
+def load_ctt_grid_results_to_dataframe(
+    parent_folder: str | Path,
+    *,
+    include_latents: bool = False,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Load all CTT grid-search JSON fit results from a parent directory
+    structured as:
+
+        parent_folder/
+            animal_id_1/
+                *_fit_results.json
+            animal_id_2/
+                *_fit_results.json
+            ...
+
+    Parameters
+    ----------
+    parent_folder : str or Path
+        Root directory containing animal subfolders.
+    include_latents : bool
+        If True, include fitted_latent_variables in the dataframe.
+        (Warning: this makes the dataframe very large.)
+    verbose : bool
+        Print progress information.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per JSON file.
+        Includes:
+            - session_id
+            - animal_id
+            - auto_train_stage
+            - metrics (LL, AIC, BIC, etc.)
+            - metadata flags
+            - fitted parameters
+    """
+
+    parent_folder = Path(parent_folder)
+    if not parent_folder.exists():
+        raise FileNotFoundError(f"Folder not found: {parent_folder}")
+
+    rows: List[Dict[str, Any]] = []
+
+    animal_dirs = [p for p in parent_folder.iterdir() if p.is_dir()]
+    if verbose:
+        print(f"Found {len(animal_dirs)} animal folders.")
+
+    for animal_dir in animal_dirs:
+        animal_id = animal_dir.name
+
+        json_files = sorted(animal_dir.glob("*_fit_results.json"))
+
+        if verbose:
+            print(f"[{animal_id}] {len(json_files)} files")
+
+        for json_path in json_files:
+            try:
+                with open(json_path, "r") as f:
+                    data = json.load(f)
+            except Exception as e:
+                print(f"[ERROR] Could not load {json_path}: {e}")
+                continue
+
+            row: Dict[str, Any] = {}
+
+            # -------------------------
+            # Basic identifiers
+            # -------------------------
+            row["animal_id"] = animal_id
+            row["session_id"] = data.get("session_id")
+            row["auto_train_stage"] = data.get("auto_train_stage")
+            row["model_name"] = data.get("model_name")
+
+            # -------------------------
+            # Fit metrics
+            # -------------------------
+            row["neg_log_likelihood"] = data.get("neg_log_likelihood")
+            row["log_likelihood"] = data.get("log_likelihood")
+            row["log_likelihood_per_trial"] = data.get("log_likelihood_per_trial")
+            row["aic"] = data.get("aic")
+            row["bic"] = data.get("bic")
+            row["n_trials_used"] = data.get("n_trials_used")
+            row["n_parameters"] = data.get("n_parameters")
+            row["success"] = data.get("success")
+
+            # -------------------------
+            # Metadata flags
+            # -------------------------
+            metadata = data.get("metadata", {})
+            for k, v in metadata.items():
+                row[f"meta__{k}"] = v
+
+            # -------------------------
+            # Fitted parameters
+            # -------------------------
+            fitted_params = data.get("fitted_params", {})
+            for k, v in fitted_params.items():
+                row[f"param__{k}"] = v
+
+            # -------------------------
+            # Optional latents
+            # -------------------------
+            if include_latents:
+                row["fitted_latent_variables"] = data.get("fitted_latent_variables")
+
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    if verbose:
+        print(f"Loaded {len(df)} total fits.")
+        print(f"Columns: {len(df.columns)}")
+
+    return df
