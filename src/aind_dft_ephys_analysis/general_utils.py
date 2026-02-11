@@ -1,12 +1,14 @@
+from __future__ import annotations
 import re
 import os
 import ast
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
-from typing import List, Dict, Tuple, Optional,Any,Union
+from typing import List, Dict, Tuple, Optional, Any, Union, Literal
 import pandas as pd
 import xarray as xr
+
 
 
 def extract_ID_Date(session_name: str) -> Optional[Tuple[str, str]]:
@@ -383,3 +385,120 @@ def load_temporary_data(
     return df
 
 
+
+
+def save_ctt_results_dataframe(
+    df: pd.DataFrame,
+    out_path: str | Path,
+    *,
+    fmt: Optional[Literal["parquet", "csv", "pkl"]] = None,
+    index: bool = False,
+    compression: Optional[str] = None,
+) -> Path:
+    """
+    Save the loaded CTT results dataframe for reuse later.
+
+    Recommended:
+      - Parquet: compact + fast + preserves dtypes well
+      - Pickle:  preserves Python objects (e.g., if you included latents)
+      - CSV:     portable but loses some dtypes and can be big
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Dataframe produced by your JSON loader.
+    out_path : str or Path
+        Output file path. If `fmt` is None, inferred from suffix.
+        Supported: .parquet, .csv, .pkl/.pickle
+    fmt : {"parquet","csv","pkl"} or None
+        Force format regardless of suffix.
+    index : bool
+        Whether to write the dataframe index.
+    compression : str or None
+        Optional compression passed through:
+          - parquet: e.g. "snappy", "gzip", "brotli", "zstd" (depends on engine)
+          - csv: e.g. "gzip"
+          - pkl: e.g. "gzip" not directly supported by pandas pickle; use .gz path with open() yourself if needed
+
+    Returns
+    -------
+    Path
+        The resolved output path.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if fmt is None:
+        suf = out_path.suffix.lower()
+        if suf == ".parquet":
+            fmt = "parquet"
+        elif suf in (".pkl", ".pickle"):
+            fmt = "pkl"
+        elif suf == ".csv":
+            fmt = "csv"
+        else:
+            raise ValueError(
+                f"Could not infer format from suffix '{out_path.suffix}'. "
+                "Use fmt='parquet'|'csv'|'pkl' or choose an appropriate suffix."
+            )
+
+    fmt = fmt.lower()  # type: ignore[assignment]
+
+    if fmt == "parquet":
+        # Default parquet engine will be chosen by pandas; compression optional
+        df.to_parquet(out_path, index=index, compression=compression)
+    elif fmt == "csv":
+        df.to_csv(out_path, index=index, compression=compression)
+    elif fmt == "pkl":
+        df.to_pickle(out_path)
+    else:
+        raise ValueError(f"Unsupported fmt: {fmt}. Use 'parquet', 'csv', or 'pkl'.")
+
+    return out_path.resolve()
+
+
+def load_ctt_results_dataframe(
+    in_path: str | Path,
+    *,
+    fmt: Optional[Literal["parquet", "csv", "pkl"]] = None,
+) -> pd.DataFrame:
+    """
+    Convenience loader for a previously saved dataframe.
+
+    Parameters
+    ----------
+    in_path : str or Path
+        Path to saved dataframe (.parquet/.csv/.pkl).
+    fmt : {"parquet","csv","pkl"} or None
+        Force format regardless of suffix.
+
+    Returns
+    -------
+    pd.DataFrame
+    """
+    in_path = Path(in_path)
+
+    if fmt is None:
+        suf = in_path.suffix.lower()
+        if suf == ".parquet":
+            fmt = "parquet"
+        elif suf in (".pkl", ".pickle"):
+            fmt = "pkl"
+        elif suf == ".csv":
+            fmt = "csv"
+        else:
+            raise ValueError(
+                f"Could not infer format from suffix '{in_path.suffix}'. "
+                "Use fmt='parquet'|'csv'|'pkl' or choose an appropriate suffix."
+            )
+
+    fmt = fmt.lower()  # type: ignore[assignment]
+
+    if fmt == "parquet":
+        return pd.read_parquet(in_path)
+    if fmt == "csv":
+        return pd.read_csv(in_path)
+    if fmt == "pkl":
+        return pd.read_pickle(in_path)
+
+    raise ValueError(f"Unsupported fmt: {fmt}. Use 'parquet', 'csv', or 'pkl'.")
