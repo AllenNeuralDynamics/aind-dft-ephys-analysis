@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import os
 import ast
-from typing import Optional, Dict, Sequence, Iterable, Union, List
+import json
+from typing import Optional, Dict, Sequence, Iterable, Union, List, Tuple, Callable
 
 import numpy as np
 import pandas as pd
@@ -12,6 +15,7 @@ from behavior_qc_visualization import (
 from behavior_utils import get_fitted_latent
 from model_fitting import fit_choice_logistic_regression_from_nwb
 from nwb_utils import NWBUtils
+
 
 
 def collect_behavior_model_summary(
@@ -533,3 +537,141 @@ def compute_spread_stats(
         "entropy_eff_bins": eff_bins,
         "entropy_bins_used": float(bins_used),
     }
+
+
+
+
+
+# =========================================================
+# 1) Default criteria builder
+# =========================================================
+
+def get_default_model_criteria(MODEL: str) -> Dict[str, Tuple[Callable[[float], bool], str]]:
+    """
+    Return default QC criteria for a given MODEL.
+    """
+    return {
+        f"{MODEL}_learn_rate": (lambda x: x > 0.15, "Learn Rate <= 0.15"),
+        f"{MODEL}_biasL": (lambda x: np.abs(x) < 0.5, "Abs(Bias L) >= 0.5"),
+        f"{MODEL}_LPT": (lambda x: x > 0.65, "LPT <= 0.65"),
+        f"{MODEL}_reward_coefs_sum6": (lambda x: x < 0.8, "Reward Coefs Sum6 >= 0.8"),
+        f"{MODEL}_deltaQ_entropy": (lambda x: x > 0.1, "DeltaQ Entropy <= 0.1"),
+        f"{MODEL}_rpe_entropy": (lambda x: x > 0.1, "RPE Entropy <= 0.1"),
+        f"{MODEL}_deltaQ_std": (lambda x: x > 0.1, "DeltaQ Std <= 0.1"),
+        f"{MODEL}_sumQ_std": (lambda x: x > 0.1, "SumQ Std <= 0.1"),
+        f"{MODEL}_rpe_std": (lambda x: x > 0.1, "RPE Std <= 0.1"),
+    }
+
+
+# =========================================================
+# 2) Helper: make a serializable criteria spec
+# =========================================================
+
+def criteria_to_spec(
+    criteria: Dict[str, Tuple[Callable[[float], bool], str]],
+    *,
+    MODEL: str,
+) -> str:
+    """
+    Create a JSON string documenting the criteria.
+
+    Note: lambdas are not serializable, so we store:
+      - column
+      - metric name (stripped prefix)
+      - fail_message (your threshold text)
+      - function_repr (best-effort)
+    """
+    spec = []
+    for col, (fn, msg) in criteria.items():
+        metric = col.split(MODEL + "_", 1)[-1]
+        try:
+            fn_repr = getattr(fn, "__name__", None) or repr(fn)
+        except Exception:
+            fn_repr = "unavailable"
+
+        spec.append(
+            {
+                "column": col,
+                "metric": metric,
+                "fail_message": msg,
+                "function_repr": fn_repr,
+            }
+        )
+
+    # Stable ordering for reproducibility
+    spec = sorted(spec, key=lambda d: d["column"])
+    return json.dumps(spec, indent=2, sort_keys=True)
+
+
+# =========================================================
+# 3) Append QC results (MODEL + criteria optional)
+# =========================================================
+
+def append_model_criteria_result(
+    summary: pd.DataFrame,
+    *,
+    MODEL: Optional[str] = None,
+    criteria: Optional[Dict[str, Tuple[Callable[[float], bool], str]]] = None,
+    inplace: bool = False,
+    append_criteria_spec: bool = True,
+) -> pd.DataFrame:
+    """
+    Append QC results to summary.
+
+    Defaults:
+      - MODEL: "QLearning_L1F1_CK1_softmax"
+      - criteria: get_default_model_criteria(MODEL)
+
+    Adds:
+      1) <MODEL>_pass_all_criteria : bool
+      2) <MODEL>_failed_reasons    : str
+      3) <MODEL>_criteria_spec     : str (optional)
+
+    NaN values are treated as FAIL and explicitly reported.
+    """
+    if MODEL is None:
+        MODEL = "QLearning_L1F1_CK1_softmax"
+    if criteria is None:
+        criteria = get_default_model_criteria(MODEL)
+
+    df = summary if inplace else summary.copy()
+
+    pass_col = f"{MODEL}_pass_all_criteria"
+    reason_col = f"{MODEL}_failed_reasons"
+    spec_col = f"{MODEL}_criteria_spec"
+
+    # ---- Check required columns exist
+    missing = [c for c in criteria if c not in df.columns]
+    if missing:
+        raise KeyError(
+            "Missing required columns in summary:\n"
+            + "\n".join(missing)
+            + f"\n\nTip: check MODEL='{MODEL}' matches your column prefixes."
+        )
+
+    def _row_passes(row: pd.Series) -> bool:
+        for col, (fn, _) in criteria.items():
+            v = row[col]
+            if pd.isna(v) or not fn(v):
+                return False
+        return True
+
+    def _failed_reasons(row: pd.Series) -> str:
+        reasons = []
+        for col, (fn, msg) in criteria.items():
+            v = row[col]
+            if pd.isna(v):
+                reasons.append(f"{col} is NaN")
+            elif not fn(v):
+                reasons.append(msg)
+        return ", ".join(reasons) if reasons else "None"
+
+    df[pass_col] = df.apply(_row_passes, axis=1)
+    df[reason_col] = df.apply(_failed_reasons, axis=1)
+
+    # Append the *input criteria* spec as a column (same value for every row)
+    if append_criteria_spec:
+        df[spec_col] = criteria_to_spec(criteria, MODEL=MODEL)
+
+    return df
+

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+# ==============================
 # Standard library
+# ==============================
 import math
 from pathlib import Path
 from typing import (
@@ -14,16 +16,23 @@ from typing import (
     Literal,
 )
 
+# ==============================
 # Third-party
+# ==============================
 import numpy as np
 import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 
+# ==============================
 # Local imports
+# ==============================
 from create_psth import load_psth_raster_subset
 from ephys_utils import append_units_locations
+from general_utils import extract_session_name_core
+
+
 
 def summarize_monotonic_unit_df_by_latent_quantile(
     source: Union[str, Path, xr.DataArray, xr.Dataset],
@@ -42,18 +51,13 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     monotonic_tol: float = 0.0,
     dropna_latent: bool = True,
     dropna_activity: bool = True,
-    # Filter for the "gt threshold" monotonic check
     activity_min_threshold: float = 0.0,
-    # Metadata
     session_name: Optional[str] = None,
     latent_name: Optional[str] = None,
     unit_metadata: Optional[pd.DataFrame] = None,
     unit_key_in_metadata: str = "unit_index",
-    # NEW: if provided, append_units_locations and attach brain_region/ccf_location
     nwb_data: Optional[Any] = None,
-    # Loader
     consolidated: bool = True,
-    # Saving (flexible)
     save_dir: Optional[Union[str, Path]] = None,
     save_filename: Optional[str] = None,
     save_path: Optional[Union[str, Path]] = None,
@@ -131,6 +135,58 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     import math  # Local import to avoid relying on module-level imports
 
     # -----------------------------
+    # 0) Resolve intended output path EARLY, so we can skip work if it exists.
+    # -----------------------------
+    def _sanitize_token(s: Optional[str]) -> str:
+        if s is None:
+            return "NA"
+        s2 = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".", "+")) else "_" for ch in str(s))
+        s2 = s2.strip("_")
+        return s2 if s2 else "NA"
+
+    thr = float(activity_min_threshold)
+    w0, w1 = float(activity_window[0]), float(activity_window[1])
+
+    saved_file: Optional[Path] = None
+
+    # NOTE: this mirrors your original naming logic (including bins/win fields).
+    if save_path is not None:
+        p = Path(save_path)
+        if p.suffix:
+            saved_file = p
+        else:
+            out_dir = p
+            # defer mkdir until needed, but still compute name deterministically
+            sess_tok = _sanitize_token(session_name) if session_name else "session"
+            lat_tok = _sanitize_token(latent_name) if latent_name else "latent"
+            thr_tok = _sanitize_token(f"thr{thr:g}")
+            # n_bins_effective not known yet -> use requested n_bins for filename pre-check
+            saved_file = out_dir / f"{sess_tok}__{lat_tok}__{thr_tok}__bins{int(n_bins)}__win_{w0:g}_{w1:g}.{save_format}"
+
+    elif save_filename is not None:
+        out_dir = Path(save_dir) if save_dir is not None else Path(".")
+        saved_file = out_dir / save_filename
+        if not saved_file.suffix:
+            saved_file = saved_file.with_suffix(f".{save_format}")
+
+    elif save_dir is not None:
+        out_dir = Path(save_dir)
+        sess_tok = _sanitize_token(session_name) if session_name else "session"
+        lat_tok = _sanitize_token(latent_name) if latent_name else "latent"
+        thr_tok = _sanitize_token(f"thr{thr:g}")
+        saved_file = out_dir / f"{sess_tok}__{lat_tok}__{thr_tok}__bins{int(n_bins)}__win_{w0:g}_{w1:g}.{save_format}"
+
+    # ---- Early exit: if output exists and overwrite=False, load and return it.
+    if saved_file is not None and saved_file.exists() and (not overwrite):
+        if save_format == "csv":
+            unit_df = pd.read_csv(saved_file)
+        elif save_format == "parquet":
+            unit_df = pd.read_parquet(saved_file)
+        else:
+            raise ValueError(f"Unsupported save_format={save_format!r} for early-load.")
+        return unit_df, saved_file
+
+    # -----------------------------
     # 1) Validate inputs
     # -----------------------------
     latent_values = np.asarray(latent_values, dtype=np.float64)
@@ -141,7 +197,6 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     if latent_trial_ids.size != np.unique(latent_trial_ids).size:
         raise ValueError("`latent_trial_ids` contains duplicates; must be one-to-one.")
 
-    w0, w1 = float(activity_window[0]), float(activity_window[1])
     if w1 <= w0:
         raise ValueError("`activity_window` must satisfy activity_window[1] > activity_window[0].")
 
@@ -151,25 +206,18 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     if ci not in ("sem", "iqr", "none"):
         raise ValueError("ci must be one of {'sem','iqr','none'}.")
 
-    thr = float(activity_min_threshold)
-
     # -----------------------------
     # 1b) Optional: build/augment unit metadata from NWB
     # -----------------------------
     nwb_meta_df: Optional[pd.DataFrame] = None
     if nwb_data is not None:
-        # Determine session name core for anatomy lookup
         sess_raw = getattr(nwb_data, "session_id", None)
         sess_core = extract_session_name_core(sess_raw)
-        # If user didn't pass session_name, fill it
         if session_name is None:
             session_name = sess_core
 
-        # Populate/attach CCF fields onto nwb_data
         nwb_data = append_units_locations(nwb_data, sess_core)
 
-        # Build a minimal metadata table keyed by unit_index
-        # Assumption: unit_index corresponds to row index in nwb_data.units
         unit_rows = []
         n_units_total = len(nwb_data.units)
         for u in range(n_units_total):
@@ -187,29 +235,23 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             )
         nwb_meta_df = pd.DataFrame(unit_rows).set_index("unit_index", drop=False)
 
-    # If user provided unit_metadata, prefer it but fill missing from NWB metadata
     meta_df: Optional[pd.DataFrame] = None
     if unit_metadata is not None:
         if unit_key_in_metadata not in unit_metadata.columns:
             raise ValueError(f"unit_metadata must contain column {unit_key_in_metadata!r}.")
         meta_df = unit_metadata.copy().set_index(unit_key_in_metadata, drop=False)
 
-        # Fill missing anatomy columns from nwb_data if available
         if nwb_meta_df is not None:
             for col in ("brain_region", "ccf_location"):
                 if col not in meta_df.columns:
                     meta_df[col] = np.nan
-            # Left-join by unit index
             join_cols = ["brain_region", "ccf_location"]
             meta_df = meta_df.join(nwb_meta_df[join_cols], how="left", rsuffix="_nwb")
-            # Prefer existing values; fall back to NWB-derived values
             for col in join_cols:
                 col_nwb = f"{col}_nwb"
                 meta_df[col] = meta_df[col].where(meta_df[col].notna(), meta_df[col_nwb])
                 meta_df = meta_df.drop(columns=[col_nwb], errors="ignore")
-
     else:
-        # No user metadata: if NWB metadata exists, use it
         if nwb_meta_df is not None:
             meta_df = nwb_meta_df
 
@@ -249,7 +291,6 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     latent_values = latent_values[keep]
 
     psth_da = psth_da.isel({trial_dim: pos_idx[keep]})
-    _trial_ids_arr = psth_da.coords[trial_coord].values.astype(np.int64)  # kept for completeness
 
     # -----------------------------
     # 4) Time mask for trial-mean activity
@@ -316,6 +357,7 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         n_bins_effective = int(n_bins)
         bin_edges = edges
 
+    # (helpers + unit loop unchanged...)
     # -----------------------------
     # 6) Helpers
     # -----------------------------
@@ -453,7 +495,6 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         unit_psth_np = np.asarray(psth_da.isel(unit=upos).values, dtype=np.float64)
         trial_mean = np.nanmean(unit_psth_np[:, tmask], axis=1)
 
-        # Base validity (raw)
         ok_raw = np.ones(trial_mean.shape[0], dtype=bool)
         if dropna_latent:
             ok_raw &= np.isfinite(lat)
@@ -465,13 +506,11 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         bin_ok = bin_idx[ok_raw]
         act_ok = trial_mean[ok_raw]
 
-        # Thresholded validity (trial_mean > thr)
         ok_thr = ok_raw & np.isfinite(trial_mean) & (trial_mean > thr)
         lat_ok_thr = lat[ok_thr]
         bin_ok_thr = bin_idx[ok_thr]
         act_ok_thr = trial_mean[ok_thr]
 
-        # Per-bin lists/stats: RAW and THR
         q_lists, q_counts, q_centers, q_ci = [], [], [], []
         q_lists_thr, q_counts_thr, q_centers_thr, q_ci_thr = [], [], [], []
 
@@ -514,7 +553,6 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             "ci": str(ci),
             "monotonic_tol": float(monotonic_tol),
 
-            # RAW: core + detailed
             "is_monotonic": bool(ann_raw["is_monotonic"]),
             "monotonic_direction": str(ann_raw["monotonic_direction"]),
             "monotonic_n_valid_bins": int(ann_raw["monotonic_n_valid_bins"]),
@@ -527,7 +565,6 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             "monotonic_direction_increasing_ok": bool(ann_raw["monotonic_direction_increasing_ok"]),
             "monotonic_direction_decreasing_ok": bool(ann_raw["monotonic_direction_decreasing_ok"]),
 
-            # THR: core + detailed
             "is_monotonic_gt_thr": bool(ann_thr["is_monotonic"]),
             "monotonic_direction_gt_thr": str(ann_thr["monotonic_direction"]),
             "monotonic_n_valid_bins_gt_thr": int(ann_thr["monotonic_n_valid_bins"]),
@@ -535,12 +572,12 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             "monotonic_check_values_gt_thr": ann_thr["monotonic_check_values"],
             "monotonic_diffs_gt_thr": ann_thr["monotonic_diffs"],
             "monotonic_violation_count_gt_thr": int(ann_thr["monotonic_violation_count"]),
-            "monotonic_violation_diffs_gt_thr": ann_thr["monotonic_violation_diffs"],
-            "monotonic_violation_pairs_gt_thr": ann_thr["monotonic_violation_pairs"],
+            "monotonic_violation_diffs_gt_thr": ann_thr["monotonic_violation_diffs_gt_thr"]
+            if "monotonic_violation_diffs_gt_thr" in ann_thr else ann_thr.get("monotonic_violation_diffs", []),
+            "monotonic_violation_pairs_gt_thr": ann_thr.get("monotonic_violation_pairs", []),
             "monotonic_direction_increasing_ok_gt_thr": bool(ann_thr["monotonic_direction_increasing_ok"]),
             "monotonic_direction_decreasing_ok_gt_thr": bool(ann_thr["monotonic_direction_decreasing_ok"]),
 
-            # Spearman
             "spearman_rho": float(rho_raw) if np.isfinite(rho_raw) else np.nan,
             "spearman_p": float(p_raw) if np.isfinite(p_raw) else np.nan,
             "spearman_rho_gt_thr": float(rho_thr) if np.isfinite(rho_thr) else np.nan,
@@ -549,9 +586,7 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             "bin_edges": np.array2string(np.asarray(bin_edges, dtype=np.float64), precision=6, separator=","),
         }
 
-        # Per-bin columns
         for b in range(n_bins_effective):
-            # RAW
             row[f"q{b}_n"] = q_counts[b]
             row[f"q{b}_{quantile_stat}_activity"] = q_centers[b]
             row[f"q{b}_trial_mean_activity_list"] = q_lists[b]
@@ -561,7 +596,6 @@ def summarize_monotonic_unit_df_by_latent_quantile(
                 row[f"q{b}_q25_activity"] = float(q_ci[b].get("q25", np.nan))
                 row[f"q{b}_q75_activity"] = float(q_ci[b].get("q75", np.nan))
 
-            # THR
             row[f"q{b}_n_gt_thr"] = q_counts_thr[b]
             row[f"q{b}_{quantile_stat}_activity_gt_thr"] = q_centers_thr[b]
             row[f"q{b}_trial_mean_activity_list_gt_thr"] = q_lists_thr[b]
@@ -571,7 +605,6 @@ def summarize_monotonic_unit_df_by_latent_quantile(
                 row[f"q{b}_q25_activity_gt_thr"] = float(q_ci_thr[b].get("q25", np.nan))
                 row[f"q{b}_q75_activity_gt_thr"] = float(q_ci_thr[b].get("q75", np.nan))
 
-        # Optional unit metadata merge (including NWB-derived anatomy)
         if meta_df is not None and int(unit) in meta_df.index:
             meta_row = meta_df.loc[int(unit)]
             for col in meta_df.columns:
@@ -590,43 +623,38 @@ def summarize_monotonic_unit_df_by_latent_quantile(
 
     # -----------------------------
     # 8) Save output (optional)
+    #     IMPORTANT: recompute filename if bins effective differs (quantile drop)
     # -----------------------------
-    def _sanitize_token(s: str) -> str:
-        s2 = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".", "+")) else "_" for ch in s)
-        return s2.strip("_") if s2.strip("_") else "NA"
-
-    saved_file: Optional[Path] = None
-
-    if save_path is not None:
-        p = Path(save_path)
-        if p.suffix:
-            saved_file = p
-        else:
-            out_dir = p
-            out_dir.mkdir(parents=True, exist_ok=True)
+    if saved_file is not None:
+        # If we used requested n_bins for precheck, but quantile collapsed, update filename to match your original behavior
+        if ("__bins" in saved_file.name) and (f"__bins{int(n_bins)}__" in saved_file.name) and (n_bins_effective != int(n_bins)):
+            # rebuild saved_file using effective bins (and same directory)
+            out_dir = saved_file.parent
             sess_tok = _sanitize_token(session_name) if session_name else "session"
             lat_tok = _sanitize_token(latent_name) if latent_name else "latent"
             thr_tok = _sanitize_token(f"thr{thr:g}")
-            saved_file = out_dir / f"{sess_tok}__{lat_tok}__{thr_tok}__bins{n_bins_effective}__win_{w0:g}_{w1:g}.{save_format}"
+            saved_file = out_dir / f"{sess_tok}__{lat_tok}__{thr_tok}__bins{int(n_bins_effective)}__win_{w0:g}_{w1:g}.{save_format}"
 
-    elif save_filename is not None:
-        out_dir = Path(save_dir) if save_dir is not None else Path(".")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        saved_file = out_dir / save_filename
-        if not saved_file.suffix:
-            saved_file = saved_file.with_suffix(f".{save_format}")
+            # Early-skip check again after we know effective bins
+            if saved_file.exists() and (not overwrite):
+                if save_format == "csv":
+                    unit_df2 = pd.read_csv(saved_file)
+                elif save_format == "parquet":
+                    unit_df2 = pd.read_parquet(saved_file)
+                else:
+                    raise ValueError(f"Unsupported save_format={save_format!r} for early-load.")
+                return unit_df2, saved_file
 
-    elif save_dir is not None:
-        out_dir = Path(save_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        sess_tok = _sanitize_token(session_name) if session_name else "session"
-        lat_tok = _sanitize_token(latent_name) if latent_name else "latent"
-        thr_tok = _sanitize_token(f"thr{thr:g}")
-        saved_file = out_dir / f"{sess_tok}__{lat_tok}__{thr_tok}__bins{n_bins_effective}__win_{w0:g}_{w1:g}.{save_format}"
+        saved_file.parent.mkdir(parents=True, exist_ok=True)
 
-    if saved_file is not None:
-        if saved_file.exists() and not overwrite:
-            raise FileExistsError(f"Output exists and overwrite=False: {saved_file}")
+        if saved_file.exists() and (not overwrite):
+            if save_format == "csv":
+                unit_df2 = pd.read_csv(saved_file)
+            elif save_format == "parquet":
+                unit_df2 = pd.read_parquet(saved_file)
+            else:
+                raise ValueError(f"Unsupported save_format={save_format!r} for early-load.")
+            return unit_df2, saved_file
 
         if save_format == "csv":
             unit_df.to_csv(saved_file, index=False)
@@ -740,9 +768,6 @@ def load_and_combine_monotonic_unit_dfs(
 
 
 
-
-
-
 def summarize_significant_and_monotonic_fractions(
     combined_df: pd.DataFrame,
     *,
@@ -750,78 +775,230 @@ def summarize_significant_and_monotonic_fractions(
     alpha: float = 0.05,
     monotonic_col: str = "is_monotonic",
     require_valid_monotonic: bool = True,
+    brain_region_col: str = "brain_region",
+    brain_region_filter: Optional[Sequence[Sequence[str]]] = None,
+    include_overall: bool = True,
+    include_group_dataframes: bool = True,
+    # --- session filtering via summary ---
+    summary: Optional[pd.DataFrame] = None,
+    criteria_col: str = "QLearning_L1F1_CK1_softmax_pass_all_criteria",
+    summary_session_col: str = "session_name",
+    combined_session_col: str = "session_name",
 ) -> Dict[str, Any]:
     """
     Compute:
       - fraction of significant rows (p <= alpha) among rows with finite p
       - fraction of monotonic rows among significant rows
 
-    Returns a dict with fractions + counts + DataFrames:
-      - significant_df: rows with p <= alpha
-      - significant_monotonic_df: rows with p <= alpha AND monotonic==True
+    Optionally filter `combined_df` by sessions listed in `summary` where `criteria_col` is True.
+    Session names are not standardized, so we normalize both sides using
+    `extract_session_name_core(basename)`.
+
+    Additionally, if `brain_region_filter` is provided, compute the same summary for each *group*
+    of brain regions.
+
+    Returns:
+      - optional "overall"
+      - "by_brain_region_group" (always present)
+      - session filtering metadata if summary is provided
     """
 
     if p_col not in combined_df.columns:
         raise KeyError(f"Missing p-value column: {p_col!r}")
     if monotonic_col not in combined_df.columns:
         raise KeyError(f"Missing monotonic column: {monotonic_col!r}")
+    if brain_region_col not in combined_df.columns:
+        raise KeyError(f"Missing brain region column: {brain_region_col!r}")
 
-    p = pd.to_numeric(combined_df[p_col], errors="coerce").to_numpy(dtype=np.float64)
-    p_valid_mask = np.isfinite(p)
+    # Default filter requested by user
+    if brain_region_filter is None:
+        brain_region_filter = [
+            ["MD"],
+            ["SI", "MA"],
+            ["PL5", "PL6a", "ILA5", "ILA6a"],
+            ["MOs2/3", "MOs5", "MOs6a"],
+            ["ORBm1", "ORBm5", "ORBm2/3", "ORBm6a"],
+        ]
 
-    n_total = int(len(combined_df))
-    n_p_valid = int(np.sum(p_valid_mask))
+    # -----------------------------
+    # Filter combined_df by sessions in summary that pass criteria
+    # -----------------------------
+    filtered_df = combined_df
+    session_filter_info: Dict[str, Any] = {"session_filter_applied": False}
 
-    sig_mask = p_valid_mask & (p <= float(alpha))
-    n_sig = int(np.sum(sig_mask))
+    if summary is not None:
+        if summary_session_col not in summary.columns:
+            raise KeyError(f"Missing summary session column: {summary_session_col!r}")
+        if criteria_col not in summary.columns:
+            raise KeyError(f"Missing criteria column in summary: {criteria_col!r}")
+        if combined_session_col not in combined_df.columns:
+            raise KeyError(f"Missing combined_df session column: {combined_session_col!r}")
 
-    frac_sig_among_p_valid = (n_sig / n_p_valid) if n_p_valid > 0 else np.nan
+        # Normalize criteria to bool
+        crit = summary[criteria_col]
+        if crit.dtype == object:
+            crit_bool = (
+                crit.astype(str)
+                .str.strip()
+                .str.lower()
+                .map(
+                    {
+                        "true": True,
+                        "false": False,
+                        "1": True,
+                        "0": False,
+                        "yes": True,
+                        "no": False,
+                        "t": True,
+                        "f": False,
+                    }
+                )
+                .fillna(False)
+                .astype(bool)
+            )
+        else:
+            crit_bool = crit.fillna(False).astype(bool)
 
-    # Significant subset
-    sig_df = combined_df.loc[sig_mask].copy()
+        # Normalize summary session names -> core
+        summary_sessions = summary.loc[crit_bool, summary_session_col].astype(str)
 
-    # Monotonic within significant
-    m = sig_df[monotonic_col]
-    # Handle cases where monotonic is stored as bool / int / string
-    if m.dtype == object:
-        m_bool = m.astype(str).str.lower().map({"true": True, "false": False})
-    else:
-        m_bool = m.astype("boolean")
+        pass_session_cores = {
+            extract_session_name_core(s.rstrip("/").split("/")[-1])
+            for s in summary_sessions.tolist()
+            if len(s) > 0
+        }
 
-    if require_valid_monotonic:
-        m_valid = m_bool.notna().to_numpy()
-        n_sig_monot_denom = int(np.sum(m_valid))
-        n_sig_monot = int(np.sum(m_bool[m_valid].to_numpy(dtype=bool)))
+        # Normalize combined_df session names -> core
+        combined_sessions = combined_df[combined_session_col].astype(str)
+        combined_session_cores = combined_sessions.map(
+            lambda s: extract_session_name_core(s.rstrip("/").split("/")[-1])
+        )
 
-        # Only count True among valid; exclude NA rows from fraction denom
-        sig_monot_mask = m_bool.fillna(False).to_numpy(dtype=bool) & m_bool.notna().to_numpy(dtype=bool)
-        significant_monotonic_df = sig_df.loc[sig_monot_mask].copy()
-    else:
-        # Treat NA as False
-        m_filled = m_bool.fillna(False).to_numpy(dtype=bool)
-        n_sig_monot_denom = int(len(sig_df))
-        n_sig_monot = int(np.sum(m_filled))
+        mask = combined_session_cores.isin(pass_session_cores)
+        filtered_df = combined_df.loc[mask].copy()
 
-        significant_monotonic_df = sig_df.loc[m_filled].copy()
+        session_filter_info = {
+            "session_filter_applied": True,
+            "criteria_col": criteria_col,
+            "summary_session_col": summary_session_col,
+            "combined_session_col": combined_session_col,
+            "n_sessions_passing_criteria": int(len(pass_session_cores)),
+            "n_rows_before_session_filter": int(len(combined_df)),
+            "n_rows_after_session_filter": int(len(filtered_df)),
+        }
 
-    frac_monotonic_among_sig = (
-        (n_sig_monot / n_sig_monot_denom) if n_sig_monot_denom > 0 else np.nan
-    )
+    # -----------------------------
+    # Core summarizer
+    # -----------------------------
+    def _summarize_one(df: pd.DataFrame) -> Dict[str, Any]:
+        p = pd.to_numeric(df[p_col], errors="coerce").to_numpy(dtype=np.float64)
+        p_valid_mask = np.isfinite(p)
 
-    return {
-        "alpha": float(alpha),
-        "p_col": p_col,
-        "monotonic_col": monotonic_col,
-        "n_total_rows": n_total,
-        "n_rows_with_valid_p": n_p_valid,
-        "n_significant": n_sig,
-        "frac_significant_among_valid_p": frac_sig_among_p_valid,
-        "n_significant_with_valid_monotonic": n_sig_monot_denom,
-        "n_significant_and_monotonic": n_sig_monot,
-        "frac_monotonic_among_significant": frac_monotonic_among_sig,
-        "significant_df": sig_df,
-        "significant_monotonic_df": significant_monotonic_df,
+        n_total = int(len(df))
+        n_p_valid = int(np.sum(p_valid_mask))
+
+        sig_mask = p_valid_mask & (p <= float(alpha))
+        n_sig = int(np.sum(sig_mask))
+
+        frac_sig_among_p_valid = (n_sig / n_p_valid) if n_p_valid > 0 else np.nan
+
+        sig_df = df.loc[sig_mask].copy()
+
+        # Monotonic within significant
+        m = sig_df[monotonic_col]
+
+        # Normalize to a pandas nullable boolean series
+        if m.dtype == object:
+            m_norm = (
+                m.astype(str)
+                .str.strip()
+                .str.lower()
+                .map(
+                    {
+                        "true": True,
+                        "false": False,
+                        "1": True,
+                        "0": False,
+                        "yes": True,
+                        "no": False,
+                        "t": True,
+                        "f": False,
+                    }
+                )
+                .astype("boolean")
+            )
+        else:
+            m_norm = m.astype("boolean")
+
+        if require_valid_monotonic:
+            m_valid = m_norm.notna().to_numpy()
+            n_sig_monot_denom = int(np.sum(m_valid))
+            n_sig_monot = int(np.sum(m_norm[m_valid].to_numpy(dtype=bool)))
+
+            sig_monot_mask = (
+                m_norm.fillna(False).to_numpy(dtype=bool)
+                & m_norm.notna().to_numpy(dtype=bool)
+            )
+            significant_monotonic_df = sig_df.loc[sig_monot_mask].copy()
+        else:
+            m_filled = m_norm.fillna(False).to_numpy(dtype=bool)
+            n_sig_monot_denom = int(len(sig_df))
+            n_sig_monot = int(np.sum(m_filled))
+
+            significant_monotonic_df = sig_df.loc[m_filled].copy()
+
+        frac_monotonic_among_sig = (
+            (n_sig_monot / n_sig_monot_denom) if n_sig_monot_denom > 0 else np.nan
+        )
+
+        return {
+            "alpha": float(alpha),
+            "p_col": p_col,
+            "monotonic_col": monotonic_col,
+            "n_total_rows": n_total,
+            "n_rows_with_valid_p": n_p_valid,
+            "n_significant": n_sig,
+            "frac_significant_among_valid_p": frac_sig_among_p_valid,
+            "n_significant_with_valid_monotonic": n_sig_monot_denom,
+            "n_significant_and_monotonic": n_sig_monot,
+            "frac_monotonic_among_significant": frac_monotonic_among_sig,
+            "significant_df": sig_df,
+            "significant_monotonic_df": significant_monotonic_df,
+        }
+
+    # -----------------------------
+    # Output structure
+    # -----------------------------
+    out: Dict[str, Any] = {
+        "brain_region_col": brain_region_col,
+        "brain_region_filter": [list(g) for g in brain_region_filter],
+        "by_brain_region_group": {},
+        **session_filter_info,
     }
+
+    if include_overall:
+        out["overall"] = _summarize_one(filtered_df)
+
+    region_series = filtered_df[brain_region_col].astype(str)
+    for group in brain_region_filter:
+        group_list = list(group)
+        label = "[" + ",".join(group_list) + "]"
+
+        mask = region_series.isin(group_list)
+        group_df = filtered_df.loc[mask].copy()
+
+        group_summary = _summarize_one(group_df)
+        group_summary["brain_regions"] = group_list
+
+        if include_group_dataframes:
+            group_summary["group_df"] = group_df
+
+        out["by_brain_region_group"][label] = group_summary
+
+    return out
+
+
+
 
 
 

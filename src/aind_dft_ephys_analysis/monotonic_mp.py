@@ -21,7 +21,6 @@ from create_psth import load_zarr
 from check_monotonic import summarize_monotonic_unit_df_by_latent_quantile
 
 
-
 def _set_worker_env_single_thread() -> None:
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -133,11 +132,14 @@ def run_one_session(
 
         models = get_fitted_model_names(session_name=session_name)
 
-        nwb, io = NWBUtils.combine_nwb(session_name=session_name)
+        # Load NWB (combined) and keep the NWB object to pass into the monotonic summarizer
+        nwb_data, io = NWBUtils.combine_nwb(session_name=session_name)
 
         psth = load_zarr(str(zarr_path))
         beh = smart_read_csv(str(beh_csv))
-        trials = np.asarray(find_trials(nwb, "response"))
+
+        # Trials: response trials (indices into go-cue aligned arrays)
+        trials = np.asarray(find_trials(nwb_data, "response"))
 
         per_latent: List[Dict[str, Any]] = []
 
@@ -181,6 +183,8 @@ def run_one_session(
                     align_to_event=align_to_event,
                     session_name=session_name,
                     latent_name=latent_name,
+                    # NEW: provide NWB so brain_region/ccf_location can be attached
+                    nwb_data=nwb_data,
                     save_path=str(out_subdir),
                     overwrite=overwrite,
                     save_format=save_format,
