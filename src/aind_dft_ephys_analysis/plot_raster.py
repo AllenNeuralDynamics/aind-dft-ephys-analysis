@@ -392,6 +392,7 @@ def plot_raster_and_quantile_psth_by_latent(
     show: bool = True,                  # control figure display
     overwrite: bool = True,             # overwrite existing figure files
     min_trial_rate: float = 0,        # NEW: include only trials with mean rate > this
+    save_format: Union[str, Sequence[str]] = ["png","eps"],
 ) -> None:
     """
     Plot per-unit rasters and binned PSTH summaries using a trial-wise latent value.
@@ -475,6 +476,16 @@ def plot_raster_and_quantile_psth_by_latent(
 
         Trials with non-finite mean rates (NaN/inf) are excluded. If no trials pass the
         filter for a unit, that unit is skipped.
+    save_format : str | sequence of str, default 'png'
+        File format(s) used when saving figures.
+        Can be:
+            - 'png'
+            - 'eps'
+            - ['png', 'eps'] (save multiple formats)
+
+        Each format will generate a separate file:
+            e.g. unit_10.png and unit_10.eps
+
     """
 
     # -----------------------------
@@ -587,16 +598,42 @@ def plot_raster_and_quantile_psth_by_latent(
     # -----------------------------
     # 5) Plot per unit
     # -----------------------------
+
+    # -----------------------------
+    # Normalize save_format
+    # -----------------------------
+    if isinstance(save_format, str):
+        save_formats = [save_format.lower()]
+    else:
+        save_formats = [str(fmt).lower() for fmt in save_format]
+
+    valid_formats = {"png", "eps"}
+    for fmt in save_formats:
+        if fmt not in valid_formats:
+            raise ValueError(f"Unsupported save_format '{fmt}'. Must be one of {valid_formats}.")
+
+
     for unit in unit_list:
         fp: Optional[Path] = None
 
         # File naming + overwrite logic (fast per-unit)
+        filepaths = []
+
         if out_dir is not None:
-            filename = f"{save_prefix or ''}unit_{unit}.png"
-            fp = out_dir / filename
-            if fp.exists() and not overwrite:
-                print(f"Skipping Unit {unit} (file exists, overwrite=False): {fp}")
+            for fmt in save_formats:
+                filename = f"{save_prefix or ''}unit_{unit}.{fmt}"
+                fp = out_dir / filename
+
+                if fp.exists() and not overwrite:
+                    print(f"Skipping Unit {unit} ({fmt}) exists and overwrite=False: {fp}")
+                    continue
+
+                filepaths.append(fp)
+
+            if len(filepaths) == 0:
+                # All formats skipped
                 continue
+
 
         where = np.where(unit_indices == unit)[0]
         if where.size == 0:
@@ -831,9 +868,11 @@ def plot_raster_and_quantile_psth_by_latent(
             # -----------------------------
             # Save / Show
             # -----------------------------
-            if fp is not None:
-                fig.savefig(fp, dpi=dpi, bbox_inches="tight")
-                print(f"Saved Unit {unit} figure to {fp}")
+            if out_dir is not None and len(filepaths) > 0:
+                for out_fp in filepaths:
+                    fig.savefig(out_fp, dpi=dpi, bbox_inches="tight")
+                    print(f"Saved Unit {unit} figure to {out_fp}")
+
 
             if show:
                 plt.show()

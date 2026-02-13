@@ -35,11 +35,11 @@ Latent_NAMES: list[str] = []
 # Model-based latents (existing)
 # --------------------------------------------------
 model_latents = [
-    ("ForagingCompareThreshold-value-1", "Foraging-value-1"),
-    ("ForagingCompareThreshold-RPE", "Foraging-RPE"),
+ #   ("ForagingCompareThreshold-value-1", "Foraging-value-1"),
+ #   ("ForagingCompareThreshold-RPE", "Foraging-RPE"),
     ("QLearning_L2F1_softmax-sumQ-1","QLearning_L2F1_softmax-sumQ-1"),
     ("QLearning_L2F1_softmax-deltaQ-1","QLearning_L2F1_softmax-deltaQ-1"),
-    ("QLearning_L2F1_softmax-RPE","QLearning_L2F1_softmax-RPE")
+  #  ("QLearning_L2F1_softmax-RPE","QLearning_L2F1_softmax-RPE")
 ]
 
 for latent, name in model_latents:
