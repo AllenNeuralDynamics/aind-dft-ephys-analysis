@@ -104,13 +104,13 @@ def run_one_session(
     activity_windows: Sequence[Tuple[float, float]],
     zarr_suffix: str,
     n_bins: int,
-    binning: str,
+    binning="equal",
     quantile_stat: str,
     ci: str,
     monotonic_tol: float,
-    activity_min_threshold: float,
+    activity_min_threshold=1,
     align_to_event: str,
-    overwrite: bool,
+    overwrite=True,
     save_format: str,
 ) -> Dict[str, Any]:
     """

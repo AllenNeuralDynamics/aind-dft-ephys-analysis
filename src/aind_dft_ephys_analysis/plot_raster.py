@@ -386,11 +386,12 @@ def plot_raster_and_quantile_psth_by_latent(
     cmap_name: str = "viridis",
     raster_colormap: bool = True,
     show_colormap: bool = True,
-    sort_order: Literal["ascending", "descending"] = "ascending",
+    sort_order: Literal["ascending", "descending", "not_sort"] = "ascending",
     save_prefix: Optional[str] = None,
     latent_name: Optional[str] = None,  # colorbar label
     show: bool = True,                  # control figure display
     overwrite: bool = True,             # overwrite existing figure files
+    min_trial_rate: float = 0,        # NEW: include only trials with mean rate > this
 ) -> None:
     """
     Plot per-unit rasters and binned PSTH summaries using a trial-wise latent value.
@@ -410,7 +411,8 @@ def plot_raster_and_quantile_psth_by_latent(
     align_to_event : str, optional
         Event name used when multiple alignment types exist in the dataset.
     time_window : (float, float), optional
-        Time range (in seconds) for plotting. Applies to both raster and PSTH.
+        Time range (in seconds) for plotting. Applies to both raster and PSTH,
+        and is also used for the trial inclusion filter when `min_trial_rate` is set.
     n_bins : int, default 5
         Number of bins (quantiles or equal-width bins) used to divide latent values.
     binning : {'quantile', 'equal'}, default 'quantile'
@@ -457,7 +459,24 @@ def plot_raster_and_quantile_psth_by_latent(
     overwrite : bool, default True
         If True, overwrite an existing figure file. If False and the target file exists,
         skip that unit (do not generate a figure).
+
+    min_trial_rate : float, default 0.2
+        Per-unit trial inclusion threshold (in spk/s).
+
+        For each unit, a per-trial mean firing rate is computed from that unit's PSTH
+        over the plotting time window:
+        - If `time_window` is provided: mean over times within `[time_window[0], time_window[1]]`
+        - If `time_window` is None: mean over the full PSTH time axis
+
+        Only trials with mean rate strictly greater than `min_trial_rate` are included.
+        This filter is applied per unit and affects BOTH:
+        - the raster (only retained trials are drawn)
+        - the PSTH summaries by bin (only retained trials contribute to curves/CI)
+
+        Trials with non-finite mean rates (NaN/inf) are excluded. If no trials pass the
+        filter for a unit, that unit is skipped.
     """
+
     # -----------------------------
     # 1) Validate inputs
     # -----------------------------
@@ -472,7 +491,6 @@ def plot_raster_and_quantile_psth_by_latent(
     # -----------------------------
     # 2) Load PSTH & raster subset
     # -----------------------------
-    # NOTE: This function must exist in your codebase.
     psth_da, raster_da = load_psth_raster_subset(
         source,
         trial_ids=None,
@@ -499,7 +517,6 @@ def plot_raster_and_quantile_psth_by_latent(
     latent_trial_ids = latent_trial_ids[present_mask]
     latent_values = latent_values[present_mask]
 
-    # Map requested trial IDs onto dataset trial positions
     pos_idx = pd.Index(all_trial_ids_in_ds).get_indexer(latent_trial_ids)
     keep = pos_idx >= 0
 
@@ -508,10 +525,9 @@ def plot_raster_and_quantile_psth_by_latent(
     lat = latent_values[keep]
 
     trial_ids_arr = psth_da.coords[trial_coord].values.astype(np.int64)
-    trial_to_pos = {int(t): i for i, t in enumerate(trial_ids_arr)}
 
     # -----------------------------
-    # 4) Build bins
+    # 4) Build bins (global edges/colors)
     # -----------------------------
     lat_finite = lat[np.isfinite(lat)]
     if lat_finite.size == 0:
@@ -531,7 +547,6 @@ def plot_raster_and_quantile_psth_by_latent(
         if hi <= lo:
             raise ValueError("Invalid bin_range or latent range.")
         edges = np.linspace(lo, hi, n_bins + 1)
-        # Include max value in last bin
         edges[-1] = np.nextafter(edges[-1], np.inf)
 
     n_bins_eff = int(edges.size - 1)
@@ -546,14 +561,6 @@ def plot_raster_and_quantile_psth_by_latent(
     cmap = cm.get_cmap(cmap_name, n_bins)
     colors = [mcolors.to_hex(cmap(i)) for i in range(n_bins)]
 
-    if bin_label == "center":
-        bin_tick_vals = list(0.5 * (edges[:-1] + edges[1:]))
-    else:
-        bin_tick_vals = [
-            float(np.nanmean(lat[bin_idx == i])) if np.any(bin_idx == i) else np.nan
-            for i in range(n_bins)
-        ]
-
     latent_min = float(np.nanmin(lat_finite))
     latent_max = float(np.nanmax(lat_finite))
 
@@ -565,14 +572,11 @@ def plot_raster_and_quantile_psth_by_latent(
     out_dir: Optional[Path] = None
     if save_path is not None:
         save_target = Path(save_path)
-
-        # Determine base output directory
         if save_target.suffix == "" or save_target.is_dir():
             base_dir = save_target
         else:
             base_dir = save_target.parent
 
-        # Folder should be base_dir / save_prefix (strip trailing underscore)
         if save_prefix:
             subfolder_name = save_prefix.rstrip("_")
             out_dir = base_dir / subfolder_name
@@ -580,7 +584,6 @@ def plot_raster_and_quantile_psth_by_latent(
             out_dir = base_dir
 
         out_dir.mkdir(parents=True, exist_ok=True)
-
     # -----------------------------
     # 5) Plot per unit
     # -----------------------------
@@ -591,7 +594,6 @@ def plot_raster_and_quantile_psth_by_latent(
         if out_dir is not None:
             filename = f"{save_prefix or ''}unit_{unit}.png"
             fp = out_dir / filename
-
             if fp.exists() and not overwrite:
                 print(f"Skipping Unit {unit} (file exists, overwrite=False): {fp}")
                 continue
@@ -612,21 +614,111 @@ def plot_raster_and_quantile_psth_by_latent(
             unit_psth = psth_da.isel(unit=upos)
             unit_rast = raster_da.isel(unit=upos)
 
-            # Materialize PSTH once per unit (avoids repeated .values in bin loop)
-            # Expected shape: (n_trials, n_time)
-            unit_psth_np = np.asarray(unit_psth.values)
+            # Materialize once
+            unit_psth_np = np.asarray(unit_psth.values)  # (n_trials, n_time)
+            unit_rast_vals = unit_rast.values            # typically object arrays per trial
 
-            # Raster values: often object-dtype variable-length arrays per trial
-            unit_rast_vals = unit_rast.values
+            # -----------------------------
+            # Per-unit trial filter by mean firing rate within time_window
+            # -----------------------------
+            if time_window is None:
+                tmask = np.ones(times.shape, dtype=bool)
+            else:
+                t0, t1 = float(time_window[0]), float(time_window[1])
+                if t1 < t0:
+                    raise ValueError("time_window must be (tmin, tmax) with tmax >= tmin.")
+                tmask = (times >= t0) & (times <= t1)
 
-            # Sorting
-            ascending = (sort_order == "ascending")
-            order = np.argsort(lat, kind="mergesort")
-            if not ascending:
-                order = order[::-1]
+            if not np.any(tmask):
+                raise ValueError("No time points fall within the specified time_window.")
 
-            sorted_trials = trial_ids_arr[order]
-            sorted_bins = bin_idx[order]
+            trial_mean_rate = np.nanmean(unit_psth_np[:, tmask], axis=1)
+            keep_trials = np.isfinite(trial_mean_rate) & (trial_mean_rate > float(min_trial_rate))
+
+            if not np.any(keep_trials):
+                print(f"Skipping Unit {unit}: no trials with mean rate > {min_trial_rate} in the time window.")
+                continue
+
+            # Filter per-unit arrays
+            lat_u = lat[keep_trials]
+            trial_ids_u = trial_ids_arr[keep_trials]
+            unit_psth_np_u = unit_psth_np[keep_trials, :]
+            unit_rast_vals_u = unit_rast_vals[keep_trials]
+
+            trial_to_pos_u = {int(t): i for i, t in enumerate(trial_ids_u)}
+
+            # -----------------------------
+            # Build bins PER UNIT (after filtering)
+            # -----------------------------
+            lat_finite_u = lat_u[np.isfinite(lat_u)]
+            if lat_finite_u.size == 0:
+                print(f"Skipping Unit {unit}: all filtered latent values are NaN/inf.")
+                continue
+
+            if binning == "quantile":
+                q_perc = np.linspace(0, 100, n_bins + 1)
+                edges_u = np.unique(np.nanpercentile(lat_finite_u, q_perc))
+                if edges_u.size < 2:
+                    print(f"Skipping Unit {unit}: quantile edges collapsed after filtering.")
+                    continue
+            else:
+                lo_u, hi_u = (
+                    (float(np.nanmin(lat_finite_u)), float(np.nanmax(lat_finite_u)))
+                    if bin_range is None
+                    else (float(bin_range[0]), float(bin_range[1]))
+                )
+                if hi_u <= lo_u:
+                    print(f"Skipping Unit {unit}: invalid bin_range or latent range after filtering.")
+                    continue
+                edges_u = np.linspace(lo_u, hi_u, n_bins + 1)
+                edges_u[-1] = np.nextafter(edges_u[-1], np.inf)
+
+            n_bins_eff_u = int(edges_u.size - 1)
+            if n_bins_eff_u <= 0:
+                print(f"Skipping Unit {unit}: invalid bin edges after filtering.")
+                continue
+
+            # If quantiles collapsed, n_bins_eff_u may be < n_bins; respect that per unit
+            n_bins_u = n_bins_eff_u
+
+            bin_idx_u = np.digitize(lat_u, edges_u[1:-1], right=False)
+            bin_idx_u = np.clip(bin_idx_u, 0, n_bins_u - 1)
+
+            cmap_u = cm.get_cmap(cmap_name, n_bins_u)
+            colors_u = [mcolors.to_hex(cmap_u(i)) for i in range(n_bins_u)]
+
+            if bin_label == "center":
+                bin_tick_vals_u = list(0.5 * (edges_u[:-1] + edges_u[1:]))
+            else:
+                bin_tick_vals_u = [
+                    float(np.nanmean(lat_u[bin_idx_u == i])) if np.any(bin_idx_u == i) else np.nan
+                    for i in range(n_bins_u)
+                ]
+
+            latent_min_u = float(np.nanmin(lat_finite_u))
+            latent_max_u = float(np.nanmax(lat_finite_u))
+
+            # -----------------------------
+            # Sorting PER UNIT (after filtering)
+            # -----------------------------
+            if sort_order == "ascending":
+                order_u = np.argsort(lat_u, kind="mergesort")
+                order_str = "ascending"
+
+            elif sort_order == "descending":
+                order_u = np.argsort(lat_u, kind="mergesort")[::-1]
+                order_str = "descending"
+
+            elif sort_order == "not_sort":
+                order_u = np.arange(len(lat_u))
+                order_str = "original order"
+
+            else:
+                raise ValueError("sort_order must be 'ascending', 'descending', or 'not_sort'.")
+
+            sorted_trials_u = trial_ids_u[order_u]
+            sorted_bins_u = bin_idx_u[order_u]
+
 
             fig, (ax_rast, ax_psth) = plt.subplots(
                 2, 1,
@@ -636,17 +728,17 @@ def plot_raster_and_quantile_psth_by_latent(
             )
 
             # -----------------------------
-            # Raster
+            # Raster (filtered trials only)
             # -----------------------------
             y = 0
-            for idx, tval in enumerate(sorted_trials):
+            for idx, tval in enumerate(sorted_trials_u):
                 y += 1
-                b = int(sorted_bins[idx])
-                ti = trial_to_pos.get(int(tval))
+                b = int(sorted_bins_u[idx])
+                ti = trial_to_pos_u.get(int(tval))
                 if ti is None:
                     continue
 
-                spikes = unit_rast_vals[ti]
+                spikes = unit_rast_vals_u[ti]
                 if spikes is None:
                     continue
 
@@ -661,26 +753,25 @@ def plot_raster_and_quantile_psth_by_latent(
                 if spikes.size == 0:
                     continue
 
-                color = colors[b] if raster_colormap else "black"
+                color = colors_u[b] if raster_colormap else "black"
                 ax_rast.vlines(spikes, y, y + 0.9, color=color, alpha=0.8, linewidth=0.6)
 
             ax_rast.axvline(0.0, color="k", ls="--", lw=0.8)
 
             ttl = f"{title_prefix} Unit {unit}" if title_prefix else f"Unit {unit}"
-            order_str = "ascending" if ascending else "descending"
-            ax_rast.set_title(f"{ttl} (sorted {order_str})")
+            ax_rast.set_title(f"{ttl} (sorted {order_str}; rate>{min_trial_rate})")
             ax_rast.set_ylabel("Trials (sorted by latent)")
 
             # -----------------------------
-            # PSTH summaries by bin
+            # PSTH summaries by bin (filtered trials only; per-unit bins)
             # -----------------------------
             ymax = 0.0
-            for b in range(n_bins):
-                sel = (bin_idx == b)
+            for b in range(n_bins_u):
+                sel = (bin_idx_u == b)
                 if not np.any(sel):
                     continue
 
-                data = unit_psth_np[sel, :]
+                data = unit_psth_np_u[sel, :]
 
                 if quantile_stat == "median":
                     center = np.nanmedian(data, axis=0)
@@ -698,10 +789,10 @@ def plot_raster_and_quantile_psth_by_latent(
                     q75 = np.nanpercentile(data, 75, axis=0)
                     lower, upper = q25, q75
 
-                ax_psth.plot(times, center, color=colors[b], linewidth=1.5)
+                ax_psth.plot(times, center, color=colors_u[b], linewidth=1.5)
 
                 if lower is not None and upper is not None:
-                    ax_psth.fill_between(times, lower, upper, color=colors[b], alpha=0.25)
+                    ax_psth.fill_between(times, lower, upper, color=colors_u[b], alpha=0.25)
 
                 fmax = np.nanmax(upper if upper is not None else center)
                 if np.isfinite(fmax):
@@ -721,17 +812,17 @@ def plot_raster_and_quantile_psth_by_latent(
             plt.tight_layout()
 
             # -----------------------------
-            # Colorbar
+            # Colorbar (per-unit scaling/ticks)
             # -----------------------------
             if show_colormap:
                 sm = plt.cm.ScalarMappable(
                     cmap=cm.get_cmap(cmap_name),
-                    norm=plt.Normalize(vmin=latent_min, vmax=latent_max),
+                    norm=plt.Normalize(vmin=latent_min_u, vmax=latent_max_u),
                 )
                 cbar = fig.colorbar(sm, ax=[ax_rast, ax_psth], orientation="vertical", pad=0.02)
                 cbar.set_label(latent_name or "Latent value", rotation=270, labelpad=12)
 
-                ticks = [v for v in bin_tick_vals if np.isfinite(v)]
+                ticks = [v for v in bin_tick_vals_u if np.isfinite(v)]
                 if len(ticks) > 0:
                     cbar.set_ticks(ticks)
                     cbar.set_ticklabels([f"{v:.2f}" for v in ticks])
@@ -748,11 +839,9 @@ def plot_raster_and_quantile_psth_by_latent(
                 plt.show()
 
         finally:
-            # Always close figures to avoid accumulation across many calls
             if fig is not None:
                 plt.close(fig)
 
-            # Drop large per-unit arrays ASAP
             if unit_psth_np is not None:
                 del unit_psth_np
             if unit_rast_vals is not None:
@@ -761,6 +850,7 @@ def plot_raster_and_quantile_psth_by_latent(
                 del unit_psth
             if unit_rast is not None:
                 del unit_rast
+
 
 
 

@@ -33,7 +33,6 @@ from ephys_utils import append_units_locations
 from general_utils import extract_session_name_core
 
 
-
 def summarize_monotonic_unit_df_by_latent_quantile(
     source: Union[str, Path, xr.DataArray, xr.Dataset],
     *,
@@ -52,6 +51,7 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     dropna_latent: bool = True,
     dropna_activity: bool = True,
     activity_min_threshold: float = 0.0,
+    min_average_firing_rate: float = 0.0,  # NEW
     session_name: Optional[str] = None,
     latent_name: Optional[str] = None,
     unit_metadata: Optional[pd.DataFrame] = None,
@@ -70,68 +70,77 @@ def summarize_monotonic_unit_df_by_latent_quantile(
 
     NEW:
     If `nwb_data` is provided, this function will:
-      1) call `append_units_locations(nwb_data, session_id_core)` to populate CCF fields
-      2) attach `brain_region` and `ccf_location` to the output rows (per unit)
+    1) call `append_units_locations(nwb_data, session_id_core)` to populate CCF fields
+    2) attach `brain_region` and `ccf_location` to the output rows (per unit)
+
+    NEW:
+    If `min_average_firing_rate` > 0, units whose average firing rate within `activity_window`
+    is < `min_average_firing_rate` are excluded from the output `unit_df`. This means these
+    units are also excluded from downstream fraction calculations performed on `unit_df`
+    (e.g., fraction significant / fraction monotonic).
 
     OUTPUT (unit_df): one row per unit, includes:
     --------------------------------------------------------------------------
     Core identifiers / metadata
-      - unit_index
-      - session_name
-      - latent_name
-      - brain_region           (if nwb_data provided or in unit_metadata)
-      - ccf_location           (if nwb_data provided or in unit_metadata)
+    - unit_index
+    - session_name
+    - latent_name
+    - brain_region           (if nwb_data provided or in unit_metadata)
+    - ccf_location           (if nwb_data provided or in unit_metadata)
 
     Binning + window config
-      - binning, n_bins_requested, n_bins_effective, bin_edges
-      - activity_window_start, activity_window_end
-      - quantile_stat, ci
-      - monotonic_tol
-      - activity_min_threshold
+    - binning, n_bins_requested, n_bins_effective, bin_edges
+    - activity_window_start, activity_window_end
+    - quantile_stat, ci
+    - monotonic_tol
+    - activity_min_threshold
+    - min_average_firing_rate
+    - avg_firing_rate_window        (average firing rate within activity_window)
 
     Trial usage counts
-      - n_trials_used               (after dropna_latent/dropna_activity/bin>=0)
-      - n_trials_used_gt_thr        (above, AND trial_mean_activity > threshold)
+    - n_trials_used               (after dropna_latent/dropna_activity/bin>=0)
+    - n_trials_used_gt_thr        (above, AND trial_mean_activity > threshold)
 
     Per-bin outputs (RAW)
-      - q{b}_n
-      - q{b}_{quantile_stat}_activity
-      - q{b}_trial_mean_activity_list
-      - CI columns depending on ci:
-          * ci="sem": q{b}_sem_activity
-          * ci="iqr": q{b}_q25_activity, q{b}_q75_activity
+    - q{b}_n
+    - q{b}_{quantile_stat}_activity
+    - q{b}_trial_mean_activity_list
+    - CI columns depending on ci:
+        * ci="sem": q{b}_sem_activity
+        * ci="iqr": q{b}_q25_activity, q{b}_q75_activity
 
     Per-bin outputs (FILTERED: trial_mean_activity > threshold)
-      - q{b}_n_gt_thr
-      - q{b}_{quantile_stat}_activity_gt_thr
-      - q{b}_trial_mean_activity_list_gt_thr
-      - CI columns with _gt_thr suffix
+    - q{b}_n_gt_thr
+    - q{b}_{quantile_stat}_activity_gt_thr
+    - q{b}_trial_mean_activity_list_gt_thr
+    - CI columns with _gt_thr suffix
 
     Detailed monotonic annotation (RAW)
-      - is_monotonic
-      - monotonic_direction                 ("increasing"|"decreasing"|"flat"|...)
-      - monotonic_n_valid_bins
-      - monotonic_check_values              length=n_bins_effective (NaN for empty bins)
-      - monotonic_check_bins_valid          bin indices used in diffs
-      - monotonic_diffs                     successive diffs of valid-bin values
-      - monotonic_violation_count           # of diffs violating increasing/decreasing (tol-aware)
-      - monotonic_violation_diffs           the violating diffs (float)
-      - monotonic_violation_pairs           list of (bin_left, bin_right, diff)
-      - monotonic_direction_increasing_ok   bool
-      - monotonic_direction_decreasing_ok   bool
+    - is_monotonic
+    - monotonic_direction                 ("increasing"|"decreasing"|"flat"|...)
+    - monotonic_n_valid_bins
+    - monotonic_check_values              length=n_bins_effective (NaN for empty bins)
+    - monotonic_check_bins_valid          bin indices used in diffs
+    - monotonic_diffs                     successive diffs of valid-bin values
+    - monotonic_violation_count           # of diffs violating increasing/decreasing (tol-aware)
+    - monotonic_violation_diffs           the violating diffs (float)
+    - monotonic_violation_pairs           list of (bin_left, bin_right, diff)
+    - monotonic_direction_increasing_ok   bool
+    - monotonic_direction_decreasing_ok   bool
 
     Detailed monotonic annotation (FILTERED)
-      - same fields, suffixed with _gt_thr
+    - same fields, suffixed with _gt_thr
 
     Trial-wise Spearman correlation (RAW and FILTERED)
-      - spearman_rho, spearman_p
-      - spearman_rho_gt_thr, spearman_p_gt_thr
+    - spearman_rho, spearman_p
+    - spearman_rho_gt_thr, spearman_p_gt_thr
 
     Saving behavior:
-      - If save_path is a file (has suffix), use it directly.
-      - Else if save_filename is provided, save under save_dir (or ".").
-      - Else if save_dir or save_path (directory) is provided, auto-generate filename.
+    - If save_path is a file (has suffix), use it directly.
+    - Else if save_filename is provided, save under save_dir (or ".").
+    - Else if save_dir or save_path (directory) is provided, auto-generate filename.
     """
+
     import math  # Local import to avoid relying on module-level imports
 
     # -----------------------------
@@ -146,21 +155,19 @@ def summarize_monotonic_unit_df_by_latent_quantile(
 
     thr = float(activity_min_threshold)
     w0, w1 = float(activity_window[0]), float(activity_window[1])
+    min_fr = float(min_average_firing_rate)  # NEW
 
     saved_file: Optional[Path] = None
 
-    # NOTE: this mirrors your original naming logic (including bins/win fields).
     if save_path is not None:
         p = Path(save_path)
         if p.suffix:
             saved_file = p
         else:
             out_dir = p
-            # defer mkdir until needed, but still compute name deterministically
             sess_tok = _sanitize_token(session_name) if session_name else "session"
             lat_tok = _sanitize_token(latent_name) if latent_name else "latent"
             thr_tok = _sanitize_token(f"thr{thr:g}")
-            # n_bins_effective not known yet -> use requested n_bins for filename pre-check
             saved_file = out_dir / f"{sess_tok}__{lat_tok}__{thr_tok}__bins{int(n_bins)}__win_{w0:g}_{w1:g}.{save_format}"
 
     elif save_filename is not None:
@@ -176,7 +183,6 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         thr_tok = _sanitize_token(f"thr{thr:g}")
         saved_file = out_dir / f"{sess_tok}__{lat_tok}__{thr_tok}__bins{int(n_bins)}__win_{w0:g}_{w1:g}.{save_format}"
 
-    # ---- Early exit: if output exists and overwrite=False, load and return it.
     if saved_file is not None and saved_file.exists() and (not overwrite):
         if save_format == "csv":
             unit_df = pd.read_csv(saved_file)
@@ -206,6 +212,9 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     if ci not in ("sem", "iqr", "none"):
         raise ValueError("ci must be one of {'sem','iqr','none'}.")
 
+    if min_fr < 0.0:  # NEW
+        raise ValueError("min_average_firing_rate must be >= 0.")
+
     # -----------------------------
     # 1b) Optional: build/augment unit metadata from NWB
     # -----------------------------
@@ -227,11 +236,7 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             if isinstance(loc, dict):
                 region = str(loc.get("brain_region", "")) if loc.get("brain_region", "") is not None else ""
             unit_rows.append(
-                {
-                    "unit_index": int(u),
-                    "brain_region": region,
-                    "ccf_location": loc,
-                }
+                {"unit_index": int(u), "brain_region": region, "ccf_location": loc}
             )
         nwb_meta_df = pd.DataFrame(unit_rows).set_index("unit_index", drop=False)
 
@@ -357,7 +362,6 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         n_bins_effective = int(n_bins)
         bin_edges = edges
 
-    # (helpers + unit loop unchanged...)
     # -----------------------------
     # 6) Helpers
     # -----------------------------
@@ -459,6 +463,63 @@ def summarize_monotonic_unit_df_by_latent_quantile(
 
         return out
 
+    def _build_bins_for_latent_values(
+        vals: np.ndarray,
+        *,
+        n_bins_requested: int,
+        binning_mode: str,
+        bin_range_local: Optional[Tuple[float, float]],
+        dropna: bool,
+    ) -> Tuple[np.ndarray, np.ndarray, int]:
+        v = np.asarray(vals, dtype=np.float64)
+        ok = np.isfinite(v)
+
+        if (not dropna) and (not np.all(ok)):
+            raise ValueError("latent has NaNs but dropna_latent=False; cannot bin NaNs.")
+
+        v_finite = v[ok]
+        if v_finite.size == 0:
+            return np.full(v.shape[0], -1, dtype=np.int32), np.asarray([], dtype=np.float64), 0
+
+        if binning_mode == "quantile":
+            s = pd.Series(v_finite, dtype="float64")
+            try:
+                q = pd.qcut(s, q=int(n_bins_requested), duplicates="drop")
+            except Exception:
+                r = s.rank(method="average")
+                q = pd.qcut(r, q=int(n_bins_requested), duplicates="drop")
+
+            n_bins_eff = int(q.cat.categories.size)
+            if n_bins_eff < 2:
+                return np.full(v.shape[0], -1, dtype=np.int32), np.asarray([], dtype=np.float64), 0
+
+            codes = q.cat.codes.to_numpy(dtype=np.int32)
+
+            bin_idx_local = np.full(v.shape[0], -1, dtype=np.int32)
+            bin_idx_local[ok] = codes
+
+            q_perc = np.linspace(0, 100, n_bins_eff + 1)
+            bin_edges = np.unique(np.nanpercentile(v_finite, q_perc))
+
+            return bin_idx_local, np.asarray(bin_edges, dtype=np.float64), n_bins_eff
+
+        lo, hi = (
+            (float(np.nanmin(v_finite)), float(np.nanmax(v_finite)))
+            if bin_range_local is None
+            else (float(bin_range_local[0]), float(bin_range_local[1]))
+        )
+        if hi <= lo:
+            return np.full(v.shape[0], -1, dtype=np.int32), np.asarray([], dtype=np.float64), 0
+
+        edges = np.linspace(lo, hi, int(n_bins_requested) + 1)
+        edges[-1] = np.nextafter(edges[-1], np.inf)
+
+        bin_idx_local = np.full(v.shape[0], -1, dtype=np.int32)
+        bin_idx_local[ok] = np.digitize(v[ok], edges[1:-1], right=False).astype(np.int32)
+        bin_idx_local = np.clip(bin_idx_local, -1, int(n_bins_requested) - 1)
+
+        return bin_idx_local, np.asarray(edges, dtype=np.float64), int(n_bins_requested)
+
     def _spearman(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
         x = np.asarray(x, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64)
@@ -495,6 +556,12 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         unit_psth_np = np.asarray(psth_da.isel(unit=upos).values, dtype=np.float64)
         trial_mean = np.nanmean(unit_psth_np[:, tmask], axis=1)
 
+        # NEW: exclude low-firing units based on average firing rate in the window
+        avg_fr_window = float(np.nanmean(trial_mean[np.isfinite(trial_mean)])) if np.any(np.isfinite(trial_mean)) else np.nan
+        if np.isfinite(min_fr) and (min_fr > 0.0):
+            if (not np.isfinite(avg_fr_window)) or (avg_fr_window < min_fr):
+                continue
+
         ok_raw = np.ones(trial_mean.shape[0], dtype=bool)
         if dropna_latent:
             ok_raw &= np.isfinite(lat)
@@ -505,11 +572,22 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         lat_ok = lat[ok_raw]
         bin_ok = bin_idx[ok_raw]
         act_ok = trial_mean[ok_raw]
-
         ok_thr = ok_raw & np.isfinite(trial_mean) & (trial_mean > thr)
         lat_ok_thr = lat[ok_thr]
-        bin_ok_thr = bin_idx[ok_thr]
         act_ok_thr = trial_mean[ok_thr]
+
+        bin_idx_thr_local, bin_edges_thr, n_bins_effective_thr = _build_bins_for_latent_values(
+            lat_ok_thr,
+            n_bins_requested=int(n_bins),
+            binning_mode=str(binning),
+            bin_range_local=bin_range,
+            dropna=bool(dropna_latent),
+        )
+
+        ok_thr_binned = (bin_idx_thr_local >= 0)
+        lat_ok_thr_binned = lat_ok_thr[ok_thr_binned]
+        act_ok_thr_binned = act_ok_thr[ok_thr_binned]
+        bin_ok_thr_re = bin_idx_thr_local[ok_thr_binned]
 
         q_lists, q_counts, q_centers, q_ci = [], [], [], []
         q_lists_thr, q_counts_thr, q_centers_thr, q_ci_thr = [], [], [], []
@@ -522,8 +600,13 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             q_centers.append(_safe_center(vals))
             q_ci.append(_ci_summary(vals))
 
-            vals2 = act_ok_thr[bin_ok_thr == b]
-            vals2 = vals2[np.isfinite(vals2)]
+        for b in range(n_bins_effective):
+            if (n_bins_effective_thr >= 2) and (b < n_bins_effective_thr):
+                vals2 = act_ok_thr_binned[bin_ok_thr_re == b]
+                vals2 = vals2[np.isfinite(vals2)]
+            else:
+                vals2 = np.asarray([], dtype=np.float64)
+
             q_lists_thr.append([float(v) for v in vals2])
             q_counts_thr.append(int(vals2.size))
             q_centers_thr.append(_safe_center(vals2))
@@ -540,6 +623,8 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             "session_name": session_name,
             "latent_name": latent_name,
             "activity_min_threshold": float(thr),
+            "min_average_firing_rate": float(min_fr),  # NEW
+            "avg_firing_rate_window": float(avg_fr_window),  # NEW
 
             "n_trials_used": int(act_ok.size),
             "n_trials_used_gt_thr": int(act_ok_thr.size),
@@ -572,8 +657,7 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             "monotonic_check_values_gt_thr": ann_thr["monotonic_check_values"],
             "monotonic_diffs_gt_thr": ann_thr["monotonic_diffs"],
             "monotonic_violation_count_gt_thr": int(ann_thr["monotonic_violation_count"]),
-            "monotonic_violation_diffs_gt_thr": ann_thr["monotonic_violation_diffs_gt_thr"]
-            if "monotonic_violation_diffs_gt_thr" in ann_thr else ann_thr.get("monotonic_violation_diffs", []),
+            "monotonic_violation_diffs_gt_thr": ann_thr.get("monotonic_violation_diffs", []),
             "monotonic_violation_pairs_gt_thr": ann_thr.get("monotonic_violation_pairs", []),
             "monotonic_direction_increasing_ok_gt_thr": bool(ann_thr["monotonic_direction_increasing_ok"]),
             "monotonic_direction_decreasing_ok_gt_thr": bool(ann_thr["monotonic_direction_decreasing_ok"]),
@@ -623,19 +707,15 @@ def summarize_monotonic_unit_df_by_latent_quantile(
 
     # -----------------------------
     # 8) Save output (optional)
-    #     IMPORTANT: recompute filename if bins effective differs (quantile drop)
     # -----------------------------
     if saved_file is not None:
-        # If we used requested n_bins for precheck, but quantile collapsed, update filename to match your original behavior
         if ("__bins" in saved_file.name) and (f"__bins{int(n_bins)}__" in saved_file.name) and (n_bins_effective != int(n_bins)):
-            # rebuild saved_file using effective bins (and same directory)
             out_dir = saved_file.parent
             sess_tok = _sanitize_token(session_name) if session_name else "session"
             lat_tok = _sanitize_token(latent_name) if latent_name else "latent"
             thr_tok = _sanitize_token(f"thr{thr:g}")
             saved_file = out_dir / f"{sess_tok}__{lat_tok}__{thr_tok}__bins{int(n_bins_effective)}__win_{w0:g}_{w1:g}.{save_format}"
 
-            # Early-skip check again after we know effective bins
             if saved_file.exists() and (not overwrite):
                 if save_format == "csv":
                     unit_df2 = pd.read_csv(saved_file)
@@ -666,6 +746,7 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         print(f"Saved unit_df to: {saved_file}")
 
     return unit_df, saved_file
+
 
 
 

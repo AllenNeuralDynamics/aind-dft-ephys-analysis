@@ -37,12 +37,15 @@ Latent_NAMES: list[str] = []
 model_latents = [
     ("ForagingCompareThreshold-value-1", "Foraging-value-1"),
     ("ForagingCompareThreshold-RPE", "Foraging-RPE"),
+    ("QLearning_L2F1_softmax-sumQ-1","QLearning_L2F1_softmax-sumQ-1"),
+    ("QLearning_L2F1_softmax-deltaQ-1","QLearning_L2F1_softmax-deltaQ-1"),
+    ("QLearning_L2F1_softmax-RPE","QLearning_L2F1_softmax-RPE")
 ]
 
 for latent, name in model_latents:
     LATENTS.append(latent)
     Latent_NAMES.append(name)
-
+"""
 # --------------------------------------------------
 # no_model — running-window reward rate (window = 1–30)
 # --------------------------------------------------
@@ -78,7 +81,7 @@ for a in ALPHAS:
     for suffix, short_name in EWMA_TYPES:
         LATENTS.append(f"no_model-reward_rate_alpha_{a}-{suffix}")
         Latent_NAMES.append(f"rr_alpha_{a_str}_{short_name}")
-
+"""
 # --------------------------------------------------
 # Sanity check
 # --------------------------------------------------
@@ -167,7 +170,8 @@ def process_session(session: str) -> str:
                     save_prefix=f"{col}_",
                     latent_name=lname,
                     show=False,   # save only
-                    overwrite=False,
+                    overwrite=True,
+                    min_trial_rate=1,
                 )
                 print(f"[{session}] plotted: {col}")
             finally:
