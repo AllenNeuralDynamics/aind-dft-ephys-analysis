@@ -130,8 +130,6 @@ def run_one_session(
         if not beh_csv.exists():
             return {"session": session_name, "ok": False, "reason": f"Missing behavior csv: {beh_csv}"}
 
-        models = get_fitted_model_names(session_name=session_name)
-
         # Load NWB (combined) and keep the NWB object to pass into the monotonic summarizer
         nwb_data, io = NWBUtils.combine_nwb(session_name=session_name)
 
@@ -207,7 +205,7 @@ def run_one_session(
             del latent_values
             gc.collect()
 
-        return {"session": session_name, "ok": True, "models": models, "per_latent": per_latent}
+        return {"session": session_name, "ok": True, "per_latent": per_latent}
 
     except Exception as e:
         return {

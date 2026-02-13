@@ -32,13 +32,13 @@ from create_psth import load_psth_raster_subset
 from ephys_utils import append_units_locations
 from general_utils import extract_session_name_core
 
-
 def summarize_monotonic_unit_df_by_latent_quantile(
     source: Union[str, Path, xr.DataArray, xr.Dataset],
     *,
     latent_values: Sequence[float],
     latent_trial_ids: Sequence[int],
     activity_window: Tuple[float, float],
+    calculation_min_window: Optional[Tuple[float, float]] = (-4.0, 3),  # NEW
     unit_ids: Optional[Sequence[int]] = None,
     align_to_event: Optional[str] = None,
     time_window: Optional[Tuple[float, float]] = None,
@@ -51,7 +51,7 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     dropna_latent: bool = True,
     dropna_activity: bool = True,
     activity_min_threshold: float = 0.0,
-    min_average_firing_rate: float = 0.0,  # NEW
+    min_average_firing_rate: float = 0.0,
     session_name: Optional[str] = None,
     latent_name: Optional[str] = None,
     unit_metadata: Optional[pd.DataFrame] = None,
@@ -65,80 +65,180 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     overwrite: bool = True,
 ) -> Tuple[pd.DataFrame, Optional[Path]]:
     """
-    Per-unit monotonicity summary vs latent (binned), with an additional monotonic check
-    after removing trials whose trial-mean activity <= activity_min_threshold.
+    Parameters
+    ----------
+    source
+        PSTH/raster data source. Can be:
+        - str or Path: path to a zarr/npz/h5/etc supported by `load_psth_raster_subset`
+        - xr.DataArray or xr.Dataset: already-loaded raster/PSTH object
+        Must contain trial and time dimensions/coords compatible with `load_psth_raster_subset`.
 
-    NEW:
-    If `nwb_data` is provided, this function will:
-    1) call `append_units_locations(nwb_data, session_id_core)` to populate CCF fields
-    2) attach `brain_region` and `ccf_location` to the output rows (per unit)
+    latent_values
+        1D array-like of latent values (float) for each trial id in `latent_trial_ids`.
+        Length must equal `latent_trial_ids`. These are used to bin trials (quantile or equal-width).
 
-    NEW:
-    If `min_average_firing_rate` > 0, units whose average firing rate within `activity_window`
-    is < `min_average_firing_rate` are excluded from the output `unit_df`. This means these
-    units are also excluded from downstream fraction calculations performed on `unit_df`
-    (e.g., fraction significant / fraction monotonic).
+    latent_trial_ids
+        1D array-like of trial identifiers (int) corresponding one-to-one with `latent_values`.
+        Must be unique (no duplicates). Used to align latent values to trials present in `source`.
 
-    OUTPUT (unit_df): one row per unit, includes:
-    --------------------------------------------------------------------------
-    Core identifiers / metadata
-    - unit_index
-    - session_name
-    - latent_name
-    - brain_region           (if nwb_data provided or in unit_metadata)
-    - ccf_location           (if nwb_data provided or in unit_metadata)
+    activity_window
+        Tuple (start, end) in seconds defining the time window (relative to `align_to_event`)
+        over which per-trial mean activity is computed for:
+        - per-bin activity summaries (q{b}_* columns)
+        - monotonicity checks (RAW and _gt_thr)
+        - Spearman correlation computations (RAW and _gt_thr)
+        Must satisfy end > start.
 
-    Binning + window config
-    - binning, n_bins_requested, n_bins_effective, bin_edges
-    - activity_window_start, activity_window_end
-    - quantile_stat, ci
-    - monotonic_tol
-    - activity_min_threshold
-    - min_average_firing_rate
-    - avg_firing_rate_window        (average firing rate within activity_window)
+    calculation_min_window
+        Optional tuple (start, end) in seconds defining the time window (relative to `align_to_event`)
+        used ONLY for thresholding/exclusion logic:
+        (1) Applying `activity_min_threshold`: a trial is included in the *_gt_thr analyses if
+            its mean activity in `calculation_min_window` is > `activity_min_threshold`.
+        (2) Applying `min_average_firing_rate`: a unit is excluded entirely if its average
+            activity across trials (mean of per-trial means) in `calculation_min_window` is
+            < `min_average_firing_rate`.
+        If None, defaults to `activity_window`.
+        Must satisfy end > start.
 
-    Trial usage counts
-    - n_trials_used               (after dropna_latent/dropna_activity/bin>=0)
-    - n_trials_used_gt_thr        (above, AND trial_mean_activity > threshold)
+    unit_ids
+        Optional list/array of unit indices to include. If None, all units in `source` are processed.
+        Unit indices must match the `unit_index` coordinate in the PSTH data returned by
+        `load_psth_raster_subset`.
 
-    Per-bin outputs (RAW)
-    - q{b}_n
-    - q{b}_{quantile_stat}_activity
-    - q{b}_trial_mean_activity_list
-    - CI columns depending on ci:
-        * ci="sem": q{b}_sem_activity
-        * ci="iqr": q{b}_q25_activity, q{b}_q75_activity
+    align_to_event
+        Optional name of the alignment event used by `load_psth_raster_subset` (e.g. "stim_onset",
+        "go_cue", etc.). This defines the reference point for `time_window`, `activity_window`,
+        and `calculation_min_window`. If None, uses the default alignment behavior in your loader.
 
-    Per-bin outputs (FILTERED: trial_mean_activity > threshold)
-    - q{b}_n_gt_thr
-    - q{b}_{quantile_stat}_activity_gt_thr
-    - q{b}_trial_mean_activity_list_gt_thr
-    - CI columns with _gt_thr suffix
+    time_window
+        Optional tuple (start, end) in seconds to crop the loaded PSTH/raster in time before any
+        downstream computations. This is passed to `load_psth_raster_subset`.
+        This controls what time samples are available, but DOES NOT by itself define which time
+        range is used for activity summaries (that is `activity_window`) or thresholding
+        (`calculation_min_window`).
+        If provided, it must contain both `activity_window` and `calculation_min_window` ranges;
+        otherwise you may get a “selects no time points” error.
 
-    Detailed monotonic annotation (RAW)
-    - is_monotonic
-    - monotonic_direction                 ("increasing"|"decreasing"|"flat"|...)
-    - monotonic_n_valid_bins
-    - monotonic_check_values              length=n_bins_effective (NaN for empty bins)
-    - monotonic_check_bins_valid          bin indices used in diffs
-    - monotonic_diffs                     successive diffs of valid-bin values
-    - monotonic_violation_count           # of diffs violating increasing/decreasing (tol-aware)
-    - monotonic_violation_diffs           the violating diffs (float)
-    - monotonic_violation_pairs           list of (bin_left, bin_right, diff)
-    - monotonic_direction_increasing_ok   bool
-    - monotonic_direction_decreasing_ok   bool
+    n_bins
+        Requested number of latent bins. Must be >= 2.
+        For quantile binning, the effective number of bins may be smaller due to ties/duplicates
+        (see `duplicates="drop"` behavior); this is recorded in `n_bins_effective`.
 
-    Detailed monotonic annotation (FILTERED)
-    - same fields, suffixed with _gt_thr
+    binning
+        Binning mode for latent values:
+        - "quantile": bins have (approximately) equal counts; uses `pd.qcut(..., duplicates="drop")`
+        - "equal": equal-width bins over [min, max] or `bin_range` if provided
+        Determines how trials are grouped into bins.
 
-    Trial-wise Spearman correlation (RAW and FILTERED)
-    - spearman_rho, spearman_p
-    - spearman_rho_gt_thr, spearman_p_gt_thr
+    bin_range
+        Optional (lo, hi) for equal-width binning when `binning="equal"`.
+        If None, uses (min(latent_values), max(latent_values)) computed after dropping NaNs (if enabled).
+        Ignored when `binning="quantile"`.
 
-    Saving behavior:
-    - If save_path is a file (has suffix), use it directly.
-    - Else if save_filename is provided, save under save_dir (or ".").
-    - Else if save_dir or save_path (directory) is provided, auto-generate filename.
+    quantile_stat
+        Summary statistic computed within each bin from per-trial mean activity:
+        - "mean": uses np.nanmean
+        - "median": uses np.nanmedian
+        This statistic populates q{b}_{quantile_stat}_activity and *_gt_thr counterparts, and
+        is the value sequence used for monotonicity checking.
+
+    ci
+        Uncertainty summary per bin:
+        - "sem": standard error of the mean (std(ddof=1) / sqrt(n)); if n<2, sem=0.0
+        - "iqr": interquartile range (25th and 75th percentiles)
+        - "none": no CI columns are added
+        Controls which CI columns are emitted for RAW and *_gt_thr.
+
+    monotonic_tol
+        Tolerance for the monotonicity check. Successive diffs dv are evaluated as:
+        - increasing ok if dv >= -monotonic_tol
+        - decreasing ok if dv <= +monotonic_tol
+        Larger values allow small violations due to noise to still count as monotonic.
+
+    dropna_latent
+        If True (default), trials with NaN latent values are excluded from all computations.
+        If False and NaNs exist in latent, the function raises (because NaNs cannot be binned).
+
+    dropna_activity
+        If True (default), trials with NaN per-trial mean activity in `activity_window` are excluded
+        from computations (RAW and *_gt_thr summaries/correlations).
+        If False, NaNs may propagate to summaries and reduce valid-bin counts.
+
+    activity_min_threshold
+        Trial exclusion threshold applied in `calculation_min_window`:
+        - A trial is included in *_gt_thr analyses if trial_mean_calc > activity_min_threshold.
+        This affects:
+        - n_trials_used_gt_thr
+        - all *_gt_thr per-bin summaries
+        - is_monotonic_gt_thr / related monotonic annotation fields
+        - spearman_rho_gt_thr / spearman_p_gt_thr
+        Note: the activities summarized in *_gt_thr bins come from `activity_window`, but the
+        inclusion decision comes from `calculation_min_window`.
+
+    min_average_firing_rate
+        Unit exclusion threshold applied in `calculation_min_window`:
+        - Compute avg_firing_rate_window = mean over trials of trial_mean_calc
+            (ignoring NaNs).
+        - If avg_firing_rate_window < min_average_firing_rate, the unit is skipped and
+            does not appear in `unit_df`.
+        This changes the denominator for any downstream “fraction of units” computation
+        performed on `unit_df`.
+
+    session_name
+        Optional session identifier stored in output rows.
+        If None and `nwb_data` is provided, it is derived from `nwb_data.session_id` via
+        `extract_session_name_core`. Otherwise it may remain None.
+
+    latent_name
+        Optional label/name of the latent variable stored in output rows.
+
+    unit_metadata
+        Optional DataFrame with per-unit metadata to attach to each row (e.g. quality metrics,
+        probe info, etc.). Must include a unit identifier column named by `unit_key_in_metadata`.
+
+    unit_key_in_metadata
+        Column name in `unit_metadata` that identifies units (default "unit_index").
+        This column is used to index/join metadata onto output rows.
+
+    nwb_data
+        Optional NWB object. If provided, the function will:
+        - derive a session core id using `extract_session_name_core(nwb_data.session_id)`
+        - call `append_units_locations(nwb_data, session_id_core)` to populate CCF fields
+        - build a per-unit metadata table containing:
+            * brain_region (string)
+            * ccf_location (dict or structured object)
+        and attach these to output rows (also merged with `unit_metadata` if provided).
+
+    consolidated
+        Passed through to `load_psth_raster_subset`. Typically indicates whether to read from a
+        consolidated zarr store (faster metadata access) when applicable.
+
+    save_dir
+        Optional directory to save the output table. Used when `save_filename` is provided or when
+        `save_path` is a directory-like path (no suffix) is not used.
+
+    save_filename
+        Optional output filename (with or without extension). If provided, the table is saved under
+        `save_dir` (or current directory if `save_dir` is None). If no suffix is provided, one is
+        added based on `save_format`.
+
+    save_path
+        Optional path controlling saving behavior:
+        - If it has a file suffix, it is used directly as the output file.
+        - If it has no suffix, it is treated as an output directory and an auto-generated
+            filename is used (based on session/latent/threshold/bins/window and `save_format`).
+
+    save_format
+        Output file format when saving:
+        - "csv": saved with `DataFrame.to_csv(index=False)`
+        - "parquet": saved with `DataFrame.to_parquet(index=False)`
+        Also controls how early-load works when overwrite=False and the file exists.
+
+    overwrite
+        If False and the resolved output file already exists:
+        - the file is loaded from disk and returned immediately (early exit),
+            skipping recomputation.
+        If True, existing files are overwritten.
     """
 
     import math  # Local import to avoid relying on module-level imports
@@ -155,7 +255,14 @@ def summarize_monotonic_unit_df_by_latent_quantile(
 
     thr = float(activity_min_threshold)
     w0, w1 = float(activity_window[0]), float(activity_window[1])
-    min_fr = float(min_average_firing_rate)  # NEW
+
+    # NEW: calculation window for min-threshold and min-average-FR
+    if calculation_min_window is None:
+        cw0, cw1 = w0, w1
+    else:
+        cw0, cw1 = float(calculation_min_window[0]), float(calculation_min_window[1])
+
+    min_fr = float(min_average_firing_rate)
 
     saved_file: Optional[Path] = None
 
@@ -206,13 +313,17 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     if w1 <= w0:
         raise ValueError("`activity_window` must satisfy activity_window[1] > activity_window[0].")
 
+    # NEW: validate calculation window
+    if cw1 <= cw0:
+        raise ValueError("`calculation_min_window` must satisfy calculation_min_window[1] > calculation_min_window[0].")
+
     if n_bins < 2:
         raise ValueError("n_bins must be >= 2.")
 
     if ci not in ("sem", "iqr", "none"):
         raise ValueError("ci must be one of {'sem','iqr','none'}.")
 
-    if min_fr < 0.0:  # NEW
+    if min_fr < 0.0:
         raise ValueError("min_average_firing_rate must be >= 0.")
 
     # -----------------------------
@@ -235,9 +346,7 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             region = ""
             if isinstance(loc, dict):
                 region = str(loc.get("brain_region", "")) if loc.get("brain_region", "") is not None else ""
-            unit_rows.append(
-                {"unit_index": int(u), "brain_region": region, "ccf_location": loc}
-            )
+            unit_rows.append({"unit_index": int(u), "brain_region": region, "ccf_location": loc})
         nwb_meta_df = pd.DataFrame(unit_rows).set_index("unit_index", drop=False)
 
     meta_df: Optional[pd.DataFrame] = None
@@ -298,12 +407,20 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     psth_da = psth_da.isel({trial_dim: pos_idx[keep]})
 
     # -----------------------------
-    # 4) Time mask for trial-mean activity
+    # 4) Time masks for trial-mean activity
     # -----------------------------
-    tmask = (times >= w0) & (times <= w1)
-    if not np.any(tmask):
+    tmask_activity = (times >= w0) & (times <= w1)
+    if not np.any(tmask_activity):
         raise ValueError(
             f"`activity_window`={activity_window} selects no time points. "
+            f"Dataset time range is [{float(np.nanmin(times)):.3f}, {float(np.nanmax(times)):.3f}]."
+        )
+
+    # NEW: separate window for thresholding and min-average-FR
+    tmask_calc = (times >= cw0) & (times <= cw1)
+    if not np.any(tmask_calc):
+        raise ValueError(
+            f"`calculation_min_window`={(cw0, cw1)} selects no time points. "
             f"Dataset time range is [{float(np.nanmin(times)):.3f}, {float(np.nanmax(times)):.3f}]."
         )
 
@@ -554,27 +671,38 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         upos = int(where[0])
 
         unit_psth_np = np.asarray(psth_da.isel(unit=upos).values, dtype=np.float64)
-        trial_mean = np.nanmean(unit_psth_np[:, tmask], axis=1)
 
-        # NEW: exclude low-firing units based on average firing rate in the window
-        avg_fr_window = float(np.nanmean(trial_mean[np.isfinite(trial_mean)])) if np.any(np.isfinite(trial_mean)) else np.nan
+        # Activity used for per-bin summaries/monotonicity (activity_window)
+        trial_mean_activity = np.nanmean(unit_psth_np[:, tmask_activity], axis=1)
+
+        # NEW: activity used for thresholding and min_average_firing_rate (calculation_min_window)
+        trial_mean_calc = np.nanmean(unit_psth_np[:, tmask_calc], axis=1)
+
+        # NEW: exclude low-firing units based on calc-window average firing rate
+        avg_fr_window = (
+            float(np.nanmean(trial_mean_calc[np.isfinite(trial_mean_calc)]))
+            if np.any(np.isfinite(trial_mean_calc))
+            else np.nan
+        )
         if np.isfinite(min_fr) and (min_fr > 0.0):
             if (not np.isfinite(avg_fr_window)) or (avg_fr_window < min_fr):
                 continue
 
-        ok_raw = np.ones(trial_mean.shape[0], dtype=bool)
+        ok_raw = np.ones(trial_mean_activity.shape[0], dtype=bool)
         if dropna_latent:
             ok_raw &= np.isfinite(lat)
         ok_raw &= (bin_idx >= 0)
         if dropna_activity:
-            ok_raw &= np.isfinite(trial_mean)
+            ok_raw &= np.isfinite(trial_mean_activity)
 
         lat_ok = lat[ok_raw]
         bin_ok = bin_idx[ok_raw]
-        act_ok = trial_mean[ok_raw]
-        ok_thr = ok_raw & np.isfinite(trial_mean) & (trial_mean > thr)
+        act_ok = trial_mean_activity[ok_raw]
+
+        # NEW: threshold decision uses calc-window values, but selected trials keep activity-window values
+        ok_thr = ok_raw & np.isfinite(trial_mean_calc) & (trial_mean_calc > thr)
         lat_ok_thr = lat[ok_thr]
-        act_ok_thr = trial_mean[ok_thr]
+        act_ok_thr = trial_mean_activity[ok_thr]
 
         bin_idx_thr_local, bin_edges_thr, n_bins_effective_thr = _build_bins_for_latent_values(
             lat_ok_thr,
@@ -623,8 +751,12 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             "session_name": session_name,
             "latent_name": latent_name,
             "activity_min_threshold": float(thr),
-            "min_average_firing_rate": float(min_fr),  # NEW
-            "avg_firing_rate_window": float(avg_fr_window),  # NEW
+            "min_average_firing_rate": float(min_fr),
+            "avg_firing_rate_window": float(avg_fr_window),
+
+            # NEW: store calculation window used for thresholding / min-FR
+            "calculation_window_start": float(cw0),
+            "calculation_window_end": float(cw1),
 
             "n_trials_used": int(act_ok.size),
             "n_trials_used_gt_thr": int(act_ok_thr.size),
@@ -632,8 +764,10 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             "n_bins_requested": int(n_bins),
             "n_bins_effective": int(n_bins_effective),
             "binning": str(binning),
+
             "activity_window_start": float(w0),
             "activity_window_end": float(w1),
+
             "quantile_stat": str(quantile_stat),
             "ci": str(ci),
             "monotonic_tol": float(monotonic_tol),
@@ -746,6 +880,7 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         print(f"Saved unit_df to: {saved_file}")
 
     return unit_df, saved_file
+
 
 
 

@@ -1,37 +1,39 @@
-# ------------------------------
+# ============================================================
 # Standard library
-# ------------------------------
-import os
+# ============================================================
 import io
 import json
 import math
+import os
+import time
+from contextlib import redirect_stderr, redirect_stdout
+from http.client import RemoteDisconnected
 from pathlib import Path
-from contextlib import redirect_stdout, redirect_stderr
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-# ------------------------------
+# ============================================================
 # Third-party libraries
-# ------------------------------
-import requests
+# ============================================================
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import requests
+from requests.exceptions import ConnectionError
 
-# ------------------------------
-# Project / local imports
-# ------------------------------
-from general_utils import (
-    format_session_name,
-    extract_session_name_core,
-    smart_read_csv,
-    extract_ID_Date,
-)
-
-from nwb_utils import NWBUtils
-from model_fitting import fit_q_learning_model
+# ============================================================
+# Project / Local imports
+# ============================================================
 from aind_analysis_arch_result_access.han_pipeline import (
     get_mle_model_fitting as _orig_get_mle_model_fitting,
 )
+from general_utils import (
+    extract_ID_Date,
+    extract_session_name_core,
+    format_session_name,
+    smart_read_csv,
+)
+from model_fitting import fit_q_learning_model
+from nwb_utils import NWBUtils
 
 
 
@@ -238,43 +240,246 @@ def extract_event_timestamps(
 
     raise ValueError(f"Unsupported event '{event_name}'")
 
+
+
 def get_fitted_model_names(
-    session_name: str
-) -> List[str]:
+    session_name: str,
+    *,
+    max_retries: int = 3,
+    base_delay: float = 2.0,
+) -> Optional[List[str]]:
     """
-    Retrieve all available fitted model aliases for a given NWB session,
-    using the local `get_mle_model_fitting(...)` helper.
+    Retrieve all available fitted model aliases for a given NWB session.
+
+    This function includes retry logic for transient network failures
+    such as ConnectionError or RemoteDisconnected.
 
     Parameters
     ----------
     session_name : str
-        The NWB session name, e.g. "744329_2024-11-25_12-13-37.nwb".
+        The NWB session name (e.g., "744329_2024-11-25_12-13-37.nwb").
+
+    max_retries : int, optional (default=3)
+        Maximum number of retry attempts if a network-related error occurs.
+
+    base_delay : float, optional (default=2.0)
+        Base delay in seconds used for exponential backoff.
+        Actual sleep time = base_delay * (2 ** (attempt - 1)).
 
     Returns
     -------
-    List[str]
-        A list of unique model_alias strings found in the fit results.
+    Optional[List[str]]
+        List of unique model alias names if available.
+        Returns None if no fitting results exist.
 
     Raises
     ------
     ValueError
-        If `session_name` is empty, cannot be parsed, or no fit results exist.
+        If session_name is empty or cannot be parsed.
+
+    Exception
+        Re-raises the final exception if all retries fail.
     """
+
+    # ------------------------------------------------------------
+    # Validate input
+    # ------------------------------------------------------------
     if not session_name:
         raise ValueError("The 'session_name' parameter cannot be empty.")
 
-    # Normalize & parse
+    # ------------------------------------------------------------
+    # Parse subject_id and session_date from session_name
+    # ------------------------------------------------------------
+    subject_id, session_date = extract_ID_Date(session_name) or (None, None)
+
+    if subject_id is None or session_date is None:
+        raise ValueError(
+            f"Could not parse subject ID & date from '{session_name}'"
+        )
+
+    # ------------------------------------------------------------
+    # Attempt to fetch model-fitting results with retry logic
+    # ------------------------------------------------------------
+    last_exception = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Call external data source (likely network-dependent)
+            df = get_mle_model_fitting(
+                subject_id=subject_id,
+                session_date=session_date,
+            )
+
+            # If successful, exit retry loop
+            break
+
+        except (ConnectionError, RemoteDisconnected) as e:
+            # Store exception for potential re-raise
+            last_exception = e
+
+            print(
+                f"[Attempt {attempt}/{max_retries}] "
+                f"Network failure for session {session_name}: {e}"
+            )
+
+            # If not last attempt, wait using exponential backoff
+            if attempt < max_retries:
+                sleep_time = base_delay * (2 ** (attempt - 1))
+                time.sleep(sleep_time)
+            else:
+                # All retries exhausted — re-raise last exception
+                raise
+
+        except Exception:
+            # Do NOT retry unknown errors
+            # This avoids masking real logic or data bugs
+            raise
+
+    # ------------------------------------------------------------
+    # Handle empty or missing results
+    # ------------------------------------------------------------
+    if df is None or df.empty:
+        print(
+            f"No model-fitting results found "
+            f"for subject {subject_id} on {session_date}"
+        )
+        return None
+
+    # ------------------------------------------------------------
+    # Determine which column contains model alias
+    # Different versions of pipeline may store alias differently
+    # ------------------------------------------------------------
+    if "agent_alias" in df.columns:
+        alias_col = "agent_alias"
+
+    elif "analysis_results.fit_settings.agent_alias" in df.columns:
+        alias_col = "analysis_results.fit_settings.agent_alias"
+
+    else:
+        raise ValueError(
+            "Could not find alias column in fit-results DataFrame"
+        )
+
+    # ------------------------------------------------------------
+    # Return unique alias names
+    # dropna() removes invalid entries
+    # unique() ensures no duplicates
+    # ------------------------------------------------------------
+    return df[alias_col].dropna().unique().tolist()
+
+
+
+
+
+def get_fitted_latent(
+    session_name: str,
+    model_alias: Optional[str] = None,
+    *,
+    max_retries: int = 3,
+    base_delay: float = 2.0,
+) -> Union[pd.DataFrame, Dict[str, Any], None]:
+    """
+    Retrieve fitted latent variables (and parameters) for a specific model
+    in a given NWB session, with retry logic for transient network failures.
+
+    If model_alias is None:
+        Returns the full fit-results DataFrame.
+    If model_alias is provided:
+        Returns a dict with keys:
+          - "params": fitted parameters (usually a dict-like object)
+          - "fitted_latent_variables": latent variables (dict/arrays/lists)
+          - "results": the full selected row (pandas Series)
+
+    Parameters
+    ----------
+    session_name : str
+        NWB session name, e.g. "744329_2024-11-25_12-13-37.nwb".
+    model_alias : Optional[str]
+        Model alias to filter for. If None, returns full DataFrame.
+    max_retries : int
+        Max retry attempts for network-related errors when fetching results.
+    base_delay : float
+        Base delay for exponential backoff:
+            sleep = base_delay * (2 ** (attempt - 1))
+
+    Returns
+    -------
+    Union[pandas.DataFrame, Dict[str, Any], None]
+        - DataFrame if model_alias is None
+        - Dict if model_alias is provided and found
+        - None if no data found (empty results or alias not found)
+
+    Raises
+    ------
+    ValueError
+        If session_name is empty or alias column cannot be determined.
+    Exception
+        Re-raises the final exception if network failures persist after retries.
+    """
+
+    # ------------------------------------------------------------
+    # Validate input
+    # ------------------------------------------------------------
+    if not session_name:
+        raise ValueError("The 'session_name' parameter cannot be empty.")
+
+    # ------------------------------------------------------------
+    # Parse subject ID and session date from the session name
+    # ------------------------------------------------------------
     subject_id, session_date = extract_ID_Date(session_name) or (None, None)
     if subject_id is None or session_date is None:
-        raise ValueError(f"Could not parse subject ID & date from '{session_name}'")
+        # Keep this as a soft failure to match your original behavior
+        print(f"Could not parse subject ID & date from '{session_name}'")
+        return None
 
-    # Fetch all fits for this session
-    df = get_mle_model_fitting(subject_id=subject_id, session_date=session_date)
+    # ------------------------------------------------------------
+    # Fetch all fits for this subject & date with retry logic
+    # Only retry on network-related errors. Do not retry other exceptions.
+    # ------------------------------------------------------------
+    last_exception = None
+    df = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            df = get_mle_model_fitting(subject_id=subject_id, session_date=session_date)
+            break  # Success
+
+        except (ConnectionError, RemoteDisconnected) as e:
+            last_exception = e
+            print(
+                f"[Attempt {attempt}/{max_retries}] "
+                f"Network failure fetching fits for {session_name}: {e}"
+            )
+
+            # Exponential backoff before retrying
+            if attempt < max_retries:
+                sleep_time = base_delay * (2 ** (attempt - 1))
+                time.sleep(sleep_time)
+            else:
+                # Retries exhausted: re-raise to make failure explicit
+                raise
+
+        except Exception:
+            # Any other error is likely not transient; surface it immediately
+            raise
+
+    # ------------------------------------------------------------
+    # Handle missing/empty results
+    # ------------------------------------------------------------
     if df is None or df.empty:
         print(f"No model-fitting results for subject {subject_id} on {session_date}")
         return None
 
-    # Determine which column holds the alias
+    # ------------------------------------------------------------
+    # If no alias requested, return the entire DataFrame
+    # ------------------------------------------------------------
+    if model_alias is None:
+        return df
+
+    # ------------------------------------------------------------
+    # Determine which column contains the model alias
+    # Support multiple possible column names for compatibility.
+    # ------------------------------------------------------------
     if "agent_alias" in df.columns:
         alias_col = "agent_alias"
     elif "analysis_results.fit_settings.agent_alias" in df.columns:
@@ -282,83 +487,59 @@ def get_fitted_model_names(
     else:
         raise ValueError("Could not find alias column in fit-results DataFrame")
 
-    # Return unique aliases
-    return df[alias_col].dropna().unique().tolist()
-
-def get_fitted_latent(
-    session_name: str,
-    model_alias: Optional[str] = None
-) -> Union[pd.DataFrame, Dict[str, Any]]:
-    """
-    Retrieve fitted latent variables (and parameters) for a specific model
-    in a given NWB session, or—if model_alias is None—return the full fit-results DataFrame.
-
-    Parameters
-    ----------
-    session_name : str
-        The NWB session name, e.g. "744329_2024-11-25_12-13-37.nwb".
-    model_alias : str, optional
-        If provided, filters to this model alias and returns a dict:
-          { "params": ..., "fitted_latent_variables": ... }.
-        If None, returns the entire fit-results DataFrame.
-
-    Returns
-    -------
-    pandas.DataFrame
-        If model_alias is None, the full DataFrame from get_mle_model_fitting().
-    dict
-        If model_alias is provided, a dict with keys:
-          - "params": model-fitted parameters (dict)
-          - "fitted_latent_variables": latent variables (dict of arrays/lists)
-
-    Raises
-    ------
-    ValueError
-        If session_name is empty, parse fails, no fit-results exist, or
-        if the specified alias isn’t found (when model_alias is not None).
-    """
-    if not session_name:
-        raise ValueError("The 'session_name' parameter cannot be empty.")
-
-    # parse subject ID and date from the session name
-    subject_id, session_date = extract_ID_Date(session_name) or (None, None)
-    if subject_id is None or session_date is None:
-        print(f"Could not parse subject ID & date from '{session_name}'")
-        return None
-
-    # fetch all fits for this subject & date   
-    df = get_mle_model_fitting(subject_id=subject_id, session_date=session_date)
-    if df is None or df.empty:
-        print(f"No model‐fitting results for subject {subject_id} on {session_date}")
-        return None
-
-    # if no alias requested, return full DataFrame
-    if model_alias is None:
-        return df
-
-    # otherwise, find and return the specific model
-    if "agent_alias" in df.columns:
-        alias_col = "agent_alias"
-    elif "analysis_results.fit_settings.agent_alias" in df.columns:
-        alias_col = "analysis_results.fit_settings.agent_alias"
-    else:
-        raise ValueError("Could not find alias column in fit‐results DataFrame")
-
+    # ------------------------------------------------------------
+    # Filter to the requested model alias
+    # ------------------------------------------------------------
     sel = df[df[alias_col] == model_alias]
     if sel.empty:
         print(f"No entries for alias '{model_alias}' in fit results")
         return None
 
+    # ------------------------------------------------------------
+    # Select the first matching row
+    # If you expect multiple fits per alias, you can change the selection logic
+    # (e.g., choose best log-likelihood if such a column exists).
+    # ------------------------------------------------------------
     row = sel.iloc[0]
-    try:
-        return {
-            "params": row["params"],
-            "fitted_latent_variables": row["latent_variables"],
-            "results": row
-        }
-    except KeyError:
-        print("Fit‐results DataFrame missing 'params' or 'latent_variables' columns")
+
+    # ------------------------------------------------------------
+    # Extract fields with compatibility fallbacks
+    # Some pipelines may store these under different keys.
+    # ------------------------------------------------------------
+    # Primary expected columns
+    params_col_candidates = ["params", "fitted_params", "analysis_results.params"]
+    latent_col_candidates = ["latent_variables", "fitted_latent_variables", "analysis_results.latent_variables"]
+
+    params_val = None
+    for c in params_col_candidates:
+        if c in sel.columns:
+            params_val = row[c]
+            break
+
+    latent_val = None
+    for c in latent_col_candidates:
+        if c in sel.columns:
+            latent_val = row[c]
+            break
+
+    if params_val is None or latent_val is None:
+        print(
+            "Fit-results DataFrame missing required columns for output. "
+            f"Found params={params_val is not None}, latent={latent_val is not None}. "
+            f"Available columns: {list(sel.columns)}"
+        )
         return None
+
+    # ------------------------------------------------------------
+    # Return a structured output
+    # - "results" gives full row for downstream debugging/metadata
+    # ------------------------------------------------------------
+    return {
+        "params": params_val,
+        "fitted_latent_variables": latent_val,
+        "results": row,
+    }
+
 
 
 
