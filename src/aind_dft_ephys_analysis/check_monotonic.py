@@ -3,7 +3,11 @@ from __future__ import annotations
 # ==============================
 # Standard library
 # ==============================
+import ast
+import concurrent.futures as cf
 import math
+import os
+import re
 from pathlib import Path
 from typing import (
     Any,
@@ -17,7 +21,7 @@ from typing import (
 )
 
 # ==============================
-# Third-party
+# Third-party libraries
 # ==============================
 import numpy as np
 import pandas as pd
@@ -26,12 +30,12 @@ import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 
 # ==============================
-# Local imports
+# Local / project imports
 # ==============================
+from average_psth import _find_psth_zarr_for_session
 from create_psth import load_psth_raster_subset
 from ephys_utils import append_units_locations
 from general_utils import extract_session_name_core
-
 
 
 def summarize_monotonic_unit_df_by_latent_quantile(
@@ -1443,3 +1447,519 @@ def show_unit_figures_from_df_inline(
             print("  ", p)
 
     return opened
+
+
+
+
+
+def _parse_trial_ids(x: Any) -> np.ndarray:
+    """
+    Parse a "trial ids" cell from combined_df into a 1D int numpy array.
+
+    This helper exists because combined_df may store trial-id lists in multiple formats:
+      - list[int] / tuple[int] / np.ndarray[int]
+      - stringified Python list/tuple, e.g. "[1, 2, 3]" or "(1, 2, 3)"
+      - comma/space-separated strings, e.g. "1,2,3" or "1 2 3"
+      - empty / None / NaN
+
+    Parameters
+    ----------
+    x : Any
+        A single cell value from combined_df, expected to represent trial ids.
+
+    Returns
+    -------
+    trial_ids : numpy.ndarray
+        1D array of dtype int. May be empty if parsing fails or the input is empty.
+
+    Notes
+    -----
+    - If a string cannot be parsed as a literal list/tuple, we fall back to extracting
+      integers by regex (robust to malformed strings).
+    - All outputs are flattened to 1D.
+    """
+    if x is None:
+        return np.asarray([], dtype=int)
+    if isinstance(x, float) and np.isnan(x):
+        return np.asarray([], dtype=int)
+
+    # Already array-like
+    if isinstance(x, (list, tuple, np.ndarray)):
+        arr = np.asarray(x).ravel()
+        return arr.astype(int, copy=False) if arr.size else np.asarray([], dtype=int)
+
+    # String-like
+    if isinstance(x, str):
+        s = x.strip()
+        if s == "" or s.lower() in {"nan", "none", "null"}:
+            return np.asarray([], dtype=int)
+
+        # Stringified python list/tuple
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
+            try:
+                obj = ast.literal_eval(s)
+                arr = np.asarray(obj).ravel()
+                return arr.astype(int, copy=False) if arr.size else np.asarray([], dtype=int)
+            except Exception:
+                pass
+
+        # Fallback: extract all integers
+        nums = re.findall(r"-?\d+", s)
+        return np.asarray([int(n) for n in nums], dtype=int) if nums else np.asarray([], dtype=int)
+
+    # Last resort
+    try:
+        arr = np.asarray(x).ravel()
+        return arr.astype(int, copy=False) if arr.size else np.asarray([], dtype=int)
+    except Exception:
+        return np.asarray([], dtype=int)
+
+
+def _compute_session_outputs(
+    session_id: str,
+    g: pd.DataFrame,
+    *,
+    session_col: str,
+    unit_col: str,
+    psth_root: Union[str, Path],
+    align_to_event: Optional[str],
+    time_window: Optional[Tuple[float, float]],
+    baseline_window: Tuple[float, float],
+    bin_size_label: str,
+    consolidated: bool,
+    q_list: List[int],
+    q_cols: Dict[int, str],
+    q_gt_cols: Dict[int, str],
+    quantile_prefix: str,
+) -> Tuple[str, Dict[Any, Dict[str, np.ndarray]], np.ndarray]:
+    """
+    Compute (mean_rate, zscore) PSTHs for all rows belonging to ONE session.
+
+    This function is intended to run inside a separate process (ProcessPoolExecutor).
+    It loads PSTH Zarr once for the session, then iterates over rows and quantiles.
+
+    Parameters
+    ----------
+    session_id : str
+        Session identifier (e.g. "ecephys_764769_2024-12-13_15-41-07...").
+        Used to locate the session-specific PSTH Zarr via `_find_psth_zarr_for_session`.
+
+    g : pandas.DataFrame
+        Sub-DataFrame containing only rows for this session.
+        Must include:
+          - unit_col
+          - quantile trial id columns (q#_trial_ids and/or q#_trial_ids_gt_thr)
+
+    session_col : str
+        Name of the session column in the original df. Not strictly used here for logic,
+        but kept for signature consistency and future-proofing.
+
+    unit_col : str
+        Column holding the integer unit index within the session.
+        Must match the PSTH Zarr "unit_index" coordinate.
+
+    psth_root : str | Path
+        Root directory where session-specific PSTH Zarr folders live.
+
+    align_to_event : str | None
+        Event name used for alignment ("go_cue", etc.). Passed to `load_psth_raster_subset`.
+
+    time_window : (float, float) | None
+        Time window in seconds relative to align_to_event. Passed to `load_psth_raster_subset`.
+        If None, uses the full stored time axis.
+
+    baseline_window : (float, float)
+        Time window used for baseline statistics for z-scoring.
+        Must overlap with the PSTH time axis; otherwise ValueError is raised.
+
+    bin_size_label : str
+        Identifies which PSTH Zarr to load (e.g. "0.2s").
+
+    consolidated : bool
+        Passed through to the Zarr/xarray loader; True is usually faster.
+
+    q_list : list[int]
+        Quantile indices discovered in the parent function (e.g. [0,1,2,3]).
+
+    q_cols : dict[int, str]
+        Mapping q -> column name for raw trial ids (e.g. 0 -> "q0_trial_ids").
+
+    q_gt_cols : dict[int, str]
+        Mapping q -> column name for thresholded trial ids (e.g. 0 -> "q0_trial_ids_gt_thr").
+
+    quantile_prefix : str
+        Prefix used for output column naming (default "q").
+
+    Returns
+    -------
+    session_id : str
+        Echoed back for bookkeeping.
+
+    per_row_outputs : dict
+        Mapping:
+            {row_index: {output_col_name: np.ndarray}}
+
+        Example output_col_names for q=3:
+            "q3_mean_rate"
+            "q3_zscore"
+            "q3_mean_rate_gt_thr"
+            "q3_zscore_gt_thr"
+
+        Arrays are 1D shape (T,) where T is the time axis length.
+
+    times : numpy.ndarray
+        The PSTH time axis for this session (1D shape (T,)).
+        Used by the parent function to enforce a shared time axis across sessions.
+
+    Notes
+    -----
+    Performance:
+      - PSTH is loaded ONCE per session (good).
+      - A mask cache is used to avoid repeated np.isin for identical trial-id sets.
+      - Unit index -> position lookup is precomputed to avoid np.where in inner loops.
+    """
+    # Local imports inside worker to ensure availability in child processes
+    from average_psth import _find_psth_zarr_for_session
+    from create_psth import load_psth_raster_subset
+
+    unit_indices = g[unit_col].astype(int).unique().tolist()
+    if len(unit_indices) == 0:
+        return session_id, {}, np.asarray([])
+
+    # Union trials across all rows and all q columns in this session
+    all_trials: List[int] = []
+    for _, row in g.iterrows():
+        for q in q_list:
+            if q in q_cols:
+                all_trials.extend(_parse_trial_ids(row.get(q_cols[q], None)).tolist())
+            if q in q_gt_cols:
+                all_trials.extend(_parse_trial_ids(row.get(q_gt_cols[q], None)).tolist())
+
+    if len(all_trials) == 0:
+        return session_id, {}, np.asarray([])
+
+    all_trial_ids = np.unique(np.asarray(all_trials, dtype=int))
+
+    # Load PSTH subset once per session: units x trials x time
+    psth_path: Path = _find_psth_zarr_for_session(
+        session_id=session_id,
+        psth_root=Path(psth_root),
+        bin_size_label=bin_size_label,
+    )
+
+    psth_da, _ = load_psth_raster_subset(
+        psth_path,
+        trial_ids=all_trial_ids,
+        unit_ids=unit_indices,
+        align_to_event=align_to_event,
+        time_window=time_window,
+        consolidated=consolidated,
+    )
+
+    trial_dim = next(d for d in psth_da.dims if d.startswith("trial_"))
+    trial_coord_name = next(c for c in psth_da.coords if c.startswith("trial_index_"))
+    unit_coord_name = "unit_index"
+
+    trial_ids_in_ds = psth_da.coords[trial_coord_name].values.astype(int)
+    unit_ids_in_ds = psth_da.coords[unit_coord_name].values.astype(int)
+    times = psth_da.coords["time"].values
+
+    baseline_mask = (times >= baseline_window[0]) & (times < baseline_window[1])
+    if not baseline_mask.any():
+        raise ValueError(
+            f"Baseline window {baseline_window} does not overlap with "
+            f"the PSTH time axis [{times[0]:.3f}, {times[-1]:.3f}]."
+        )
+
+    # Cache np.isin masks for repeated trial-id sets
+    mask_cache: Dict[Tuple[str, Tuple[int, ...]], np.ndarray] = {}
+
+    def _get_mask(cond_ids: np.ndarray) -> Optional[np.ndarray]:
+        if cond_ids.size == 0:
+            return None
+        key = ("ids", tuple(cond_ids.tolist()))
+        m = mask_cache.get(key)
+        if m is None:
+            m = np.isin(trial_ids_in_ds, cond_ids)
+            mask_cache[key] = m
+        return m if m.any() else None
+
+    def _mean_and_z(unit_psth_all: xr.DataArray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        unit_psth = unit_psth_all.isel({trial_dim: mask})
+        data = unit_psth.values
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
+
+        mean_rate = np.nanmean(data, axis=0)
+
+        baseline_vals = data[:, baseline_mask].reshape(-1)
+        baseline_mean = np.nanmean(baseline_vals)
+        baseline_std = np.nanstd(baseline_vals, ddof=1)
+
+        if baseline_std <= 0 or not np.isfinite(baseline_std):
+            z = np.zeros_like(mean_rate)
+        else:
+            z = (mean_rate - baseline_mean) / baseline_std
+
+        return mean_rate, z
+
+    # Map unit_index -> position to avoid np.where repeatedly
+    unit_pos_map = {int(u): int(i) for i, u in enumerate(unit_ids_in_ds.tolist())}
+
+    per_row: Dict[Any, Dict[str, np.ndarray]] = {}
+
+    for idx, row in g.iterrows():
+        u = int(row[unit_col])
+        if u not in unit_pos_map:
+            continue
+
+        unit_psth_all = psth_da.isel(unit=unit_pos_map[u])
+        out_cols: Dict[str, np.ndarray] = {}
+
+        for q in q_list:
+            if q in q_cols:
+                ids = _parse_trial_ids(row.get(q_cols[q], None))
+                m = _get_mask(ids)
+                if m is not None:
+                    mean_rate, z = _mean_and_z(unit_psth_all, m)
+                    out_cols[f"{quantile_prefix}{q}_mean_rate"] = mean_rate
+                    out_cols[f"{quantile_prefix}{q}_zscore"] = z
+
+            if q in q_gt_cols:
+                ids_gt = _parse_trial_ids(row.get(q_gt_cols[q], None))
+                m_gt = _get_mask(ids_gt)
+                if m_gt is not None:
+                    mean_rate_gt, z_gt = _mean_and_z(unit_psth_all, m_gt)
+                    out_cols[f"{quantile_prefix}{q}_mean_rate_gt_thr"] = mean_rate_gt
+                    out_cols[f"{quantile_prefix}{q}_zscore_gt_thr"] = z_gt
+
+        if out_cols:
+            per_row[idx] = out_cols
+
+    return session_id, per_row, times
+
+
+def append_average_psth_from_combined_df_parallel(
+    combined_df: pd.DataFrame,
+    *,
+    session_col: str = "session_name",
+    unit_col: str = "unit_index",
+    psth_root: Union[str, Path] = "/root/capsule/scratch/psth_results/",
+    align_to_event: Optional[str] = "go_cue",
+    time_window: Optional[Tuple[float, float]] = (-3.0, 5.0),
+    baseline_window: Tuple[float, float] = (-0.5, 0.0),
+    bin_size_label: str = "0.2s",
+    consolidated: bool = True,
+    quantile_prefix: str = "q",
+    add_time_column: bool = False,
+    time_col_name: str = "psth_time",
+    max_workers: Optional[int] = None,
+    show_progress: bool = True,
+) -> Tuple[pd.DataFrame, np.ndarray]:
+    """
+    Parallel append of average PSTH / z-scored PSTH into combined_df.
+
+    Parallelization strategy:
+      - One process per session (recommended axis), because each session requires
+        independent Zarr reads and produces independent outputs.
+      - This avoids repeatedly loading PSTH per unit and avoids trying to share
+        large xarray objects across workers.
+
+    Parameters
+    ----------
+    combined_df : pandas.DataFrame
+        Input DataFrame with many rows (units). Must contain:
+          - session_col (default "session_name")
+          - unit_col (default "unit_index")
+          - quantile trial id columns:
+              f"{quantile_prefix}{q}_trial_ids"
+              and optionally f"{quantile_prefix}{q}_trial_ids_gt_thr"
+
+        Cells in trial-id columns may be list/ndarray or stringified lists.
+        The function uses `_parse_trial_ids` to normalize them.
+
+    session_col : str, default="session_name"
+        Column name identifying the session. Used for grouping and session-batching.
+
+    unit_col : str, default="unit_index"
+        Column name identifying unit index in the session. Must match PSTH Zarr unit coordinate.
+
+    psth_root : str | Path, default="/root/capsule/scratch/psth_results/"
+        Root directory containing PSTH Zarr folders per session.
+
+    align_to_event : str | None, default="go_cue"
+        Alignment event used during PSTH extraction. Passed to loader.
+
+    time_window : (float, float) | None, default=(-3.0, 5.0)
+        Time window in seconds. Passed to loader to slice time.
+
+    baseline_window : (float, float), default=(-0.5, 0.0)
+        Baseline window used for z-scoring. Must overlap with time axis.
+
+    bin_size_label : str, default="0.2s"
+        Encodes the bin size in PSTH Zarr naming. Used by `_find_psth_zarr_for_session`.
+
+    consolidated : bool, default=True
+        Use consolidated metadata when reading Zarr (faster).
+
+    quantile_prefix : str, default="q"
+        Prefix used to discover quantile columns and to name output columns.
+
+    add_time_column : bool, default=False
+        If True, adds a column named time_col_name where every row stores the shared time array.
+
+    time_col_name : str, default="psth_time"
+        Output column name used when add_time_column=True.
+
+    max_workers : int | None, default=None
+        Number of worker processes.
+
+        If None:
+          - uses max(1, os.cpu_count() - 1) to leave one core free.
+
+        Guidance:
+          - If storage is slow/networked, too many workers can hurt (I/O contention).
+          - Often 4–8 is a good starting point.
+
+    show_progress : bool, default=True
+        If True, show a progress bar over completed sessions using tqdm (if installed).
+        If tqdm is not installed, falls back to simple printing.
+
+    Returns
+    -------
+    df_out : pandas.DataFrame
+        Copy of combined_df with new object-dtype columns appended:
+          - f"{quantile_prefix}{q}_mean_rate"
+          - f"{quantile_prefix}{q}_zscore"
+          - f"{quantile_prefix}{q}_mean_rate_gt_thr"
+          - f"{quantile_prefix}{q}_zscore_gt_thr"
+
+        Each cell is either:
+          - np.ndarray shape (T,) if computed
+          - None if unavailable / empty trials / missing data
+
+    common_time : numpy.ndarray
+        Shared time axis (shape (T,)).
+
+    Raises
+    ------
+    ValueError
+        - If no quantile trial-id columns are found.
+        - If baseline_window does not overlap time axis.
+        - If time axes differ across sessions.
+
+    RuntimeError
+        If no PSTH data could be loaded across all sessions.
+    """
+    # Optional tqdm progress
+    tqdm = None
+    if show_progress:
+        try:
+            from tqdm.auto import tqdm as _tqdm  # type: ignore
+            tqdm = _tqdm
+        except Exception:
+            tqdm = None
+
+    df_out = combined_df.copy()
+
+    # Discover quantile columns
+    q_trial_pat = re.compile(rf"^{re.escape(quantile_prefix)}(\d+)_trial_ids$")
+    q_trial_gt_pat = re.compile(rf"^{re.escape(quantile_prefix)}(\d+)_trial_ids_gt_thr$")
+
+    q_nums: set[int] = set()
+    q_cols: Dict[int, str] = {}
+    q_gt_cols: Dict[int, str] = {}
+
+    for c in df_out.columns:
+        m = q_trial_pat.match(c)
+        if m:
+            q = int(m.group(1))
+            q_nums.add(q)
+            q_cols[q] = c
+            continue
+        m2 = q_trial_gt_pat.match(c)
+        if m2:
+            q = int(m2.group(1))
+            q_nums.add(q)
+            q_gt_cols[q] = c
+
+    if not q_nums:
+        raise ValueError(
+            "No quantile trial-id columns found. Expected columns like "
+            f"'{quantile_prefix}0_trial_ids' and/or '{quantile_prefix}0_trial_ids_gt_thr'."
+        )
+
+    q_list = sorted(q_nums)
+
+    # Create object columns up-front so assigning np.ndarray per cell works
+    n_rows = len(df_out)
+    for q in q_list:
+        df_out[f"{quantile_prefix}{q}_mean_rate"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
+        df_out[f"{quantile_prefix}{q}_zscore"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
+        df_out[f"{quantile_prefix}{q}_mean_rate_gt_thr"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
+        df_out[f"{quantile_prefix}{q}_zscore_gt_thr"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
+
+    # Group by session; each session becomes one worker task
+    grouped = [(sid, g.copy()) for sid, g in df_out.groupby(session_col, sort=False)]
+
+    if max_workers is None:
+        max_workers = max(1, (os.cpu_count() or 2) - 1)
+
+    common_time: Optional[np.ndarray] = None
+
+    # Submit tasks
+    with cf.ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futures = [
+            ex.submit(
+                _compute_session_outputs,
+                sid,
+                g,
+                session_col=session_col,
+                unit_col=unit_col,
+                psth_root=psth_root,
+                align_to_event=align_to_event,
+                time_window=time_window,
+                baseline_window=baseline_window,
+                bin_size_label=bin_size_label,
+                consolidated=consolidated,
+                q_list=q_list,
+                q_cols=q_cols,
+                q_gt_cols=q_gt_cols,
+                quantile_prefix=quantile_prefix,
+            )
+            for sid, g in grouped
+        ]
+
+        # Progress over completed futures
+        done_iter = cf.as_completed(futures)
+        if tqdm is not None:
+            done_iter = tqdm(done_iter, total=len(futures), desc="Sessions (completed)")
+        else:
+            print(f"[INFO] Submitted {len(futures)} session jobs with max_workers={max_workers}")
+
+        for fut in done_iter:
+            sid, per_row, times = fut.result()
+            if times.size == 0:
+                continue
+
+            if common_time is None:
+                common_time = times.copy()
+            else:
+                if len(times) != len(common_time) or not np.allclose(times, common_time):
+                    raise ValueError("Time axis differs between sessions.")
+
+            # Apply results back into df_out
+            for idx, cols in per_row.items():
+                for colname, arr in cols.items():
+                    df_out.at[idx, colname] = arr
+
+    if common_time is None:
+        raise RuntimeError("No PSTH data found/loaded. Check your trial-id columns and PSTH root paths.")
+
+    if add_time_column:
+        df_out[time_col_name] = [common_time] * len(df_out)
+
+    return df_out, common_time
+
+
+

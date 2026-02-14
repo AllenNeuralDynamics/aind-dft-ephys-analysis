@@ -11,7 +11,7 @@ import zarr
 from nwb_utils import NWBUtils
 from behavior_utils import find_trials
 from create_psth import load_psth_raster_subset
-
+from general_utils import extract_session_name_core
 
 
 def _find_psth_zarr_for_session(
@@ -46,6 +46,7 @@ def _find_psth_zarr_for_session(
     RuntimeError
         If multiple matching PSTH Zarr folders are found.
     """
+    session_id=extract_session_name_core(session_id)
     psth_root = Path(psth_root)
     pattern = f"ecephys_{session_id}_*_{bin_size_label}.zarr"
     matches = sorted(psth_root.glob(pattern))
