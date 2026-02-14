@@ -1738,7 +1738,6 @@ def _compute_session_outputs(
 
     return session_id, per_row, times
 
-
 def append_average_psth_from_combined_df_parallel(
     combined_df: pd.DataFrame,
     *,
@@ -1755,102 +1754,234 @@ def append_average_psth_from_combined_df_parallel(
     time_col_name: str = "psth_time",
     max_workers: Optional[int] = None,
     show_progress: bool = True,
+    save_path: Optional[Union[str, Path]] = None,
+    save_format: Literal["pickle", "parquet", "csv"] = "pickle",
+    parquet_compression: Literal["snappy", "gzip", "brotli", "zstd", "none"] = "snappy",
 ) -> Tuple[pd.DataFrame, np.ndarray]:
     """
-    Parallel append of average PSTH / z-scored PSTH into combined_df.
+    Parallel append of average PSTH / z-scored PSTH into combined_df, with optional saving.
 
-    Parallelization strategy:
-      - One process per session (recommended axis), because each session requires
-        independent Zarr reads and produces independent outputs.
-      - This avoids repeatedly loading PSTH per unit and avoids trying to share
-        large xarray objects across workers.
+    This function computes, for each row (unit) in combined_df, the mean PSTH and baseline
+    z-scored PSTH for each quantile-defined trial subset (q#_trial_ids and q#_trial_ids_gt_thr).
+    Processing is parallelized across sessions to minimize redundant Zarr loading and maximize speed.
+
+    Parallelization strategy
+    ------------------------
+    - Each session is processed in a separate worker process.
+    - Within a worker, PSTH Zarr is loaded only once for that session.
+    - This avoids repeated disk access and significantly improves performance when many units
+      belong to the same session.
 
     Parameters
     ----------
     combined_df : pandas.DataFrame
-        Input DataFrame with many rows (units). Must contain:
-          - session_col (default "session_name")
-          - unit_col (default "unit_index")
-          - quantile trial id columns:
-              f"{quantile_prefix}{q}_trial_ids"
-              and optionally f"{quantile_prefix}{q}_trial_ids_gt_thr"
+        Input DataFrame containing unit-level rows and quantile trial-id columns.
 
-        Cells in trial-id columns may be list/ndarray or stringified lists.
-        The function uses `_parse_trial_ids` to normalize them.
+        Required columns:
+        - session_col (default: "session_name")
+        - unit_col (default: "unit_index")
+        - quantile trial-id columns such as:
+              f"{quantile_prefix}{q}_trial_ids"
+              f"{quantile_prefix}{q}_trial_ids_gt_thr"
+
+        Trial-id cells may contain:
+        - list[int]
+        - numpy.ndarray[int]
+        - stringified lists (e.g., "[1, 2, 3]")
+        - None / NaN
 
     session_col : str, default="session_name"
-        Column name identifying the session. Used for grouping and session-batching.
+        Column name identifying the recording session.
+
+        Used to group rows so that PSTH data is loaded once per session.
 
     unit_col : str, default="unit_index"
-        Column name identifying unit index in the session. Must match PSTH Zarr unit coordinate.
+        Column name identifying the unit index within each session.
 
-    psth_root : str | Path, default="/root/capsule/scratch/psth_results/"
-        Root directory containing PSTH Zarr folders per session.
+        Must match the unit coordinate stored in the PSTH Zarr files.
 
-    align_to_event : str | None, default="go_cue"
-        Alignment event used during PSTH extraction. Passed to loader.
+    psth_root : str or Path, default="/root/capsule/scratch/psth_results/"
+        Root directory containing PSTH Zarr folders.
 
-    time_window : (float, float) | None, default=(-3.0, 5.0)
-        Time window in seconds. Passed to loader to slice time.
+        Expected structure:
+            psth_root/
+                sessionA_0.2s.zarr/
+                sessionB_0.2s.zarr/
+                ...
 
-    baseline_window : (float, float), default=(-0.5, 0.0)
-        Baseline window used for z-scoring. Must overlap with time axis.
+    align_to_event : str or None, default="go_cue"
+        Alignment event used when PSTHs were originally extracted.
 
-    bin_size_label : str, default="0.2s"
-        Encodes the bin size in PSTH Zarr naming. Used by `_find_psth_zarr_for_session`.
+        Passed directly to load_psth_raster_subset.
 
-    consolidated : bool, default=True
-        Use consolidated metadata when reading Zarr (faster).
+        Examples:
+            "go_cue"
+            "reward"
+            None (use default alignment in PSTH file)
 
-    quantile_prefix : str, default="q"
-        Prefix used to discover quantile columns and to name output columns.
-
-    add_time_column : bool, default=False
-        If True, adds a column named time_col_name where every row stores the shared time array.
-
-    time_col_name : str, default="psth_time"
-        Output column name used when add_time_column=True.
-
-    max_workers : int | None, default=None
-        Number of worker processes.
+    time_window : tuple(float, float) or None, default=(-3.0, 5.0)
+        Time window (seconds relative to align_to_event) to extract PSTH.
 
         If None:
-          - uses max(1, os.cpu_count() - 1) to leave one core free.
+            full PSTH time axis is used.
 
-        Guidance:
-          - If storage is slow/networked, too many workers can hurt (I/O contention).
-          - Often 4–8 is a good starting point.
+        Example:
+            (-3.0, 5.0)  → extract PSTH from -3 to +5 seconds
+
+    baseline_window : tuple(float, float), default=(-0.5, 0.0)
+        Time window used to compute baseline mean and standard deviation.
+
+        Used to compute z-score:
+
+            z(t) = (mean_rate(t) - baseline_mean) / baseline_std
+
+        Must overlap with PSTH time axis.
+
+    bin_size_label : str, default="0.2s"
+        Label identifying PSTH bin size in Zarr folder names.
+
+        Used by `_find_psth_zarr_for_session`.
+
+        Example PSTH folder name:
+            sessionA_0.2s.zarr
+
+    consolidated : bool, default=True
+        Whether to use consolidated metadata when loading Zarr.
+
+        True:
+            faster loading (recommended)
+
+        False:
+            slower but compatible with older Zarr files
+
+    quantile_prefix : str, default="q"
+        Prefix used to identify quantile trial-id columns.
+
+        Example columns:
+            q0_trial_ids
+            q1_trial_ids
+            q3_trial_ids_gt_thr
+
+    add_time_column : bool, default=False
+        If True, adds a column storing the PSTH time axis in every row.
+
+        Column name specified by time_col_name.
+
+    time_col_name : str, default="psth_time"
+        Column name used when add_time_column=True.
+
+        Each cell contains numpy.ndarray shape (T,).
+
+    max_workers : int or None, default=None
+        Number of parallel worker processes.
+
+        If None:
+            max_workers = os.cpu_count() - 1
+
+        Recommended values:
+            local SSD: 4–16
+            network storage: 2–8
+
+        Setting too high may cause disk I/O bottlenecks.
 
     show_progress : bool, default=True
-        If True, show a progress bar over completed sessions using tqdm (if installed).
-        If tqdm is not installed, falls back to simple printing.
+        If True:
+            show progress bar over sessions using tqdm (if available)
+
+        Otherwise:
+            print simple progress messages.
+
+    save_path : str or Path or None, default=None
+        Optional output file path.
+
+        If None:
+            no file is saved.
+
+        Example:
+            "/root/capsule/scratch/psth_results.pkl"
+
+    save_format : {"pickle", "parquet", "csv"}, default="pickle"
+        Output file format.
+
+        pickle:
+            Recommended. Preserves numpy arrays exactly.
+
+        parquet:
+            PSTH arrays converted to Python lists before saving.
+
+        csv:
+            PSTH arrays serialized as JSON strings.
+
+    parquet_compression : {"snappy","gzip","brotli","zstd","none"}, default="snappy"
+        Compression used for parquet saving.
+
+        Ignored if save_format != "parquet".
 
     Returns
     -------
     df_out : pandas.DataFrame
-        Copy of combined_df with new object-dtype columns appended:
-          - f"{quantile_prefix}{q}_mean_rate"
-          - f"{quantile_prefix}{q}_zscore"
-          - f"{quantile_prefix}{q}_mean_rate_gt_thr"
-          - f"{quantile_prefix}{q}_zscore_gt_thr"
+        Copy of combined_df with appended PSTH columns.
 
-        Each cell is either:
-          - np.ndarray shape (T,) if computed
-          - None if unavailable / empty trials / missing data
+        New columns added per quantile q:
+
+            f"{quantile_prefix}{q}_mean_rate"
+            f"{quantile_prefix}{q}_zscore"
+            f"{quantile_prefix}{q}_mean_rate_gt_thr"
+            f"{quantile_prefix}{q}_zscore_gt_thr"
+
+        Each cell contains:
+            numpy.ndarray shape (T,)
+            OR None
 
     common_time : numpy.ndarray
-        Shared time axis (shape (T,)).
+        Shared PSTH time axis.
+
+        Shape:
+            (T,)
+
+    Saving behavior
+    ---------------
+    pickle:
+        Best format. Preserves numpy arrays exactly.
+
+    parquet:
+        Arrays converted to lists.
+
+    csv:
+        Arrays converted to JSON strings.
+
+    Performance characteristics
+    ---------------------------
+    Time complexity:
+        O(n_sessions × load_psth + n_units)
+
+    Memory usage:
+        Moderate. PSTH loaded one session at a time.
+
+    Major speed advantage over non-parallel version due to:
+        - session batching
+        - parallel execution
+        - PSTH mask caching
 
     Raises
     ------
     ValueError
-        - If no quantile trial-id columns are found.
-        - If baseline_window does not overlap time axis.
-        - If time axes differ across sessions.
+        If no quantile trial-id columns found.
 
     RuntimeError
-        If no PSTH data could be loaded across all sessions.
+        If no PSTH data loaded successfully.
+
+    Examples
+    --------
+    df_out, time = append_average_psth_from_combined_df_parallel(
+        combined_df,
+        psth_root="/root/capsule/scratch/psth_results/",
+        max_workers=8,
+        save_path="psth.pkl",
+        save_format="pickle",
+    )
     """
+
     # Optional tqdm progress
     tqdm = None
     if show_progress:
@@ -1907,7 +2038,6 @@ def append_average_psth_from_combined_df_parallel(
 
     common_time: Optional[np.ndarray] = None
 
-    # Submit tasks
     with cf.ProcessPoolExecutor(max_workers=max_workers) as ex:
         futures = [
             ex.submit(
@@ -1930,7 +2060,6 @@ def append_average_psth_from_combined_df_parallel(
             for sid, g in grouped
         ]
 
-        # Progress over completed futures
         done_iter = cf.as_completed(futures)
         if tqdm is not None:
             done_iter = tqdm(done_iter, total=len(futures), desc="Sessions (completed)")
@@ -1959,7 +2088,64 @@ def append_average_psth_from_combined_df_parallel(
     if add_time_column:
         df_out[time_col_name] = [common_time] * len(df_out)
 
+    # ------------------------------------------------------------------
+    # Optional save
+    # ------------------------------------------------------------------
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        psth_cols = [
+            c for c in df_out.columns
+            if c.startswith(quantile_prefix)
+            and (
+                c.endswith("_mean_rate")
+                or c.endswith("_zscore")
+                or c.endswith("_mean_rate_gt_thr")
+                or c.endswith("_zscore_gt_thr")
+            )
+        ]
+
+        if save_format == "pickle":
+            df_out.to_pickle(save_path)
+            if show_progress:
+                print(f"[INFO] Saved DataFrame (pickle): {save_path}")
+
+        elif save_format == "parquet":
+            df_save = df_out.copy()
+
+            def _obj_to_list(v: Any) -> Any:
+                if isinstance(v, np.ndarray):
+                    return v.tolist()
+                return v
+
+            for c in psth_cols:
+                df_save[c] = df_save[c].map(_obj_to_list)
+
+            compression = None if parquet_compression == "none" else parquet_compression
+            df_save.to_parquet(save_path, index=True, compression=compression)
+            if show_progress:
+                print(f"[INFO] Saved DataFrame (parquet): {save_path}")
+
+        elif save_format == "csv":
+            import json
+
+            df_save = df_out.copy()
+
+            def _obj_to_json(v: Any) -> Any:
+                if isinstance(v, np.ndarray):
+                    return json.dumps(v.tolist())
+                return v
+
+            for c in psth_cols:
+                df_save[c] = df_save[c].map(_obj_to_json)
+
+            df_save.to_csv(save_path, index=True)
+            if show_progress:
+                print(f"[INFO] Saved DataFrame (csv, PSTH arrays as JSON strings): {save_path}")
+
+        else:
+            raise ValueError(f"Unsupported save_format: {save_format}. Use 'pickle', 'parquet', or 'csv'.")
+
     return df_out, common_time
-
-
 

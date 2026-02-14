@@ -1,11 +1,30 @@
 from __future__ import annotations
-import re
-import os
+
+# ==============================
+# Standard library
+# ==============================
 import ast
-from pathlib import Path
-from datetime import datetime
+import json
+import os
+import re
 from collections import defaultdict
-from typing import List, Dict, Tuple, Optional, Any, Union, Literal
+from datetime import datetime
+from pathlib import Path
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    Literal,
+)
+
+# ==============================
+# Third-party libraries
+# ==============================
+import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -502,3 +521,137 @@ def load_ctt_results_dataframe(
         return pd.read_pickle(in_path)
 
     raise ValueError(f"Unsupported fmt: {fmt}. Use 'parquet', 'csv', or 'pkl'.")
+
+
+
+
+
+
+
+def save_df_with_psth_csv(
+    df: pd.DataFrame,
+    path: Union[str, Path],
+    *,
+    array_columns: Optional[Sequence[str]] = None,
+    overwrite: bool = True,
+    show_progress: bool = True,
+) -> None:
+    """
+    Save DataFrame containing numpy array cells to CSV.
+
+    Arrays are serialized using JSON so they can be restored later.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing numpy arrays in some columns.
+
+    path : str or Path
+        Output CSV file path.
+
+    array_columns : list[str] or None, default=None
+        Columns to serialize as arrays.
+
+        If None:
+            automatically detects columns containing numpy arrays.
+
+    overwrite : bool, default=True
+        If False, raises error if file exists.
+
+    show_progress : bool, default=True
+        Print progress info.
+
+    Notes
+    -----
+    Arrays are stored as JSON strings.
+    """
+
+    path = Path(path)
+
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"{path} already exists")
+
+    df_save = df.copy()
+
+    # Auto-detect array columns if not provided
+    if array_columns is None:
+        array_columns = [
+            c for c in df.columns
+            if df[c].apply(lambda x: isinstance(x, np.ndarray)).any()
+        ]
+
+    if show_progress:
+        print(f"[SAVE] Serializing {len(array_columns)} array columns...")
+
+    # Convert arrays to JSON
+    for col in array_columns:
+        df_save[col] = df_save[col].apply(
+            lambda x: json.dumps(x.tolist()) if isinstance(x, np.ndarray) else None
+        )
+
+    df_save.to_csv(path, index=False)
+
+    if show_progress:
+        print(f"[SAVE] CSV saved: {path}")
+
+
+
+def load_df_with_psth_csv(
+    path: Union[str, Path],
+    *,
+    array_columns: Optional[Sequence[str]] = None,
+    show_progress: bool = True,
+) -> pd.DataFrame:
+    """
+    Load CSV saved by save_df_with_psth_csv and restore numpy arrays.
+
+    Parameters
+    ----------
+    path : str or Path
+        CSV file path.
+
+    array_columns : list[str] or None
+        Columns to restore as numpy arrays.
+
+        If None:
+            auto-detect columns that look like JSON arrays.
+
+    show_progress : bool, default=True
+        Print progress info.
+
+    Returns
+    -------
+    pandas.DataFrame
+    """
+
+    path = Path(path)
+
+    if show_progress:
+        print(f"[LOAD] Reading CSV: {path}")
+
+    df = pd.read_csv(path)
+
+    # Auto-detect array columns if needed
+    if array_columns is None:
+
+        def looks_like_array(x):
+            return isinstance(x, str) and x.startswith("[") and x.endswith("]")
+
+        array_columns = [
+            c for c in df.columns
+            if df[c].dropna().apply(looks_like_array).any()
+        ]
+
+    if show_progress:
+        print(f"[LOAD] Restoring {len(array_columns)} array columns...")
+
+    # Restore arrays
+    for col in array_columns:
+        df[col] = df[col].apply(
+            lambda x: np.array(json.loads(x)) if isinstance(x, str) else None
+        )
+
+    if show_progress:
+        print("[LOAD] Done.")
+
+    return df
