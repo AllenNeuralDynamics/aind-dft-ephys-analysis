@@ -32,13 +32,15 @@ from create_psth import load_psth_raster_subset
 from ephys_utils import append_units_locations
 from general_utils import extract_session_name_core
 
+
+
 def summarize_monotonic_unit_df_by_latent_quantile(
     source: Union[str, Path, xr.DataArray, xr.Dataset],
     *,
     latent_values: Sequence[float],
     latent_trial_ids: Sequence[int],
     activity_window: Tuple[float, float],
-    calculation_min_window: Optional[Tuple[float, float]] = (-4.0, 3),  # NEW
+    calculation_min_window: Optional[Tuple[float, float]] = (-4.0, 3.0),  # NEW
     unit_ids: Optional[Sequence[int]] = None,
     align_to_event: Optional[str] = None,
     time_window: Optional[Tuple[float, float]] = None,
@@ -65,6 +67,13 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     overwrite: bool = True,
 ) -> Tuple[pd.DataFrame, Optional[Path]]:
     """
+    Summarize per-unit monotonicity vs a latent variable by binning trials (quantile or equal-width),
+    and compute per-bin activity summaries plus Spearman correlations.
+
+    NEW (this version):
+    - Saves trial IDs used in each quantile bin (RAW and gt_thr)
+    - Saves combined trial IDs used across all quantiles (RAW and gt_thr)
+
     Parameters
     ----------
     source
@@ -177,10 +186,9 @@ def summarize_monotonic_unit_df_by_latent_quantile(
 
     min_average_firing_rate
         Unit exclusion threshold applied in `calculation_min_window`:
-        - Compute avg_firing_rate_window = mean over trials of trial_mean_calc
-            (ignoring NaNs).
+        - Compute avg_firing_rate_window = mean over trials of trial_mean_calc (ignoring NaNs).
         - If avg_firing_rate_window < min_average_firing_rate, the unit is skipped and
-            does not appear in `unit_df`.
+          does not appear in `unit_df`.
         This changes the denominator for any downstream “fraction of units” computation
         performed on `unit_df`.
 
@@ -204,44 +212,22 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         Optional NWB object. If provided, the function will:
         - derive a session core id using `extract_session_name_core(nwb_data.session_id)`
         - call `append_units_locations(nwb_data, session_id_core)` to populate CCF fields
-        - build a per-unit metadata table containing:
-            * brain_region (string)
-            * ccf_location (dict or structured object)
+        - build a per-unit metadata table containing brain_region and ccf_location
         and attach these to output rows (also merged with `unit_metadata` if provided).
 
     consolidated
         Passed through to `load_psth_raster_subset`. Typically indicates whether to read from a
         consolidated zarr store (faster metadata access) when applicable.
 
-    save_dir
-        Optional directory to save the output table. Used when `save_filename` is provided or when
-        `save_path` is a directory-like path (no suffix) is not used.
+    save_dir, save_filename, save_path, save_format, overwrite
+        Saving controls. If overwrite=False and the resolved file exists, early-load occurs.
 
-    save_filename
-        Optional output filename (with or without extension). If provided, the table is saved under
-        `save_dir` (or current directory if `save_dir` is None). If no suffix is provided, one is
-        added based on `save_format`.
-
-    save_path
-        Optional path controlling saving behavior:
-        - If it has a file suffix, it is used directly as the output file.
-        - If it has no suffix, it is treated as an output directory and an auto-generated
-            filename is used (based on session/latent/threshold/bins/window and `save_format`).
-
-    save_format
-        Output file format when saving:
-        - "csv": saved with `DataFrame.to_csv(index=False)`
-        - "parquet": saved with `DataFrame.to_parquet(index=False)`
-        Also controls how early-load works when overwrite=False and the file exists.
-
-    overwrite
-        If False and the resolved output file already exists:
-        - the file is loaded from disk and returned immediately (early exit),
-            skipping recomputation.
-        If True, existing files are overwritten.
+    Returns
+    -------
+    unit_df, saved_file
+        unit_df: per-unit summary DataFrame
+        saved_file: Path if saved, else None
     """
-
-    import math  # Local import to avoid relying on module-level imports
 
     # -----------------------------
     # 0) Resolve intended output path EARLY, so we can skip work if it exists.
@@ -256,7 +242,7 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     thr = float(activity_min_threshold)
     w0, w1 = float(activity_window[0]), float(activity_window[1])
 
-    # NEW: calculation window for min-threshold and min-average-FR
+    # Calculation window for thresholding and min-average-FR
     if calculation_min_window is None:
         cw0, cw1 = w0, w1
     else:
@@ -313,7 +299,6 @@ def summarize_monotonic_unit_df_by_latent_quantile(
     if w1 <= w0:
         raise ValueError("`activity_window` must satisfy activity_window[1] > activity_window[0].")
 
-    # NEW: validate calculation window
     if cw1 <= cw0:
         raise ValueError("`calculation_min_window` must satisfy calculation_min_window[1] > calculation_min_window[0].")
 
@@ -338,7 +323,7 @@ def summarize_monotonic_unit_df_by_latent_quantile(
 
         nwb_data = append_units_locations(nwb_data, sess_core)
 
-        unit_rows = []
+        unit_rows_meta = []
         n_units_total = len(nwb_data.units)
         for u in range(n_units_total):
             loc = nwb_data.units["ccf_location"][u] if "ccf_location" in nwb_data.units.colnames else None
@@ -346,8 +331,8 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             region = ""
             if isinstance(loc, dict):
                 region = str(loc.get("brain_region", "")) if loc.get("brain_region", "") is not None else ""
-            unit_rows.append({"unit_index": int(u), "brain_region": region, "ccf_location": loc})
-        nwb_meta_df = pd.DataFrame(unit_rows).set_index("unit_index", drop=False)
+            unit_rows_meta.append({"unit_index": int(u), "brain_region": region, "ccf_location": loc})
+        nwb_meta_df = pd.DataFrame(unit_rows_meta).set_index("unit_index", drop=False)
 
     meta_df: Optional[pd.DataFrame] = None
     if unit_metadata is not None:
@@ -416,7 +401,6 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             f"Dataset time range is [{float(np.nanmin(times)):.3f}, {float(np.nanmax(times)):.3f}]."
         )
 
-    # NEW: separate window for thresholding and min-average-FR
     tmask_calc = (times >= cw0) & (times <= cw1)
     if not np.any(tmask_calc):
         raise ValueError(
@@ -425,7 +409,7 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         )
 
     # -----------------------------
-    # 5) Build latent bins (shared across units)
+    # 5) Build latent bins (shared across units) for RAW
     # -----------------------------
     lat = latent_values.copy()
     ok_lat = np.isfinite(lat)
@@ -616,9 +600,9 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             bin_idx_local[ok] = codes
 
             q_perc = np.linspace(0, 100, n_bins_eff + 1)
-            bin_edges = np.unique(np.nanpercentile(v_finite, q_perc))
+            bin_edges_local = np.unique(np.nanpercentile(v_finite, q_perc))
 
-            return bin_idx_local, np.asarray(bin_edges, dtype=np.float64), n_bins_eff
+            return bin_idx_local, np.asarray(bin_edges_local, dtype=np.float64), n_bins_eff
 
         lo, hi = (
             (float(np.nanmin(v_finite)), float(np.nanmax(v_finite)))
@@ -675,10 +659,10 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         # Activity used for per-bin summaries/monotonicity (activity_window)
         trial_mean_activity = np.nanmean(unit_psth_np[:, tmask_activity], axis=1)
 
-        # NEW: activity used for thresholding and min_average_firing_rate (calculation_min_window)
+        # Activity used for thresholding and min_average_firing_rate (calculation_min_window)
         trial_mean_calc = np.nanmean(unit_psth_np[:, tmask_calc], axis=1)
 
-        # NEW: exclude low-firing units based on calc-window average firing rate
+        # Exclude low-firing units based on calc-window average firing rate
         avg_fr_window = (
             float(np.nanmean(trial_mean_calc[np.isfinite(trial_mean_calc)]))
             if np.any(np.isfinite(trial_mean_calc))
@@ -699,10 +683,17 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         bin_ok = bin_idx[ok_raw]
         act_ok = trial_mean_activity[ok_raw]
 
-        # NEW: threshold decision uses calc-window values, but selected trials keep activity-window values
+        # NEW: trial IDs for RAW (aligned to ok_raw)
+        trial_ids_ok = latent_trial_ids[ok_raw].astype(np.int64)
+        trial_ids_used = trial_ids_ok.tolist()  # combined across all quantiles (RAW)
+
+        # Threshold decision uses calc-window values; selected trials keep activity-window values
         ok_thr = ok_raw & np.isfinite(trial_mean_calc) & (trial_mean_calc > thr)
         lat_ok_thr = lat[ok_thr]
         act_ok_thr = trial_mean_activity[ok_thr]
+
+        # NEW: trial IDs before gt_thr re-binning (aligned to ok_thr)
+        trial_ids_thr = latent_trial_ids[ok_thr].astype(np.int64)
 
         bin_idx_thr_local, bin_edges_thr, n_bins_effective_thr = _build_bins_for_latent_values(
             lat_ok_thr,
@@ -717,23 +708,41 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         act_ok_thr_binned = act_ok_thr[ok_thr_binned]
         bin_ok_thr_re = bin_idx_thr_local[ok_thr_binned]
 
+        # NEW: final gt_thr trial IDs (aligned to ok_thr_binned)
+        trial_ids_thr_binned = trial_ids_thr[ok_thr_binned].astype(np.int64)
+        trial_ids_used_gt_thr = trial_ids_thr_binned.tolist()  # combined across all quantiles (gt_thr)
+
         q_lists, q_counts, q_centers, q_ci = [], [], [], []
         q_lists_thr, q_counts_thr, q_centers_thr, q_ci_thr = [], [], [], []
 
+        # NEW: per-bin trial IDs
+        q_trial_ids: List[List[int]] = []
+        q_trial_ids_thr: List[List[int]] = []
+
+        # RAW per-bin summaries + per-bin trial IDs
         for b in range(n_bins_effective):
-            vals = act_ok[bin_ok == b]
-            vals = vals[np.isfinite(vals)]
+            m = (bin_ok == b) & np.isfinite(act_ok)
+            vals = act_ok[m]
+
+            tids = trial_ids_ok[m]
+            q_trial_ids.append([int(t) for t in tids.tolist()])
+
             q_lists.append([float(v) for v in vals])
             q_counts.append(int(vals.size))
             q_centers.append(_safe_center(vals))
             q_ci.append(_ci_summary(vals))
 
+        # gt_thr per-bin summaries + per-bin trial IDs (note: bins are recomputed under gt_thr)
         for b in range(n_bins_effective):
             if (n_bins_effective_thr >= 2) and (b < n_bins_effective_thr):
-                vals2 = act_ok_thr_binned[bin_ok_thr_re == b]
-                vals2 = vals2[np.isfinite(vals2)]
+                m2 = (bin_ok_thr_re == b) & np.isfinite(act_ok_thr_binned)
+                vals2 = act_ok_thr_binned[m2]
+
+                tids2 = trial_ids_thr_binned[m2]
+                q_trial_ids_thr.append([int(t) for t in tids2.tolist()])
             else:
                 vals2 = np.asarray([], dtype=np.float64)
+                q_trial_ids_thr.append([])
 
             q_lists_thr.append([float(v) for v in vals2])
             q_counts_thr.append(int(vals2.size))
@@ -754,7 +763,6 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             "min_average_firing_rate": float(min_fr),
             "avg_firing_rate_window": float(avg_fr_window),
 
-            # NEW: store calculation window used for thresholding / min-FR
             "calculation_window_start": float(cw0),
             "calculation_window_end": float(cw1),
 
@@ -802,12 +810,20 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             "spearman_p_gt_thr": float(p_thr) if np.isfinite(p_thr) else np.nan,
 
             "bin_edges": np.array2string(np.asarray(bin_edges, dtype=np.float64), precision=6, separator=","),
+
+            # NEW: combined trial IDs used across all quantiles
+            "trial_ids_used": trial_ids_used,
+            "trial_ids_used_gt_thr": trial_ids_used_gt_thr,
         }
 
         for b in range(n_bins_effective):
             row[f"q{b}_n"] = q_counts[b]
             row[f"q{b}_{quantile_stat}_activity"] = q_centers[b]
             row[f"q{b}_trial_mean_activity_list"] = q_lists[b]
+
+            # NEW: per-quantile RAW trial IDs
+            row[f"q{b}_trial_ids"] = q_trial_ids[b]
+
             if ci == "sem":
                 row[f"q{b}_sem_activity"] = float(q_ci[b].get("sem", np.nan))
             elif ci == "iqr":
@@ -817,6 +833,10 @@ def summarize_monotonic_unit_df_by_latent_quantile(
             row[f"q{b}_n_gt_thr"] = q_counts_thr[b]
             row[f"q{b}_{quantile_stat}_activity_gt_thr"] = q_centers_thr[b]
             row[f"q{b}_trial_mean_activity_list_gt_thr"] = q_lists_thr[b]
+
+            # NEW: per-quantile gt_thr trial IDs
+            row[f"q{b}_trial_ids_gt_thr"] = q_trial_ids_thr[b]
+
             if ci == "sem":
                 row[f"q{b}_sem_activity_gt_thr"] = float(q_ci_thr[b].get("sem", np.nan))
             elif ci == "iqr":
@@ -880,6 +900,7 @@ def summarize_monotonic_unit_df_by_latent_quantile(
         print(f"Saved unit_df to: {saved_file}")
 
     return unit_df, saved_file
+
 
 
 
