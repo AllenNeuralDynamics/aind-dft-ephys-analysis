@@ -1,24 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Sequence, Tuple, Optional, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Union, Literal
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import zarr
 
 from nwb_utils import NWBUtils
 from behavior_utils import find_trials
 from create_psth import load_psth_raster_subset
 
-from typing import Any, Dict, Optional, Tuple, Literal
 
-import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
-import numpy as np
-import pandas as pd
-import zarr
 
 def _find_psth_zarr_for_session(
     session_id: str,
@@ -68,10 +62,14 @@ def _find_psth_zarr_for_session(
     return matches[0]
 
 
+
 def compute_average_psth_matrix(
     unit_specs: Sequence[Dict[str, Any]],
-    trial_types: Sequence[str],
+    trial_types: Optional[Sequence[str]] = None,
     *,
+    # NEW: allow passing trial IDs directly (one list per "condition")
+    trial_ids: Optional[Sequence[Sequence[int]]] = None,
+    trial_type_names: Optional[Sequence[str]] = None,
     psth_root: Union[str, Path] = "/root/capsule/scratch/psth",
     align_to_event: Optional[str] = None,
     time_window: Optional[Tuple[float, float]] = None,
@@ -81,16 +79,32 @@ def compute_average_psth_matrix(
     save_zarr_path: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     """
-    Compute average PSTH and z-scored PSTH in one matrix for multiple units and trial types.
+    Compute average PSTH and z-scored PSTH in one matrix for multiple units and conditions.
 
     This function:
-      - Groups units by session to avoid repeated loading of NWB and PSTH files.
-      - For each session, loads a PSTH subset containing:
-          (all requested units) × (all trials from the requested trial types).
-      - For each (unit, trial_type), averages PSTH across trials.
-      - Computes a z-scored PSTH based on a baseline time window.
-      - Returns a single set of matrices and metadata.
-      - Optionally saves the result into a Zarr group.
+    - Deduplicates (session_id, unit_index) pairs while preserving the input order.
+    - Groups units by session to avoid repeated loading of NWB and PSTH files.
+    - For each session, loads a PSTH subset containing:
+        (all requested units) × (all trials from the requested conditions).
+    - For each (unit, condition), averages PSTH across trials.
+    - Computes a z-scored PSTH based on a baseline time window.
+    - Returns a single set of matrices and metadata.
+    - Optionally saves the result into a Zarr group.
+
+    Conditions can be defined in one of two ways:
+
+    1) Using trial types (`trial_types`):
+    - The function calls `find_trials(nwb_data, trial_type)` per session to obtain trial ids.
+
+    2) Using explicit trial id lists (`trial_ids`):
+    - `trial_ids` must be a list-of-lists (or any sequence of sequences), one per condition.
+    - The function uses these trial ids directly and does NOT call `find_trials`.
+    - If `trial_type_names` is not provided, conditions will be labeled as:
+        ["cond_0", "cond_1", ..., "cond_{K-1}"].
+
+    Priority rule:
+    - If `trial_ids` is provided (even if it contains empty inner lists like [[], []]),
+        `trial_ids` takes precedence and `trial_types` is ignored.
 
     Parameters
     ----------
@@ -105,28 +119,86 @@ def compute_average_psth_matrix(
                 {"session_id": "764769_2024-12-11_18-21-49", "unit_index": 877},
             ]
 
-        Order is preserved, and duplicate (session_id, unit_index) pairs are removed.
+        Notes:
+        - Input order is preserved.
+        - Duplicate (session_id, unit_index) pairs are removed (first occurrence kept).
+        - Units are internally grouped by session to reduce I/O.
 
-    trial_types : sequence of str
+    trial_types : sequence of str, optional
         Trial type names as understood by `find_trials`, e.g. ["rewarded", "unrewarded"].
+
+        Notes:
+        - Used only when `trial_ids` is None.
+        - For each session, the function resolves:
+            trial_ids_by_type[tt] = np.asarray(find_trials(nwb_data, tt), dtype=int)
+
+    trial_ids : sequence of sequence of int, optional
+        Explicit trial id lists, one list per condition (column).
+
+        Examples:
+            [[1, 2, 3], [10, 11, 12]]
+            [[1, 2, 3], []]              # empty condition allowed
+            [np.array([1, 2]), [5, 6]]   # any sequence of sequences is fine
+
+        Notes:
+        - If provided, `trial_ids` takes precedence and `trial_types` is ignored.
+        - Each inner list is interpreted as trial indices that must match the PSTH Zarr
+        trial coordinate values (e.g., "trial_index_*" coordinate in the PSTH DataArray).
+        - Trial ids are not automatically filtered by session; the function will attempt to
+        load the union of all trial ids for the session, then intersect per condition via
+        membership tests against the dataset's trial coordinate.
+
+    trial_type_names : sequence of str, optional
+        Names for the conditions when using `trial_ids`.
+
+        Notes:
+        - Must have the same length as `trial_ids` if provided.
+        - If omitted and `trial_ids` is provided, defaults to:
+            ["cond_0", "cond_1", ..., "cond_{K-1}"].
+        - When `trial_types` is used (and `trial_ids` is None), this parameter is ignored.
 
     psth_root : str | Path, default "/root/capsule/scratch/psth"
         Root directory where precomputed PSTH Zarr folders are stored.
 
+        Notes:
+        - The function uses `_find_psth_zarr_for_session(session_id, psth_root, bin_size_label)`
+        to locate the session-specific PSTH Zarr.
+        - `psth_root` should contain per-session PSTH Zarr directories consistent with how
+        they were produced by `extract_neuron_psth_to_zarr`.
+
     align_to_event : str, optional
         Event name used when PSTHs were extracted (e.g. "go_cue").
-        Must match the value used inside `extract_neuron_psth_to_zarr`.
+
+        Notes:
+        - Must match the value used inside `extract_neuron_psth_to_zarr`.
+        - Passed through to `load_psth_raster_subset`.
+        - If None, `load_psth_raster_subset` should default to the stored alignment within
+        the PSTH Zarr (behavior depends on your loader implementation).
 
     time_window : (float, float), optional
         Time window (in seconds) to slice the PSTH around the alignment event.
-        If None, the full time axis from the PSTH Zarr is used.
+
+        Notes:
+        - If None, the full time axis from the PSTH Zarr is used.
+        - If provided, it is passed to `load_psth_raster_subset` which is responsible for slicing.
 
     baseline_window : (float, float), default (-0.5, 0.0)
         Time window (in seconds, relative to the alignment event) used to compute
-        baseline mean and standard deviation for z-scoring. The z-score is:
+        baseline mean and standard deviation for z-scoring.
+
+        Definition:
+        - First compute the trial-averaged PSTH for each (unit, condition):
+            mean_rate(t) = mean over trials of rate(trial, t)
+        - Then compute baseline mean/std over ALL trials and ALL time bins within baseline_window:
+            baseline_vals = rate(trial, t) for all trials and t in baseline_window
+            baseline_mean = mean(baseline_vals)
+            baseline_std  = std(baseline_vals, ddof=1)
+
+        Z-score:
             z(t) = (mean_rate(t) - baseline_mean) / baseline_std
-        where the baseline is taken across all trials and all time bins within
-        the baseline_window.
+
+        Edge cases:
+        - If baseline_std <= 0 or non-finite, z(t) is set to zeros for that (unit, condition).
 
     bin_size_label : str, default "0.2s"
         Suffix that encodes the PSTH bin size in the Zarr folder names and is
@@ -138,14 +210,18 @@ def compute_average_psth_matrix(
 
     save_zarr_path : str | Path, optional
         If provided, the result will be saved to a Zarr group at this path.
+
         The group will contain datasets:
-          - "time"          : 1D float array, length T
-          - "trial_types"   : 1D unicode array, length K
-          - "unit_session"  : 1D unicode array, length N
-          - "unit_index"    : 1D int array, length N
-          - "mean_rate"     : 3D float array, shape (N, K, T)
-          - "zscore"        : 3D float array, shape (N, K, T)
-        and group attributes with basic metadata.
+        - "time"          : 1D float array, length T
+        - "trial_types"   : 1D unicode array, length K
+        - "unit_session"  : 1D unicode array, length N
+        - "unit_index"    : 1D int array, length N
+        - "mean_rate"     : 3D float array, shape (N, K, T)
+        - "zscore"        : 3D float array, shape (N, K, T)
+
+        Group attributes include basic metadata, including:
+        - "baseline_window", "align_to_event", "bin_size_label"
+        - "conditions_source" : either "trial_ids" or "trial_types"
 
     Returns
     -------
@@ -156,29 +232,64 @@ def compute_average_psth_matrix(
             Shared time axis used for all PSTHs.
 
         - "trial_types" : list of str, length K
-            Copy of the input trial_types in the resolved order.
+            Resolved condition names:
+            - equals `trial_types` when `trial_ids` is None
+            - equals `trial_type_names` (or default "cond_*") when `trial_ids` is provided
 
-        - "unit_table" : pandas.DataFrame with columns
-            ["row_index", "session_id", "unit_index"],
+        - "unit_table" : pandas.DataFrame
+            Columns: ["row_index", "session_id", "unit_index"]
             where row_index corresponds to the first dimension of the matrices.
 
         - "mean_rate" : numpy.ndarray, shape (N, K, T)
-            Average PSTH for each unit (N) and trial type (K).
+            Average PSTH for each unit (N) and condition (K).
 
         - "zscore" : numpy.ndarray, shape (N, K, T)
-            Z-scored PSTH for each unit and trial type, using the specified baseline_window.
+            Z-scored PSTH for each unit and condition (K), using `baseline_window`.
 
     Raises
     ------
+    ValueError
+        - If both `trial_ids` and `trial_types` are None.
+        - If `trial_type_names` is provided but its length does not match `trial_ids`.
+        - If the time axes differ across sessions.
+        - If `baseline_window` does not overlap with the PSTH time axis.
+
     FileNotFoundError
         If no matching PSTH Zarr folder is found for a requested session.
+
     RuntimeError
-        If no PSTH data is found for any of the requested (unit, trial_type) pairs,
+        If no PSTH data is found for any of the requested (unit, condition) pairs,
         or if multiple PSTH Zarr folders exist for a given session.
-    ValueError
-        If the time axes differ across sessions, or if the baseline_window does not
-        overlap with the PSTH time axis.
     """
+
+    # ------------------------------------------------------------------
+    # 0) Resolve "conditions": either from trial_ids or trial_types
+    # ------------------------------------------------------------------
+    use_trial_ids_directly = trial_ids is not None
+
+    if use_trial_ids_directly:
+        trial_ids_lists: list[np.ndarray] = [
+            np.asarray(x, dtype=int) for x in trial_ids
+        ]
+        n_types = len(trial_ids_lists)
+
+        if trial_type_names is not None:
+            if len(trial_type_names) != n_types:
+                raise ValueError(
+                    "When providing `trial_ids`, `trial_type_names` must have the same length."
+                )
+            resolved_trial_type_names = list(trial_type_names)
+        else:
+            resolved_trial_type_names = [f"cond_{i}" for i in range(n_types)]
+    else:
+        if trial_types is None:
+            raise ValueError(
+                "You must provide either `trial_types` or `trial_ids` (list-of-lists)."
+            )
+        resolved_trial_type_names = list(trial_types)
+        n_types = len(resolved_trial_type_names)
+        trial_ids_lists = []  # will be filled per-session using find_trials
+
     # ------------------------------------------------------------------
     # 1) Deduplicate unit specs while preserving order
     # ------------------------------------------------------------------
@@ -192,14 +303,12 @@ def compute_average_psth_matrix(
             seen_keys.add(key)
             unit_keys.append(key)
 
-    trial_types = list(trial_types)
-
     # Group units by session so we only load once per session
     units_by_session: Dict[str, list[int]] = {}
     for sid, uid in unit_keys:
         units_by_session.setdefault(sid, []).append(uid)
 
-    # Containers for mean PSTH and z-score per (session, unit, trial_type)
+    # Containers for mean PSTH and z-score per (session, unit, condition_name)
     mean_map: Dict[Tuple[str, int, str], np.ndarray] = {}
     zscore_map: Dict[Tuple[str, int, str], np.ndarray] = {}
 
@@ -217,17 +326,24 @@ def compute_average_psth_matrix(
         )
 
         # 2.2) Load NWB once per session
-        nwb_data= NWBUtils.read_behavior_nwb(session_name=session_id)
+        nwb_data = NWBUtils.read_behavior_nwb(session_name=session_id)
 
-        # 2.3) Resolve trial ids for each trial type
-        trial_ids_by_type: Dict[str, np.ndarray] = {}
-        for tt in trial_types:
-            trial_ids_by_type[tt] = np.asarray(find_trials(nwb_data, tt), dtype=int)
+        # 2.3) Resolve trial ids for each condition in this session
+        trial_ids_by_name: Dict[str, np.ndarray] = {}
+
+        if use_trial_ids_directly:
+            # Use the provided trial ids as-is for every session
+            for name, arr in zip(resolved_trial_type_names, trial_ids_lists):
+                trial_ids_by_name[name] = np.asarray(arr, dtype=int)
+        else:
+            # Use find_trials per trial_type name
+            for name in resolved_trial_type_names:
+                trial_ids_by_name[name] = np.asarray(find_trials(nwb_data, name), dtype=int)
 
         # Union of all requested trial ids in this session
-        non_empty_trial_lists = [v for v in trial_ids_by_type.values() if v.size > 0]
+        non_empty_trial_lists = [v for v in trial_ids_by_name.values() if v.size > 0]
         if len(non_empty_trial_lists) == 0:
-            # No trials of the requested types in this session
+            # No trials of the requested conditions in this session
             continue
         all_trial_ids = np.unique(np.concatenate(non_empty_trial_lists))
 
@@ -243,9 +359,7 @@ def compute_average_psth_matrix(
 
         # Identify trial and unit dims/coords
         trial_dim = next(d for d in psth_da.dims if d.startswith("trial_"))
-        trial_coord_name = next(
-            c for c in psth_da.coords if c.startswith("trial_index_")
-        )
+        trial_coord_name = next(c for c in psth_da.coords if c.startswith("trial_index_"))
         unit_coord_name = "unit_index"
 
         trial_ids_in_ds = psth_da.coords[trial_coord_name].values.astype(int)
@@ -270,52 +384,41 @@ def compute_average_psth_matrix(
                 f"the PSTH time axis [{times[0]:.3f}, {times[-1]:.3f}]."
             )
 
-        # 2.7) Loop over units and trial types
+        # 2.7) Loop over units and conditions
         for unit_index in unit_indices:
-            # Find the index of this unit in the PSTH DataArray
             where_unit = np.where(unit_ids_in_ds == int(unit_index))[0]
             if where_unit.size == 0:
-                # This unit is not present in the PSTH dataset (skip)
                 continue
             u_pos = int(where_unit[0])
 
-            # Slice to get all trials for this unit → (trial_dim, time)
             unit_psth_all = psth_da.isel(unit=u_pos)
 
-            for tt in trial_types:
-                tt_trial_ids = trial_ids_by_type[tt]
-                if tt_trial_ids.size == 0:
-                    # No trials of this type in this session
+            for cond_name, cond_trial_ids in trial_ids_by_name.items():
+                if cond_trial_ids.size == 0:
                     continue
 
-                # Map requested trial ids to positions in the PSTH array
-                mask = np.isin(trial_ids_in_ds, tt_trial_ids)
+                mask = np.isin(trial_ids_in_ds, cond_trial_ids)
                 if not mask.any():
-                    # No overlap between PSTH trials and this trial type
                     continue
 
                 unit_psth = unit_psth_all.isel({trial_dim: mask})
-                data = unit_psth.values  # shape: (n_trials, n_time)
+                data = unit_psth.values  # (n_trials, n_time) or (n_time,)
 
                 if data.ndim == 1:
-                    # Single trial edge case → make it 2D
                     data = data[np.newaxis, :]
 
-                # Mean PSTH across trials
                 mean_rate = np.nanmean(data, axis=0)  # (time,)
 
-                # Baseline statistics for z-score
                 baseline_vals = data[:, baseline_mask].reshape(-1)
                 baseline_mean = np.nanmean(baseline_vals)
                 baseline_std = np.nanstd(baseline_vals, ddof=1)
 
                 if baseline_std <= 0 or not np.isfinite(baseline_std):
-                    # Degenerate baseline (no variance or non-finite)
                     zscore = np.zeros_like(mean_rate)
                 else:
                     zscore = (mean_rate - baseline_mean) / baseline_std
 
-                key = (session_id, int(unit_index), tt)
+                key = (session_id, int(unit_index), cond_name)
                 mean_map[key] = mean_rate
                 zscore_map[key] = zscore
 
@@ -323,45 +426,36 @@ def compute_average_psth_matrix(
     # 3) Assemble final matrices
     # ------------------------------------------------------------------
     if common_time is None:
-        raise RuntimeError(
-            "No PSTH data found for the requested units and trial types."
-        )
+        raise RuntimeError("No PSTH data found for the requested units and conditions.")
 
     n_units = len(unit_keys)
-    n_types = len(trial_types)
     n_time = len(common_time)
 
-    # Initialize with NaN (or zeros if you prefer) so missing combinations are explicit
     mean_matrix = np.full((n_units, n_types, n_time), np.nan, dtype=float)
     zscore_matrix = np.full((n_units, n_types, n_time), np.nan, dtype=float)
 
-    # Maps from (session, unit) and trial type to matrix indices
-    unit_to_row: Dict[Tuple[str, int], int] = {
-        uk: i for i, uk in enumerate(unit_keys)
-    }
-    type_to_col: Dict[str, int] = {tt: j for j, tt in enumerate(trial_types)}
+    unit_to_row: Dict[Tuple[str, int], int] = {uk: i for i, uk in enumerate(unit_keys)}
+    type_to_col: Dict[str, int] = {name: j for j, name in enumerate(resolved_trial_type_names)}
 
     for (sid, uid), row in unit_to_row.items():
-        for tt, col in type_to_col.items():
-            key = (sid, uid, tt)
+        for name, col in type_to_col.items():
+            key = (sid, uid, name)
             if key not in mean_map:
-                # No data for this (unit, trial_type) combination
                 continue
             mean_matrix[row, col, :] = mean_map[key]
             zscore_matrix[row, col, :] = zscore_map[key]
 
-    # Build a small table describing how rows map back to (session, unit)
     unit_table = pd.DataFrame(
         {
             "row_index": np.arange(n_units, dtype=int),
-            "session_id": [sid for (sid, uid) in unit_keys],
-            "unit_index": [uid for (sid, uid) in unit_keys],
+            "session_id": [sid for (sid, _uid) in unit_keys],
+            "unit_index": [uid for (_sid, uid) in unit_keys],
         }
     )
 
     result: Dict[str, Any] = {
         "time": common_time,
-        "trial_types": trial_types,
+        "trial_types": resolved_trial_type_names,
         "unit_table": unit_table,
         "mean_rate": mean_matrix,
         "zscore": zscore_matrix,
@@ -372,28 +466,15 @@ def compute_average_psth_matrix(
     # ------------------------------------------------------------------
     if save_zarr_path is not None:
         save_zarr_path = Path(save_zarr_path)
-
-        # Create a fresh Zarr group (overwrite if exists)
         root = zarr.open_group(str(save_zarr_path), mode="w")
 
-        # 4.1) Core arrays
         root.create_dataset("time", data=common_time)
-        root.create_dataset(
-            "trial_types",
-            data=np.asarray(trial_types, dtype="U"),
-        )
-        root.create_dataset(
-            "unit_session",
-            data=np.asarray([sid for (sid, uid) in unit_keys], dtype="U"),
-        )
-        root.create_dataset(
-            "unit_index",
-            data=np.asarray([uid for (sid, uid) in unit_keys], dtype=int),
-        )
+        root.create_dataset("trial_types", data=np.asarray(resolved_trial_type_names, dtype="U"))
+        root.create_dataset("unit_session", data=np.asarray([sid for (sid, _uid) in unit_keys], dtype="U"))
+        root.create_dataset("unit_index", data=np.asarray([uid for (_sid, uid) in unit_keys], dtype=int))
         root.create_dataset("mean_rate", data=mean_matrix)
         root.create_dataset("zscore", data=zscore_matrix)
 
-        # 4.2) Metadata in group attributes
         root.attrs.update(
             {
                 "n_units": n_units,
@@ -402,12 +483,14 @@ def compute_average_psth_matrix(
                 "baseline_window": tuple(baseline_window),
                 "align_to_event": align_to_event,
                 "bin_size_label": bin_size_label,
+                "conditions_source": "trial_ids" if use_trial_ids_directly else "trial_types",
             }
         )
 
         print(f"Saved PSTH summary to Zarr: {save_zarr_path}")
 
     return result
+
 
 
 
