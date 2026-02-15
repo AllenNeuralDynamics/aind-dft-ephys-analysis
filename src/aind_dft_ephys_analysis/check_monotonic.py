@@ -1514,6 +1514,9 @@ def _parse_trial_ids(x: Any) -> np.ndarray:
     except Exception:
         return np.asarray([], dtype=int)
 
+
+
+
 def _compute_session_outputs(
     session_id: str,
     g: pd.DataFrame,
@@ -1984,7 +1987,7 @@ def append_average_psth_from_combined_df_parallel(
         - f"{used_prefix}_mean_rate_gt_thr"
         - f"{used_prefix}_zscore_gt_thr"
 
-        
+
     common_time : numpy.ndarray
         Shared PSTH time axis.
 
