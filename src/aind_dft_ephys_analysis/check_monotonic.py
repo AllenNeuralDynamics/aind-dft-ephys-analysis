@@ -1515,8 +1515,6 @@ def _parse_trial_ids(x: Any) -> np.ndarray:
         return np.asarray([], dtype=int)
 
 
-
-
 def _compute_session_outputs(
     session_id: str,
     g: pd.DataFrame,
@@ -1533,18 +1531,17 @@ def _compute_session_outputs(
     q_cols: Dict[int, str],
     q_gt_cols: Dict[int, str],
     quantile_prefix: str,
-    # --- NEW: combined (all-quantiles) trial-id columns ---
+    # Combined (all-quantiles) trial-id columns
     trial_ids_used_col: Optional[str] = "trial_ids_used",
     trial_ids_used_gt_thr_col: Optional[str] = "trial_ids_used_gt_thr",
     used_prefix: str = "used",
+    # NEW: z-score mode
+    zscore_mode: Literal["within_quantile", "across_all_quantiles"] = "within_quantile",
 ) -> Tuple[str, Dict[Any, Dict[str, np.ndarray]], np.ndarray]:
     """
-    Compute (mean_rate, zscore) PSTHs for all rows belonging to ONE session.
+    Worker: compute mean PSTH and baseline z-scored PSTH for each trial subset.
 
-    This function is intended to run inside a separate process (ProcessPoolExecutor).
-    It loads PSTH Zarr once for the session, then iterates over rows and quantiles.
-
-    Parameters
+    zscore_mode
     ----------
     session_id : str
         Session identifier (e.g. "ecephys_764769_2024-12-13_15-41-07...").
@@ -1595,7 +1592,13 @@ def _compute_session_outputs(
 
     quantile_prefix : str
         Prefix used for output column naming (default "q").
-
+   
+   "within_quantile":
+        baseline_mean/std computed from the SAME subset of trials used for mean_rate.
+    - "across_all_quantiles":
+        baseline_mean/std computed once per (session, unit, flavor) from the UNION of
+        trials across all subsets in that flavor (raw vs gt_thr), then reused for every subset.
+        This makes z-scores comparable across quantiles.
     Returns
     -------
     session_id : str
@@ -1627,10 +1630,9 @@ def _compute_session_outputs(
         - f"{used_prefix}_zscore_gt_thr"
     Notes
     -----
-    Performance:
-      - PSTH is loaded ONCE per session (good).
-      - A mask cache is used to avoid repeated np.isin for identical trial-id sets.
-      - Unit index -> position lookup is precomputed to avoid np.where in inner loops.
+    "flavor" here means:
+      - RAW subsets: q#_trial_ids and optionally trial_ids_used
+      - GT_THR subsets: q#_trial_ids_gt_thr and optionally trial_ids_used_gt_thr
     """
     # Local imports inside worker to ensure availability in child processes
     from average_psth import _find_psth_zarr_for_session
@@ -1640,17 +1642,17 @@ def _compute_session_outputs(
     if len(unit_indices) == 0:
         return session_id, {}, np.asarray([])
 
-    # Union trials across all rows and all q columns in this session
+    # ------------------------------------------------------------------
+    # Collect all trial IDs needed for loading (union of everything)
+    # ------------------------------------------------------------------
     all_trials: List[int] = []
     for _, row in g.iterrows():
-        # Quantile-specific trial sets
         for q in q_list:
             if q in q_cols:
                 all_trials.extend(_parse_trial_ids(row.get(q_cols[q], None)).tolist())
             if q in q_gt_cols:
                 all_trials.extend(_parse_trial_ids(row.get(q_gt_cols[q], None)).tolist())
 
-        # NEW: combined trial sets
         if trial_ids_used_col is not None and trial_ids_used_col in g.columns:
             all_trials.extend(_parse_trial_ids(row.get(trial_ids_used_col, None)).tolist())
         if trial_ids_used_gt_thr_col is not None and trial_ids_used_gt_thr_col in g.columns:
@@ -1705,28 +1707,82 @@ def _compute_session_outputs(
             mask_cache[key] = m
         return m if m.any() else None
 
-    def _mean_and_z(unit_psth_all: xr.DataArray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    # Map unit_index -> position
+    unit_pos_map = {int(u): int(i) for i, u in enumerate(unit_ids_in_ds.tolist())}
+
+    # ------------------------------------------------------------------
+    # Helpers for mean and z-score
+    # ------------------------------------------------------------------
+    def _mean_rate_from_mask(unit_psth_all: xr.DataArray, mask: np.ndarray) -> np.ndarray:
         unit_psth = unit_psth_all.isel({trial_dim: mask})
         data = unit_psth.values
         if data.ndim == 1:
             data = data[np.newaxis, :]
+        return np.nanmean(data, axis=0)
 
-        mean_rate = np.nanmean(data, axis=0)
-
+    def _baseline_stats_from_mask(unit_psth_all: xr.DataArray, mask: np.ndarray) -> Tuple[float, float]:
+        unit_psth = unit_psth_all.isel({trial_dim: mask})
+        data = unit_psth.values
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
         baseline_vals = data[:, baseline_mask].reshape(-1)
-        baseline_mean = np.nanmean(baseline_vals)
-        baseline_std = np.nanstd(baseline_vals, ddof=1)
+        mu = float(np.nanmean(baseline_vals))
+        sd = float(np.nanstd(baseline_vals, ddof=1))
+        return mu, sd
 
-        if baseline_std <= 0 or not np.isfinite(baseline_std):
-            z = np.zeros_like(mean_rate)
-        else:
-            z = (mean_rate - baseline_mean) / baseline_std
+    def _z_from_stats(mean_rate: np.ndarray, mu: float, sd: float) -> np.ndarray:
+        if (sd <= 0.0) or (not np.isfinite(sd)):
+            return np.zeros_like(mean_rate)
+        return (mean_rate - mu) / sd
 
-        return mean_rate, z
+    # ------------------------------------------------------------------
+    # Precompute baseline stats per unit if zscore_mode="across_all_quantiles"
+    # We compute separately for RAW flavor and GT_THR flavor.
+    # ------------------------------------------------------------------
+    baseline_stats_raw: Dict[int, Tuple[float, float]] = {}
+    baseline_stats_gt: Dict[int, Tuple[float, float]] = {}
 
-    # Map unit_index -> position to avoid np.where repeatedly
-    unit_pos_map = {int(u): int(i) for i, u in enumerate(unit_ids_in_ds.tolist())}
+    if zscore_mode == "across_all_quantiles":
+        # For each unit, union all RAW trial IDs across rows; similarly for GT_THR.
+        for u in unit_indices:
+            u_int = int(u)
+            if u_int not in unit_pos_map:
+                continue
+            unit_psth_all = psth_da.isel(unit=unit_pos_map[u_int])
 
+            raw_ids_all: List[int] = []
+            gt_ids_all: List[int] = []
+
+            for _, row in g.iterrows():
+                # RAW
+                for q in q_list:
+                    if q in q_cols:
+                        raw_ids_all.extend(_parse_trial_ids(row.get(q_cols[q], None)).tolist())
+                if trial_ids_used_col is not None and trial_ids_used_col in g.columns:
+                    raw_ids_all.extend(_parse_trial_ids(row.get(trial_ids_used_col, None)).tolist())
+
+                # GT_THR
+                for q in q_list:
+                    if q in q_gt_cols:
+                        gt_ids_all.extend(_parse_trial_ids(row.get(q_gt_cols[q], None)).tolist())
+                if trial_ids_used_gt_thr_col is not None and trial_ids_used_gt_thr_col in g.columns:
+                    gt_ids_all.extend(_parse_trial_ids(row.get(trial_ids_used_gt_thr_col, None)).tolist())
+
+            if len(raw_ids_all) > 0:
+                raw_ids = np.unique(np.asarray(raw_ids_all, dtype=int))
+                m_raw = _get_mask(raw_ids)
+                if m_raw is not None:
+                    baseline_stats_raw[u_int] = _baseline_stats_from_mask(unit_psth_all, m_raw)
+
+            if len(gt_ids_all) > 0:
+                gt_ids = np.unique(np.asarray(gt_ids_all, dtype=int))
+                m_gt = _get_mask(gt_ids)
+                if m_gt is not None:
+                    baseline_stats_gt[u_int] = _baseline_stats_from_mask(unit_psth_all, m_gt)
+
+    # ------------------------------------------------------------------
+    # Main per-row outputs
+    # ------------------------------------------------------------------
     per_row: Dict[Any, Dict[str, np.ndarray]] = {}
 
     for idx, row in g.iterrows():
@@ -1737,30 +1793,60 @@ def _compute_session_outputs(
         unit_psth_all = psth_da.isel(unit=unit_pos_map[u])
         out_cols: Dict[str, np.ndarray] = {}
 
+        # --------------------------
         # Quantile-specific outputs
+        # --------------------------
         for q in q_list:
+            # RAW
             if q in q_cols:
                 ids = _parse_trial_ids(row.get(q_cols[q], None))
                 m = _get_mask(ids)
                 if m is not None:
-                    mean_rate, z = _mean_and_z(unit_psth_all, m)
+                    mean_rate = _mean_rate_from_mask(unit_psth_all, m)
+
+                    if zscore_mode == "within_quantile":
+                        mu, sd = _baseline_stats_from_mask(unit_psth_all, m)
+                    else:
+                        mu, sd = baseline_stats_raw.get(u, (np.nan, np.nan))
+
+                    z = _z_from_stats(mean_rate, mu, sd) if np.isfinite(mu) else np.zeros_like(mean_rate)
+
                     out_cols[f"{quantile_prefix}{q}_mean_rate"] = mean_rate
                     out_cols[f"{quantile_prefix}{q}_zscore"] = z
 
+            # GT_THR
             if q in q_gt_cols:
                 ids_gt = _parse_trial_ids(row.get(q_gt_cols[q], None))
                 m_gt = _get_mask(ids_gt)
                 if m_gt is not None:
-                    mean_rate_gt, z_gt = _mean_and_z(unit_psth_all, m_gt)
+                    mean_rate_gt = _mean_rate_from_mask(unit_psth_all, m_gt)
+
+                    if zscore_mode == "within_quantile":
+                        mu_gt, sd_gt = _baseline_stats_from_mask(unit_psth_all, m_gt)
+                    else:
+                        mu_gt, sd_gt = baseline_stats_gt.get(u, (np.nan, np.nan))
+
+                    z_gt = _z_from_stats(mean_rate_gt, mu_gt, sd_gt) if np.isfinite(mu_gt) else np.zeros_like(mean_rate_gt)
+
                     out_cols[f"{quantile_prefix}{q}_mean_rate_gt_thr"] = mean_rate_gt
                     out_cols[f"{quantile_prefix}{q}_zscore_gt_thr"] = z_gt
 
-        # NEW: combined trial-id outputs
+        # --------------------------
+        # Combined trial set outputs
+        # --------------------------
         if trial_ids_used_col is not None and trial_ids_used_col in g.columns:
             ids_used = _parse_trial_ids(row.get(trial_ids_used_col, None))
             m_used = _get_mask(ids_used)
             if m_used is not None:
-                mean_rate_used, z_used = _mean_and_z(unit_psth_all, m_used)
+                mean_rate_used = _mean_rate_from_mask(unit_psth_all, m_used)
+
+                if zscore_mode == "within_quantile":
+                    mu_u, sd_u = _baseline_stats_from_mask(unit_psth_all, m_used)
+                else:
+                    mu_u, sd_u = baseline_stats_raw.get(u, (np.nan, np.nan))
+
+                z_used = _z_from_stats(mean_rate_used, mu_u, sd_u) if np.isfinite(mu_u) else np.zeros_like(mean_rate_used)
+
                 out_cols[f"{used_prefix}_mean_rate"] = mean_rate_used
                 out_cols[f"{used_prefix}_zscore"] = z_used
 
@@ -1768,7 +1854,15 @@ def _compute_session_outputs(
             ids_used_gt = _parse_trial_ids(row.get(trial_ids_used_gt_thr_col, None))
             m_used_gt = _get_mask(ids_used_gt)
             if m_used_gt is not None:
-                mean_rate_used_gt, z_used_gt = _mean_and_z(unit_psth_all, m_used_gt)
+                mean_rate_used_gt = _mean_rate_from_mask(unit_psth_all, m_used_gt)
+
+                if zscore_mode == "within_quantile":
+                    mu_ug, sd_ug = _baseline_stats_from_mask(unit_psth_all, m_used_gt)
+                else:
+                    mu_ug, sd_ug = baseline_stats_gt.get(u, (np.nan, np.nan))
+
+                z_used_gt = _z_from_stats(mean_rate_used_gt, mu_ug, sd_ug) if np.isfinite(mu_ug) else np.zeros_like(mean_rate_used_gt)
+
                 out_cols[f"{used_prefix}_mean_rate_gt_thr"] = mean_rate_used_gt
                 out_cols[f"{used_prefix}_zscore_gt_thr"] = z_used_gt
 
@@ -1798,10 +1892,13 @@ def append_average_psth_from_combined_df_parallel(
     save_format: Literal["pickle", "parquet", "csv"] = "pickle",
     parquet_compression: Literal["snappy", "gzip", "brotli", "zstd", "none"] = "snappy",
     # --- NEW: also compute PSTH for combined trial sets ---
+    # Combined trial sets
     compute_used_trials: bool = True,
     trial_ids_used_col: str = "trial_ids_used",
     trial_ids_used_gt_thr_col: str = "trial_ids_used_gt_thr",
     used_prefix: str = "used",
+    # NEW: z-score option
+    zscore_mode: Literal["within_quantile", "across_all_quantiles"] = "across_all_quantiles",
 ) -> Tuple[pd.DataFrame, np.ndarray]:
     """
     Parallel append of average PSTH / z-scored PSTH into combined_df, with optional saving.
@@ -1996,47 +2093,10 @@ def append_average_psth_from_combined_df_parallel(
 
     Saving behavior
     ---------------
-    pickle:
-        Best format. Preserves numpy arrays exactly.
-
-    parquet:
-        Arrays converted to lists.
-
-    csv:
-        Arrays converted to JSON strings.
-
-    Performance characteristics
-    ---------------------------
-    Time complexity:
-        O(n_sessions × load_psth + n_units)
-
-    Memory usage:
-        Moderate. PSTH loaded one session at a time.
-
-    Major speed advantage over non-parallel version due to:
-        - session batching
-        - parallel execution
-        - PSTH mask caching
-
-    Raises
-    ------
-    ValueError
-        If no quantile trial-id columns found.
-
-    RuntimeError
-        If no PSTH data loaded successfully.
-
-    Examples
-    --------
-    df_out, time = append_average_psth_from_combined_df_parallel(
-        combined_df,
-        psth_root="/root/capsule/scratch/psth_results/",
-        max_workers=8,
-        save_path="psth.pkl",
-        save_format="pickle",
-    )
+    - "within_quantile": baseline stats computed within each subset.
+    - "across_all_quantiles": baseline stats computed per unit from the union of trials
+      across all subsets (RAW and GT_THR computed separately), then reused for every subset.
     """
-
     # Optional tqdm progress
     tqdm = None
     if show_progress:
@@ -2045,6 +2105,9 @@ def append_average_psth_from_combined_df_parallel(
             tqdm = _tqdm
         except Exception:
             tqdm = None
+
+    if zscore_mode not in ("within_quantile", "across_all_quantiles"):
+        raise ValueError("zscore_mode must be one of {'within_quantile','across_all_quantiles'}.")
 
     df_out = combined_df.copy()
 
@@ -2077,7 +2140,7 @@ def append_average_psth_from_combined_df_parallel(
 
     q_list = sorted(q_nums)
 
-    # Create object columns up-front so assigning np.ndarray per cell works
+    # Create object columns up-front
     n_rows = len(df_out)
     for q in q_list:
         df_out[f"{quantile_prefix}{q}_mean_rate"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
@@ -2085,7 +2148,6 @@ def append_average_psth_from_combined_df_parallel(
         df_out[f"{quantile_prefix}{q}_mean_rate_gt_thr"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
         df_out[f"{quantile_prefix}{q}_zscore_gt_thr"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
 
-    # NEW: combined-trial columns
     has_used_cols = (
         compute_used_trials
         and (trial_ids_used_col in df_out.columns or trial_ids_used_gt_thr_col in df_out.columns)
@@ -2096,7 +2158,6 @@ def append_average_psth_from_combined_df_parallel(
         df_out[f"{used_prefix}_mean_rate_gt_thr"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
         df_out[f"{used_prefix}_zscore_gt_thr"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
 
-    # Group by session; each session becomes one worker task
     grouped = [(sid, g.copy()) for sid, g in df_out.groupby(session_col, sort=False)]
 
     if max_workers is None:
@@ -2122,10 +2183,10 @@ def append_average_psth_from_combined_df_parallel(
                 q_cols=q_cols,
                 q_gt_cols=q_gt_cols,
                 quantile_prefix=quantile_prefix,
-                # NEW: pass combined columns (or disable)
                 trial_ids_used_col=(trial_ids_used_col if (has_used_cols and trial_ids_used_col in df_out.columns) else None),
                 trial_ids_used_gt_thr_col=(trial_ids_used_gt_thr_col if (has_used_cols and trial_ids_used_gt_thr_col in df_out.columns) else None),
                 used_prefix=used_prefix,
+                zscore_mode=zscore_mode,
             )
             for sid, g in grouped
         ]
@@ -2147,7 +2208,6 @@ def append_average_psth_from_combined_df_parallel(
                 if len(times) != len(common_time) or not np.allclose(times, common_time):
                     raise ValueError("Time axis differs between sessions.")
 
-            # Apply results back into df_out
             for idx, cols in per_row.items():
                 for colname, arr in cols.items():
                     df_out.at[idx, colname] = arr
@@ -2158,9 +2218,7 @@ def append_average_psth_from_combined_df_parallel(
     if add_time_column:
         df_out[time_col_name] = [common_time] * len(df_out)
 
-    # ------------------------------------------------------------------
-    # Optional save
-    # ------------------------------------------------------------------
+    # Optional save (same behavior as your prior version)
     if save_path is not None:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2214,3 +2272,4 @@ def append_average_psth_from_combined_df_parallel(
             raise ValueError(f"Unsupported save_format: {save_format}. Use 'pickle', 'parquet', or 'csv'.")
 
     return df_out, common_time
+
