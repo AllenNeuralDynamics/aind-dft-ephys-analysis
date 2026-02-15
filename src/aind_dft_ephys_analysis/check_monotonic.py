@@ -1514,7 +1514,6 @@ def _parse_trial_ids(x: Any) -> np.ndarray:
     except Exception:
         return np.asarray([], dtype=int)
 
-
 def _compute_session_outputs(
     session_id: str,
     g: pd.DataFrame,
@@ -1531,6 +1530,10 @@ def _compute_session_outputs(
     q_cols: Dict[int, str],
     q_gt_cols: Dict[int, str],
     quantile_prefix: str,
+    # --- NEW: combined (all-quantiles) trial-id columns ---
+    trial_ids_used_col: Optional[str] = "trial_ids_used",
+    trial_ids_used_gt_thr_col: Optional[str] = "trial_ids_used_gt_thr",
+    used_prefix: str = "used",
 ) -> Tuple[str, Dict[Any, Dict[str, np.ndarray]], np.ndarray]:
     """
     Compute (mean_rate, zscore) PSTHs for all rows belonging to ONE session.
@@ -1610,7 +1613,15 @@ def _compute_session_outputs(
     times : numpy.ndarray
         The PSTH time axis for this session (1D shape (T,)).
         Used by the parent function to enforce a shared time axis across sessions.
-
+    NEW:
+    - Also compute mean/zscore PSTH for the combined trial sets stored in:
+        - `trial_ids_used_col` (default: "trial_ids_used")
+        - `trial_ids_used_gt_thr_col` (default: "trial_ids_used_gt_thr")
+      Output columns:
+        - f"{used_prefix}_mean_rate"
+        - f"{used_prefix}_zscore"
+        - f"{used_prefix}_mean_rate_gt_thr"
+        - f"{used_prefix}_zscore_gt_thr"
     Notes
     -----
     Performance:
@@ -1629,11 +1640,18 @@ def _compute_session_outputs(
     # Union trials across all rows and all q columns in this session
     all_trials: List[int] = []
     for _, row in g.iterrows():
+        # Quantile-specific trial sets
         for q in q_list:
             if q in q_cols:
                 all_trials.extend(_parse_trial_ids(row.get(q_cols[q], None)).tolist())
             if q in q_gt_cols:
                 all_trials.extend(_parse_trial_ids(row.get(q_gt_cols[q], None)).tolist())
+
+        # NEW: combined trial sets
+        if trial_ids_used_col is not None and trial_ids_used_col in g.columns:
+            all_trials.extend(_parse_trial_ids(row.get(trial_ids_used_col, None)).tolist())
+        if trial_ids_used_gt_thr_col is not None and trial_ids_used_gt_thr_col in g.columns:
+            all_trials.extend(_parse_trial_ids(row.get(trial_ids_used_gt_thr_col, None)).tolist())
 
     if len(all_trials) == 0:
         return session_id, {}, np.asarray([])
@@ -1716,6 +1734,7 @@ def _compute_session_outputs(
         unit_psth_all = psth_da.isel(unit=unit_pos_map[u])
         out_cols: Dict[str, np.ndarray] = {}
 
+        # Quantile-specific outputs
         for q in q_list:
             if q in q_cols:
                 ids = _parse_trial_ids(row.get(q_cols[q], None))
@@ -1733,10 +1752,28 @@ def _compute_session_outputs(
                     out_cols[f"{quantile_prefix}{q}_mean_rate_gt_thr"] = mean_rate_gt
                     out_cols[f"{quantile_prefix}{q}_zscore_gt_thr"] = z_gt
 
+        # NEW: combined trial-id outputs
+        if trial_ids_used_col is not None and trial_ids_used_col in g.columns:
+            ids_used = _parse_trial_ids(row.get(trial_ids_used_col, None))
+            m_used = _get_mask(ids_used)
+            if m_used is not None:
+                mean_rate_used, z_used = _mean_and_z(unit_psth_all, m_used)
+                out_cols[f"{used_prefix}_mean_rate"] = mean_rate_used
+                out_cols[f"{used_prefix}_zscore"] = z_used
+
+        if trial_ids_used_gt_thr_col is not None and trial_ids_used_gt_thr_col in g.columns:
+            ids_used_gt = _parse_trial_ids(row.get(trial_ids_used_gt_thr_col, None))
+            m_used_gt = _get_mask(ids_used_gt)
+            if m_used_gt is not None:
+                mean_rate_used_gt, z_used_gt = _mean_and_z(unit_psth_all, m_used_gt)
+                out_cols[f"{used_prefix}_mean_rate_gt_thr"] = mean_rate_used_gt
+                out_cols[f"{used_prefix}_zscore_gt_thr"] = z_used_gt
+
         if out_cols:
             per_row[idx] = out_cols
 
     return session_id, per_row, times
+
 
 def append_average_psth_from_combined_df_parallel(
     combined_df: pd.DataFrame,
@@ -1757,6 +1794,11 @@ def append_average_psth_from_combined_df_parallel(
     save_path: Optional[Union[str, Path]] = None,
     save_format: Literal["pickle", "parquet", "csv"] = "pickle",
     parquet_compression: Literal["snappy", "gzip", "brotli", "zstd", "none"] = "snappy",
+    # --- NEW: also compute PSTH for combined trial sets ---
+    compute_used_trials: bool = True,
+    trial_ids_used_col: str = "trial_ids_used",
+    trial_ids_used_gt_thr_col: str = "trial_ids_used_gt_thr",
+    used_prefix: str = "used",
 ) -> Tuple[pd.DataFrame, np.ndarray]:
     """
     Parallel append of average PSTH / z-scored PSTH into combined_df, with optional saving.
@@ -1932,7 +1974,17 @@ def append_average_psth_from_combined_df_parallel(
         Each cell contains:
             numpy.ndarray shape (T,)
             OR None
+    NEW:
+    - If compute_used_trials=True and the columns exist, also compute PSTHs for:
+        - `trial_ids_used_col` (default: "trial_ids_used")
+        - `trial_ids_used_gt_thr_col` (default: "trial_ids_used_gt_thr")
+      Output columns:
+        - f"{used_prefix}_mean_rate"
+        - f"{used_prefix}_zscore"
+        - f"{used_prefix}_mean_rate_gt_thr"
+        - f"{used_prefix}_zscore_gt_thr"
 
+        
     common_time : numpy.ndarray
         Shared PSTH time axis.
 
@@ -2030,6 +2082,17 @@ def append_average_psth_from_combined_df_parallel(
         df_out[f"{quantile_prefix}{q}_mean_rate_gt_thr"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
         df_out[f"{quantile_prefix}{q}_zscore_gt_thr"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
 
+    # NEW: combined-trial columns
+    has_used_cols = (
+        compute_used_trials
+        and (trial_ids_used_col in df_out.columns or trial_ids_used_gt_thr_col in df_out.columns)
+    )
+    if has_used_cols:
+        df_out[f"{used_prefix}_mean_rate"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
+        df_out[f"{used_prefix}_zscore"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
+        df_out[f"{used_prefix}_mean_rate_gt_thr"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
+        df_out[f"{used_prefix}_zscore_gt_thr"] = pd.Series([None] * n_rows, index=df_out.index, dtype="object")
+
     # Group by session; each session becomes one worker task
     grouped = [(sid, g.copy()) for sid, g in df_out.groupby(session_col, sort=False)]
 
@@ -2056,6 +2119,10 @@ def append_average_psth_from_combined_df_parallel(
                 q_cols=q_cols,
                 q_gt_cols=q_gt_cols,
                 quantile_prefix=quantile_prefix,
+                # NEW: pass combined columns (or disable)
+                trial_ids_used_col=(trial_ids_used_col if (has_used_cols and trial_ids_used_col in df_out.columns) else None),
+                trial_ids_used_gt_thr_col=(trial_ids_used_gt_thr_col if (has_used_cols and trial_ids_used_gt_thr_col in df_out.columns) else None),
+                used_prefix=used_prefix,
             )
             for sid, g in grouped
         ]
@@ -2097,12 +2164,9 @@ def append_average_psth_from_combined_df_parallel(
 
         psth_cols = [
             c for c in df_out.columns
-            if c.startswith(quantile_prefix)
-            and (
-                c.endswith("_mean_rate")
-                or c.endswith("_zscore")
-                or c.endswith("_mean_rate_gt_thr")
-                or c.endswith("_zscore_gt_thr")
+            if (
+                (c.startswith(quantile_prefix) and (c.endswith("_mean_rate") or c.endswith("_zscore") or c.endswith("_mean_rate_gt_thr") or c.endswith("_zscore_gt_thr")))
+                or (c.startswith(f"{used_prefix}_") and (c.endswith("_mean_rate") or c.endswith("_zscore") or c.endswith("_mean_rate_gt_thr") or c.endswith("_zscore_gt_thr")))
             )
         ]
 
@@ -2129,7 +2193,6 @@ def append_average_psth_from_combined_df_parallel(
 
         elif save_format == "csv":
             import json
-
             df_save = df_out.copy()
 
             def _obj_to_json(v: Any) -> Any:
@@ -2148,4 +2211,3 @@ def append_average_psth_from_combined_df_parallel(
             raise ValueError(f"Unsupported save_format: {save_format}. Use 'pickle', 'parquet', or 'csv'.")
 
     return df_out, common_time
-
