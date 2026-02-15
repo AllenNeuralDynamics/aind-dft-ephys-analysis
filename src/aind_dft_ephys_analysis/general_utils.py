@@ -527,6 +527,12 @@ def load_ctt_results_dataframe(
 
 
 
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from typing import Union, Optional, Sequence, Any
+
 
 def save_df_with_psth_csv(
     df: pd.DataFrame,
@@ -535,39 +541,15 @@ def save_df_with_psth_csv(
     array_columns: Optional[Sequence[str]] = None,
     overwrite: bool = True,
     show_progress: bool = True,
+    na_rep: str = "",
 ) -> None:
     """
-    Save DataFrame containing numpy array cells to CSV.
+    Save DataFrame with numpy arrays in cells to CSV.
 
-    Arrays are serialized using JSON so they can be restored later.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        DataFrame containing numpy arrays in some columns.
-
-    path : str or Path
-        Output CSV file path.
-
-    array_columns : list[str] or None, default=None
-        Columns to serialize as arrays.
-
-        If None:
-            automatically detects columns containing numpy arrays.
-
-    overwrite : bool, default=True
-        If False, raises error if file exists.
-
-    show_progress : bool, default=True
-        Print progress info.
-
-    Notes
-    -----
-    Arrays are stored as JSON strings.
+    - numpy.ndarray -> JSON string (via json.dumps(array.tolist()))
+    - None / NaN -> empty string (controlled by na_rep)
     """
-
     path = Path(path)
-
     if path.exists() and not overwrite:
         raise FileExistsError(f"{path} already exists")
 
@@ -575,25 +557,24 @@ def save_df_with_psth_csv(
 
     # Auto-detect array columns if not provided
     if array_columns is None:
-        array_columns = [
-            c for c in df.columns
-            if df[c].apply(lambda x: isinstance(x, np.ndarray)).any()
-        ]
+        array_columns = [c for c in df_save.columns if df_save[c].apply(lambda x: isinstance(x, np.ndarray)).any()]
 
     if show_progress:
         print(f"[SAVE] Serializing {len(array_columns)} array columns...")
 
-    # Convert arrays to JSON
-    for col in array_columns:
-        df_save[col] = df_save[col].apply(
-            lambda x: json.dumps(x.tolist()) if isinstance(x, np.ndarray) else None
-        )
+    def _to_json_or_empty(v: Any) -> str:
+        if isinstance(v, np.ndarray):
+            return json.dumps(v.tolist())
+        return na_rep
 
-    df_save.to_csv(path, index=False)
+    for col in array_columns:
+        df_save[col] = df_save[col].apply(_to_json_or_empty)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df_save.to_csv(path, index=False, na_rep=na_rep)
 
     if show_progress:
         print(f"[SAVE] CSV saved: {path}")
-
 
 
 def load_df_with_psth_csv(
@@ -601,57 +582,83 @@ def load_df_with_psth_csv(
     *,
     array_columns: Optional[Sequence[str]] = None,
     show_progress: bool = True,
+    keep_bad_strings: bool = False,
+    dtype: Any = float,
 ) -> pd.DataFrame:
     """
-    Load CSV saved by save_df_with_psth_csv and restore numpy arrays.
+    Load CSV produced by save_df_with_psth_csv and restore numpy arrays.
+
+    Robust parsing:
+    - Only attempts json.loads on strings that look like JSON arrays: startswith '[' and endswith ']'
+    - Treats '', 'nan', 'none', 'null' as None
+    - If parsing fails:
+        - keep_bad_strings=False -> return None
+        - keep_bad_strings=True  -> keep original string
 
     Parameters
     ----------
-    path : str or Path
-        CSV file path.
+    keep_bad_strings : bool
+        If True, keep un-parseable strings as-is rather than converting to None.
 
-    array_columns : list[str] or None
-        Columns to restore as numpy arrays.
-
-        If None:
-            auto-detect columns that look like JSON arrays.
-
-    show_progress : bool, default=True
-        Print progress info.
-
-    Returns
-    -------
-    pandas.DataFrame
+    dtype : Any
+        dtype for restored arrays, default float.
     """
-
     path = Path(path)
-
     if show_progress:
         print(f"[LOAD] Reading CSV: {path}")
 
     df = pd.read_csv(path)
 
-    # Auto-detect array columns if needed
+    # Auto-detect array columns if not provided:
+    # choose columns where ANY non-null cell looks like a JSON array.
     if array_columns is None:
+        def _looks_like_json_array(x: Any) -> bool:
+            if not isinstance(x, str):
+                return False
+            s = x.strip()
+            return len(s) >= 2 and s[0] == "[" and s[-1] == "]"
 
-        def looks_like_array(x):
-            return isinstance(x, str) and x.startswith("[") and x.endswith("]")
-
-        array_columns = [
-            c for c in df.columns
-            if df[c].dropna().apply(looks_like_array).any()
-        ]
+        array_columns = []
+        for c in df.columns:
+            ser = df[c].dropna()
+            if len(ser) == 0:
+                continue
+            # sample a few values to avoid scanning everything
+            sample = ser.head(50).tolist()
+            if any(_looks_like_json_array(v) for v in sample):
+                array_columns.append(c)
 
     if show_progress:
         print(f"[LOAD] Restoring {len(array_columns)} array columns...")
 
-    # Restore arrays
+    def _parse_cell(x: Any) -> Any:
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return None
+        if not isinstance(x, str):
+            return None
+
+        s = x.strip()
+        if s == "" or s.lower() in {"nan", "none", "null"}:
+            return None
+
+        # Only parse strings that look like JSON arrays
+        if not (s.startswith("[") and s.endswith("]")):
+            return x if keep_bad_strings else None
+
+        try:
+            obj = json.loads(s)
+            # Ensure list-like
+            if isinstance(obj, list):
+                return np.array(obj, dtype=dtype)
+            return x if keep_bad_strings else None
+        except Exception:
+            return x if keep_bad_strings else None
+
     for col in array_columns:
-        df[col] = df[col].apply(
-            lambda x: np.array(json.loads(x)) if isinstance(x, str) else None
-        )
+        df[col] = df[col].map(_parse_cell)
 
     if show_progress:
         print("[LOAD] Done.")
 
     return df
+
