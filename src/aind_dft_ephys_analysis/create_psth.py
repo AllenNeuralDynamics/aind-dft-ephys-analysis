@@ -1,15 +1,35 @@
+from __future__ import annotations
+
+# ==============================
+# Standard library
+# ==============================
+from pathlib import Path
+from typing import (
+    Any,
+    Iterable,
+    Sequence,
+    Tuple,
+    Optional,
+    Union,
+    Literal,
+    Mapping,
+    List,
+    Dict,
+)
+
+# ==============================
+# Third-party libraries
+# ==============================
 import numpy as np
 import xarray as xr
-from pathlib import Path
-from typing import Any, Iterable, Sequence, Tuple, Optional, Union
-from ephys_behavior import get_units_passed_default_qc
-from behavior_utils import extract_event_timestamps, find_trials
-import numpy as np
-import xarray as xr
-from pathlib import Path
-from typing import Any, Iterable, Tuple, Optional, Union, Literal,Mapping, List, Dict
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+
+# ==============================
+# Project-specific imports
+# ==============================
+from ephys_behavior import get_units_passed_default_qc
+from behavior_utils import extract_event_timestamps, find_trials
 
 
 def extract_neuron_psth_to_zarr(
@@ -492,6 +512,252 @@ def mean_firing_rate_matrix(
 
 
 
+def extract_neuron_psth_full_session_to_zarr(
+    nwb_data: Any,
+    units: Optional[Iterable[int]] = None,
+    *,
+    bin_size: float = 0.1,
+    time_range: Optional[Tuple[float, float]] = None,
+    t0_mode: Literal["none", "min_spike"] = "min_spike",
+    save_folder: Union[str, Path] = "/root/capsule/results",
+    save_name: Optional[str] = None,
+    overwrite: bool = True,
+) -> xr.Dataset:
+    """
+    Compute a full-session binned spike count matrix and firing-rate PSTH for a set of units,
+    then save the result as a Zarr-backed xarray.Dataset.
 
+    This function treats the entire recording as one continuous time axis (not trial-aligned).
+    It reads spike timestamps from:
+        nwb_data.units["spike_times"][unit_index]
+    where each entry is expected to be an array-like of spike times (seconds).
+
+    Parameters
+    ----------
+    nwb_data
+        An NWB-like object that exposes `units["spike_times"]` and optionally `session_id`.
+
+    units
+        Iterable of unit indices to include. If None, uses `get_units_passed_default_qc(nwb_data)`
+        to select units that pass a default QC filter.
+
+    bin_size
+        Bin width in seconds used to histogram spikes. PSTH firing rate is computed as:
+            rate (Hz) = counts / bin_size
+
+    time_range
+        (t_start, t_end) for the histogram time axis *after* applying the `t0_mode` shift.
+        - If None: inferred from global min/max spike time across ALL selected units.
+        - If provided: used as-is (assumed to match the spike time base after t0 shift).
+
+    t0_mode
+        Controls whether spike times are shifted before histogramming:
+        - "min_spike": subtract global minimum spike time (across selected units), so time starts near 0.
+        - "none": do not shift spike times (t0 = 0).
+
+    save_folder
+        Folder where the Zarr dataset will be written.
+
+    save_name
+        Name of the Zarr store. If None, defaults to "{session_id}_full_psth.zarr".
+        If provided without ".zarr" suffix, the suffix is appended.
+
+    overwrite
+        If True and the destination exists, deletes the existing Zarr store before writing.
+
+    Returns
+    -------
+    xr.Dataset
+        Dataset with:
+          - counts_full: int32 array, shape (n_units, n_bins)
+          - psth_full: float32 array (Hz), shape (n_units, n_bins)
+        Coordinates:
+          - unit_index: unit ids/indices used (len = n_units)
+          - time: bin centers in seconds (len = n_bins)
+        Attributes include session_id, bin_size, time_range, raw spike time range, and t0 info.
+    """
+
+    # ---------------------------------------------------------------------
+    # 1) Determine which units to include
+    # ---------------------------------------------------------------------
+    # If the caller didn't pass units explicitly, select units using a default QC rule.
+    if units is None:
+        units = get_units_passed_default_qc(nwb_data)
+
+    # Convert to a concrete list so we can:
+    #   - compute length
+    #   - iterate multiple times
+    #   - preserve ordering
+    units = list(units)
+
+    # Defensive check: a PSTH over "no units" is meaningless.
+    if len(units) == 0:
+        raise ValueError("No units selected.")
+
+    # ---------------------------------------------------------------------
+    # 2) Load spike trains and compute GLOBAL min/max across ALL selected units
+    # ---------------------------------------------------------------------
+    # We store each unit's spike train to avoid reading from NWB twice.
+    spike_trains: List[np.ndarray] = []
+
+    # Track the minimum and maximum spike time observed across the selected units.
+    # These are used to infer session-wide time_range when time_range=None.
+    global_min = np.inf
+    global_max = -np.inf
+
+    for u in units:
+        # Convert spike times to a float numpy array.
+        # Assumes nwb_data.units["spike_times"][u] is array-like (possibly ragged lists).
+        st = np.asarray(nwb_data.units["spike_times"][u], dtype=float)
+        spike_trains.append(st)
+
+        # Update global min/max only if this unit actually has spikes.
+        if st.size > 0:
+            smin = float(st.min())
+            smax = float(st.max())
+            if smin < global_min:
+                global_min = smin
+            if smax > global_max:
+                global_max = smax
+
+    # If all spike trains were empty (or invalid), global_min/max remain +/- inf.
+    # Also reject degenerate ranges where max <= min.
+    if not np.isfinite(global_min) or not np.isfinite(global_max) or global_max <= global_min:
+        raise ValueError("Could not infer global min/max spike time across units (all empty?).")
+
+    # ---------------------------------------------------------------------
+    # 3) Choose the reference t0 (time shift) based on t0_mode
+    # ---------------------------------------------------------------------
+    # t0 is subtracted from all spike times before histogramming.
+    # "min_spike" shifts the earliest spike in the selected set to ~0.
+    if t0_mode == "min_spike":
+        t0 = global_min
+    elif t0_mode == "none":
+        t0 = 0.0
+    else:
+        raise ValueError("t0_mode must be one of {'none','min_spike'}")
+
+    # ---------------------------------------------------------------------
+    # 4) Determine histogram time_range in the shifted time base
+    # ---------------------------------------------------------------------
+    # If user didn't provide time_range, infer it from the global min/max (raw),
+    # then convert into the post-shift time base by subtracting t0.
+    if time_range is None:
+        t_start = global_min - t0
+        t_end = global_max - t0
+    else:
+        # If time_range is provided, we assume it is already in the same time base
+        # as spike times after shifting by t0 (i.e., it matches st - t0).
+        t_start, t_end = float(time_range[0]), float(time_range[1])
+
+    # Validate final range (must be finite and have positive width).
+    if not np.isfinite(t_start) or not np.isfinite(t_end) or t_end <= t_start:
+        raise ValueError(f"Invalid time_range: ({t_start}, {t_end})")
+
+    # ---------------------------------------------------------------------
+    # 5) Build histogram bin edges and bin centers
+    # ---------------------------------------------------------------------
+    # Number of bins: ceil ensures we cover the full span even if not divisible by bin_size.
+    n_bins = int(np.ceil((t_end - t_start) / bin_size))
+
+    # Bin edges: length = n_bins + 1
+    # Edges are [t_start, t_start+bin_size, ..., t_start+n_bins*bin_size]
+    edges = t_start + np.arange(n_bins + 1, dtype=float) * bin_size
+
+    # Bin centers: used as the time coordinate in the output.
+    centers = edges[:-1] + bin_size / 2.0
+
+    # ---------------------------------------------------------------------
+    # 6) Histogram spikes for each unit
+    # ---------------------------------------------------------------------
+    # counts: (n_units, n_bins)
+    counts = np.zeros((len(units), n_bins), dtype=np.int32)
+
+    for ui, st in enumerate(spike_trains):
+        # Skip units with no spikes.
+        if st.size == 0:
+            continue
+
+        # Shift spike timestamps by t0 (either 0 or global_min).
+        st = st - t0
+
+        # Restrict spikes to the desired [t_start, t_end] range before histogramming.
+        # Note: np.histogram uses half-open bins [edge_i, edge_{i+1}) except the last bin,
+        # which includes the right edge. Here we filter using <= t_end which is consistent
+        # with allowing spikes exactly at t_end to potentially land in the last bin.
+        st = st[(st >= t_start) & (st <= t_end)]
+        if st.size == 0:
+            continue
+
+        # Histogram: returns counts per bin (length n_bins).
+        c, _ = np.histogram(st, bins=edges)
+
+        # Store as int32 without unnecessary copies.
+        counts[ui, :] = c.astype(np.int32, copy=False)
+
+    # Convert to firing rate (Hz) as float32 for compactness.
+    psth = counts.astype(np.float32) / float(bin_size)
+
+    # ---------------------------------------------------------------------
+    # 7) Package results into an xarray.Dataset
+    # ---------------------------------------------------------------------
+    ds = xr.Dataset(
+        data_vars={
+            # Raw binned spike counts
+            "counts_full": (("unit", "time"), counts),
+            # Firing rate (Hz)
+            "psth_full": (("unit", "time"), psth),
+        },
+        coords={
+            # The original unit indices (from NWB indexing) for each row
+            "unit_index": ("unit", units),
+            # Bin centers for the time coordinate
+            "time": ("time", centers),
+        },
+        attrs={
+            # Helpful metadata for provenance / reproducibility
+            "session_id": getattr(nwb_data, "session_id", "unknown"),
+            "bin_size": float(bin_size),
+            # Time range in the post-shift time base used for edges/centers
+            "time_range": (float(t_start), float(t_end)),
+            # Raw time range in the original spike time base (before subtracting t0)
+            "global_spike_time_range_raw": (float(global_min), float(global_max)),
+            "t0_mode": t0_mode,
+            "t0_subtracted": float(t0),
+            "n_units": int(len(units)),
+            "created_with": "extract_neuron_psth_full_session_to_zarr",
+        },
+    )
+
+    # ---------------------------------------------------------------------
+    # 8) Save the dataset to a Zarr store on disk
+    # ---------------------------------------------------------------------
+    session_id = getattr(nwb_data, "session_id", "session")
+
+    # If the caller didn't provide a save_name, build a default.
+    if save_name is None:
+        save_name = f"{session_id}_full_psth.zarr"
+    elif not str(save_name).endswith(".zarr"):
+        # Ensure the name ends in .zarr for consistency.
+        save_name = f"{save_name}.zarr"
+
+    # Destination path: expand ~ and join folder/name.
+    dest = Path(save_folder).expanduser() / str(save_name)
+
+    # Overwrite behavior: remove existing directory-based Zarr store.
+    if dest.exists() and overwrite:
+        import shutil
+        shutil.rmtree(dest)
+
+    # Write the dataset. consolidated=True writes consolidated metadata
+    # (faster opening in many workflows).
+    ds.to_zarr(dest, mode="w", consolidated=True)
+
+    print(
+        f"Saved full-session PSTH to {dest} "
+        f"[t0_mode={t0_mode}, time_range={ds.attrs['time_range']}]"
+    )
+
+    return ds
 
 
