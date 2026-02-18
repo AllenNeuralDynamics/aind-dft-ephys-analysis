@@ -1,13 +1,34 @@
+# ============================================================
+# Future annotations (must be first)
+# ============================================================
 from __future__ import annotations
 
+# ============================================================
+# Standard library
+# ============================================================
 import os
 import ast
 import json
-from typing import Optional, Dict, Sequence, Iterable, Union, List, Tuple, Callable
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
+# ============================================================
+# Third-party libraries
+# ============================================================
 import numpy as np
 import pandas as pd
 
+# ============================================================
+# Local / project imports
+# ============================================================
 from behavior_qc_visualization import (
     plot_rpe_history_regression_from_nwb,
 )
@@ -15,8 +36,7 @@ from behavior_qc_visualization import (
 from behavior_utils import get_fitted_latent
 from model_fitting import fit_choice_logistic_regression_from_nwb
 from nwb_utils import NWBUtils
-
-
+from general_utils import extract_session_name_core
 
 def collect_behavior_model_summary(
     sessions: Optional[Iterable[str]] = None,
@@ -675,3 +695,121 @@ def append_model_criteria_result(
 
     return df
 
+
+
+
+
+
+def append_summary_to_df_by_session(
+    df: pd.DataFrame,
+    summary: pd.DataFrame,
+    *,
+    df_session_col: str = "session_name",
+    summary_session_col: str = "session_name",
+    summary_cols: Optional[Sequence[str]] = None,
+    prefix: str = "summary__",
+    keep_session_core_cols: bool = False,
+    how: str = "left",
+    dedup_summary: bool = True,
+) -> pd.DataFrame:
+    """
+    Append session-level summary columns to a DataFrame by matching sessions.
+
+    Matching rule
+    -------------
+    - Both df and summary are matched using a normalized key:
+        session_name_core = extract_session_name_core(basename(session_name))
+      This is robust to:
+        - full paths vs basenames
+        - trailing slashes
+        - extra prefixes/suffixes in session strings (as handled by extract_session_name_core)
+
+    Parameters
+    ----------
+    df
+        Input DataFrame that contains a session identifier column (df_session_col).
+
+    summary
+        Session-level summary DataFrame (e.g., behavior_model_summary_*.csv after
+        append_model_criteria_result), containing summary_session_col.
+
+    df_session_col
+        Column in df containing session identifiers.
+
+    summary_session_col
+        Column in summary containing session identifiers.
+
+    summary_cols
+        Which columns from summary to append.
+        - None: append all columns except summary_session_col.
+        - Sequence: append only these columns (if present).
+
+    prefix
+        Prefix to add to appended summary columns to avoid name collisions.
+
+    keep_session_core_cols
+        If True, keep helper columns:
+          - df_session_name_core
+          - summary_session_name_core
+        If False, drop helper columns before returning.
+
+    how
+        Merge mode. Usually "left".
+
+    dedup_summary
+        If True, drop duplicate sessions in summary (by core key) keeping first.
+
+    Returns
+    -------
+    df_out
+        A copy of df with appended summary columns.
+    """
+    if df_session_col not in df.columns:
+        raise KeyError(f"df is missing required column: {df_session_col!r}")
+    if summary_session_col not in summary.columns:
+        raise KeyError(f"summary is missing required column: {summary_session_col!r}")
+
+    df_out = df.copy()
+    summ = summary.copy()
+
+    # Normalize both session columns to session core keys
+    df_out["_df_session_name_core"] = (
+        df_out[df_session_col]
+        .astype(str)
+        .map(lambda s: extract_session_name_core(s.rstrip("/").split("/")[-1]))
+    )
+
+    summ["_summary_session_name_core"] = (
+        summ[summary_session_col]
+        .astype(str)
+        .map(lambda s: extract_session_name_core(s.rstrip("/").split("/")[-1]))
+    )
+
+    # Decide which summary columns to append
+    if summary_cols is None:
+        cols_to_add = [c for c in summ.columns if c not in {summary_session_col, "_summary_session_name_core"}]
+    else:
+        cols_to_add = [c for c in summary_cols if c in summ.columns]
+
+    # Build lookup table: one row per session core
+    lookup = summ[["_summary_session_name_core"] + cols_to_add].copy()
+    if dedup_summary:
+        lookup = lookup.drop_duplicates(subset=["_summary_session_name_core"], keep="first")
+
+    # Prefix columns to avoid collisions
+    rename_map = {c: f"{prefix}{c}" for c in cols_to_add}
+    lookup = lookup.rename(columns=rename_map)
+
+    # Merge
+    df_out = df_out.merge(
+        lookup,
+        left_on="_df_session_name_core",
+        right_on="_summary_session_name_core",
+        how=how,
+    )
+
+    # Optionally drop helper keys
+    if not keep_session_core_cols:
+        df_out = df_out.drop(columns=["_df_session_name_core", "_summary_session_name_core"], errors="ignore")
+
+    return df_out
