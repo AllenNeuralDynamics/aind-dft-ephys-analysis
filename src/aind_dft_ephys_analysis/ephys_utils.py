@@ -1,13 +1,44 @@
+# ============================================================
+# Future annotations (must be first)
+# ============================================================
+from __future__ import annotations
+
+# ============================================================
+# Standard library
+# ============================================================
 import os
 import glob
 import json
+from pathlib import Path
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
-from typing import Union, Sequence, Optional, Any, Dict, Iterable
+# ============================================================
+# Third-party libraries
+# ============================================================
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 
-from general_utils import format_session_name
+# ============================================================
+# Local / project imports
+# ============================================================
+from general_utils import (
+    format_session_name,
+    extract_session_name_core,
+)
+from nwb_utils import NWBUtils
+
+
 
 def save_ccf_locations_to_json(
     units_table: Any,
@@ -437,3 +468,255 @@ def append_units_locations(nwb_data: Any,
     )
 
     return nwb_data
+
+
+
+
+def _try_close(obj: Any) -> None:
+    """
+    Best-effort resource cleanup helper.
+
+    Parameters
+    ----------
+    obj : Any
+        An arbitrary object that *may* hold external resources (e.g., an NWB IO handle).
+        If `obj` has a callable `.close()` method, this function will attempt to call it.
+
+    Behavior / Notes
+    ----------------
+    - If `obj` is None: do nothing.
+    - If `.close()` does not exist or is not callable: do nothing.
+    - If `.close()` raises any exception: swallow it (ignore), because cleanup should
+      never crash the main processing loop.
+    """
+    if obj is None:
+        return
+    try:
+        close = getattr(obj, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
+
+
+def _extract_brain_region_from_ccf(loc: Any) -> str:
+    """
+    Normalize a "ccf_location"-like field into a simple `brain_region` string.
+
+    Parameters
+    ----------
+    loc : Any
+        A single unit's location entry (commonly coming from `units["ccf_location"][u]`).
+        Depending on your pipeline, this could be:
+        - None
+        - a dict-like object (e.g., {"brain_region": "MOs", ...})
+        - a string
+        - another object with a meaningful string representation
+
+    Returns
+    -------
+    str
+        A string brain region label.
+        - Returns "" if `loc` is None, or if `brain_region` is missing / None in a dict.
+        - If `loc` is a dict, attempts to read `loc["brain_region"]`.
+        - Otherwise returns `str(loc)`; if string conversion fails, returns "".
+
+    Rationale
+    ---------
+    Your `ccf_location` column can store structured metadata. This helper extracts just
+    the "brain_region" label for a convenient flat CSV column.
+    """
+    if loc is None:
+        return ""
+    if isinstance(loc, dict):
+        br = loc.get("brain_region", "")
+        return "" if br is None else str(br)
+    try:
+        return str(loc)
+    except Exception:
+        return ""
+
+
+def collect_units_locations_to_csv(
+    sessions: Sequence[str],
+    *,
+    out_csv: str | Path,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Collect per-unit location metadata across multiple NWB sessions and write to CSV.
+
+    High-level workflow (per session)
+    ---------------------------------
+    For each session in `sessions`:
+      1) Load the NWB file via `NWBUtils.combine_nwb(session_name=...)`
+      2) Derive a "core" session name (used by your location-append pipeline)
+      3) Call `append_units_locations(...)` to ensure `nwb_data.units` contains
+         location-related columns (notably "ccf_location")
+      4) Iterate over all units and extract:
+         - session identifier (input string and core)
+         - unit index within the NWB units table
+         - unit_id (prefer NWB ids if available)
+         - ccf_location raw entry
+         - brain_region extracted from ccf_location
+      5) Accumulate all unit rows across sessions into a single DataFrame
+      6) Save the DataFrame to `out_csv`
+
+    IMPORTANT CONVENTION
+    --------------------
+    The output column `session_name` is set to the *input* session string from `sessions`,
+    not necessarily `nwb_data.session_id`. This is useful when your input list uses a
+    particular naming convention you want to preserve verbatim.
+
+    Parameters
+    ----------
+    sessions : Sequence[str]
+        A list/tuple of session identifiers to process. Each entry should be compatible
+        with your internal NWB loader:
+            `NWBUtils.combine_nwb(session_name=<entry>)`
+        Typically these are strings like "ecephys_YYYY_MM_DD_..." or your lab’s session keys.
+
+    out_csv : str | Path
+        Output path for the CSV file. Parent directories will be created automatically.
+
+    verbose : bool, default True
+        If True, prints per-session progress:
+        - "OK" with unit counts for successful sessions
+        - "FAIL" with exception type/message for failed sessions
+        Also prints a final "Saved:" line and a brief failure summary (up to 10).
+
+    Returns
+    -------
+    pd.DataFrame
+        A DataFrame with one row per unit across all successfully processed sessions.
+        Columns:
+        - session_name: the input session string (verbatim)
+        - session_name_core: derived "core" session name used for location appending
+        - unit_index: row index within the NWB units table (0..n_units-1)
+        - unit_id: NWB unit id if available; otherwise falls back to unit_index
+        - ccf_location: raw location metadata from units["ccf_location"][u] (may be dict/str/etc.)
+        - brain_region: normalized string extracted from ccf_location
+
+    Failure Handling
+    ----------------
+    - Any exception during loading, location appending, or unit iteration causes the
+      entire session to be marked as failed (no rows added for that session).
+    - Failed sessions are recorded as (session_input, "ExceptionType: message").
+    - Processing continues for remaining sessions.
+    - The NWB IO handle is always closed in `finally` via `_try_close(io)`.
+
+    Notes / Assumptions
+    -------------------
+    - `append_units_locations(nwb_data, sess_core)` is expected to add/ensure a
+      "ccf_location" column in `nwb_data.units` (or at least not error if absent).
+    - `nwb_data.units` is assumed to be an HDMF DynamicTable-like object where:
+        - `len(units)` gives number of units
+        - `units.colnames` lists available columns
+        - indexing like `units["ccf_location"][u]` returns a per-unit entry
+    - `units.id[:]` is used when available to get stable unit ids.
+    """
+    out_csv = Path(out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    # Accumulated per-unit rows (one dict per unit)
+    rows: List[Dict[str, Any]] = []
+
+    # Per-session failures stored as (session_string, "ExceptionType: message")
+    failures: List[Tuple[str, str]] = []
+
+    # Enumerate sessions with a 1-based counter for nicer progress printing
+    for i, session_input in enumerate(list(sessions), start=1):
+        io = None          # will hold the NWB IO object/handle (if provided by combine_nwb)
+        nwb_data = None    # will hold the NWBFile-like object
+
+        try:
+            # 1) Load NWB (your utility returns (nwb_data, io))
+            nwb_data, io = NWBUtils.combine_nwb(session_name=session_input)
+
+            # 2) Extract the "core" session name used by append_units_locations
+            #    Prefer NWB's embedded session_id if present, otherwise use the input string.
+            sess_raw = getattr(nwb_data, "session_id", None)
+            sess_core = extract_session_name_core(
+                sess_raw if sess_raw is not None else session_input
+            )
+
+            # 3) Append location info to units table (e.g., add "ccf_location")
+            nwb_data = append_units_locations(nwb_data, sess_core)
+
+            # 4) Pull out the units table and basic unit count
+            units = nwb_data.units
+            n_units = len(units)
+
+            # 5) Attempt to read stable unit ids from NWB (if the table has an "id" field)
+            unit_ids = None
+            try:
+                if hasattr(units, "id"):
+                    unit_ids = [int(x) for x in units.id[:]]
+            except Exception:
+                # If reading ids fails for any reason, fall back to indexing
+                unit_ids = None
+
+            # 6) Check whether location info exists as a column
+            has_ccf = "ccf_location" in units.colnames
+
+            # 7) Iterate through units, extract per-unit fields, and append to rows
+            for u in range(n_units):
+                loc = None
+                if has_ccf:
+                    try:
+                        loc = units["ccf_location"][u]
+                    except Exception:
+                        loc = None
+
+                brain_region = _extract_brain_region_from_ccf(loc)
+
+                rows.append(
+                    {
+                        # session_name is explicitly the *input* identifier
+                        "session_name": session_input,
+
+                        # store the derived core name as a separate helpful column
+                        "session_name_core": sess_core,
+
+                        # unit_index is always 0..n_units-1 (row number within units table)
+                        "unit_index": int(u),
+
+                        # unit_id prefers NWB-provided ids; otherwise use unit_index
+                        "unit_id": int(unit_ids[u]) if unit_ids is not None else int(u),
+
+                        # raw location payload (could be dict/string/etc.)
+                        "ccf_location": loc,
+
+                        # normalized brain region label (string)
+                        "brain_region": brain_region,
+                    }
+                )
+
+            if verbose:
+                print(f"[{i:>4}/{len(sessions)}] OK   {session_input}  n_units={n_units}")
+
+        except Exception as e:
+            # Record session-level failure; continue processing other sessions
+            msg = f"{type(e).__name__}: {e}"
+            failures.append((str(session_input), msg))
+            if verbose:
+                print(f"[{i:>4}/{len(sessions)}] FAIL {session_input}  {msg}")
+
+        finally:
+            # Always attempt to close IO handle to prevent open-file accumulation
+            _try_close(io)
+
+    # Build DataFrame from all accumulated unit rows
+    df = pd.DataFrame(rows)
+
+    # Write results to disk
+    df.to_csv(out_csv, index=False)
+
+    if verbose:
+        print(f"\nSaved: {out_csv}")
+        if failures:
+            print(f"[WARN] Failed sessions: {len(failures)}")
+            for s, m in failures[:10]:
+                print("  ", s, "->", m)
+
+    return df
