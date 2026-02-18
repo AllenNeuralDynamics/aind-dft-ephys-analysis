@@ -720,3 +720,174 @@ def collect_units_locations_to_csv(
                 print("  ", s, "->", m)
 
     return df
+
+
+
+
+
+
+def summarize_units_by_region_and_session(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summarize unit statistics per session (one row per session).
+
+    This function aggregates unit-level metadata into session-level summaries,
+    including both overall statistics and per-brain-region statistics.
+
+    -------------------------------------------------------------------------
+    INPUT
+    -------------------------------------------------------------------------
+    df : pd.DataFrame
+        A unit-level dataframe containing at least the following columns:
+            - session_name
+            - unit_id
+            - brain_region
+            - summary_QLearning_L1F1_CK1_softmax_pass_all_criteria
+
+        Each row corresponds to one unit.
+
+    -------------------------------------------------------------------------
+    OUTPUT
+    -------------------------------------------------------------------------
+    Returns a dataframe with ONE ROW PER SESSION.
+
+    Columns include:
+
+    Overall session statistics:
+        - total_units
+        - total_pass
+        - total_fail
+        - fraction_pass
+
+    Per-region statistics (for each unique brain_region):
+        - n_units_<region>
+        - n_pass_<region>
+        - fraction_pass_<region>
+    """
+
+    # Column name for the session-level QC pass flag
+    pass_col = "summary_QLearning_L1F1_CK1_softmax_pass_all_criteria"
+
+    # Work on a copy to avoid modifying original dataframe
+    df = df.copy()
+
+    # ---------------------------------------------------------------------
+    # Normalize key columns
+    # ---------------------------------------------------------------------
+
+    # Replace NaN brain_region with a string label
+    # This ensures groupby and pivot won't drop NaNs
+    df["brain_region"] = df["brain_region"].fillna("Unknown").astype(str)
+
+    # Replace NaN pass values with False
+    # Convert to boolean so sum() counts True values properly
+    df[pass_col] = df[pass_col].fillna(False).astype(bool)
+
+    # ---------------------------------------------------------------------
+    # 1) Overall session-level summary
+    # ---------------------------------------------------------------------
+
+    # Group by session and compute:
+    # - total_units: number of rows (units)
+    # - total_pass: number of True in pass_col
+    overall = (
+        df.groupby("session_name")
+        .agg(
+            total_units=("unit_id", "count"),
+            total_pass=(pass_col, "sum"),  # bool sum counts True
+        )
+        .astype({"total_units": int, "total_pass": int})
+    )
+
+    # Compute total_fail
+    overall["total_fail"] = overall["total_units"] - overall["total_pass"]
+
+    # Compute fraction_pass
+    overall["fraction_pass"] = overall["total_pass"] / overall["total_units"]
+
+    # ---------------------------------------------------------------------
+    # 2) Per-region unit counts
+    # ---------------------------------------------------------------------
+
+    # Count number of units per (session, brain_region)
+    # Result shape:
+    #   rows = sessions
+    #   columns = brain regions
+    #   values = number of units
+    units_counts = (
+        df.groupby(["session_name", "brain_region"])
+        .size()
+        .unstack(fill_value=0)
+    )
+
+    # ---------------------------------------------------------------------
+    # 3) Per-region pass counts
+    # ---------------------------------------------------------------------
+
+    # Filter only units that passed QC
+    # Then count per (session, brain_region)
+    pass_counts = (
+        df[df[pass_col]]
+        .groupby(["session_name", "brain_region"])
+        .size()
+        .unstack(fill_value=0)
+    )
+
+    # ---------------------------------------------------------------------
+    # 4) Align both tables to same sessions and regions
+    # ---------------------------------------------------------------------
+
+    # In case some sessions or regions exist in only one table,
+    # take union to avoid shape mismatch
+    all_sessions = units_counts.index.union(pass_counts.index)
+    all_regions = units_counts.columns.union(pass_counts.columns)
+
+    # Reindex both tables to same shape
+    units_counts = units_counts.reindex(
+        index=all_sessions,
+        columns=all_regions,
+        fill_value=0,
+    )
+
+    pass_counts = pass_counts.reindex(
+        index=all_sessions,
+        columns=all_regions,
+        fill_value=0,
+    )
+
+    # ---------------------------------------------------------------------
+    # 5) Compute per-region fraction_pass
+    # ---------------------------------------------------------------------
+
+    # Avoid divide-by-zero:
+    # where units_counts == 0, keep result as 0
+    fraction_counts = pass_counts.divide(
+        units_counts.where(units_counts != 0),
+        fill_value=0,
+    )
+
+    # ---------------------------------------------------------------------
+    # 6) Add column prefixes for clarity
+    # ---------------------------------------------------------------------
+
+    units_pivot = units_counts.add_prefix("n_units_")
+    pass_pivot = pass_counts.add_prefix("n_pass_")
+    fraction_pivot = fraction_counts.add_prefix("fraction_pass_")
+
+    # ---------------------------------------------------------------------
+    # 7) Combine everything into final dataframe
+    # ---------------------------------------------------------------------
+
+    out = (
+        pd.concat(
+            [
+                overall,
+                units_pivot,
+                pass_pivot,
+                fraction_pivot,
+            ],
+            axis=1,
+        )
+        .reset_index()
+    )
+
+    return out
