@@ -25,20 +25,27 @@ Returns dictionary with:
     - 'cv_corr', 'cv_r2', 'y_cv', 'z_cv', 'final' (from CV wrapper)
     - scaling + bookkeeping: 'zscore_mu', 'zscore_sigma', 'time_window_fit', etc.
 """
+from __future__ import annotations
+
+# ==============================
+# Standard library
+# ==============================
 import json
-from typing import Dict, List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union, Literal
+
+# ==============================
+# Third-party libraries
+# ==============================
 import numpy as np
 import xarray as xr
 from scipy import stats
 from sklearn.model_selection import KFold
-from pathlib import Path
 
 import matplotlib.pyplot as plt
-from matplotlib.cm import get_cmap
+from matplotlib.cm import get_cmap, ScalarMappable
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
-from matplotlib.cm import ScalarMappable
-
 
 
 # ----------------------------- utilities -----------------------------
@@ -1158,3 +1165,212 @@ def plot_tdr_trace_by_quantile(
     fig.tight_layout(rect=[0, 0, 0.82, 1])
     plt.show()
 
+
+
+
+def project_full_session_to_tdr(
+    ds_full: xr.Dataset,
+    tdr_ds: xr.Dataset,
+    *,
+    psth_key: str = "psth_full",
+    ds_unit_coord: str = "unit_index",
+    tdr_unit_coord: str = "unit_id",
+    w_key: str = "axis_w",
+    norm_mode: Literal["none", "zscore_time", "demean_time"] = "zscore_time",
+    require_all_units: bool = False,
+    eps: float = 1e-12,
+) -> xr.DataArray:
+    """
+    Project a full-session PSTH (units x time) onto a single TDR axis.
+
+    Concept
+    -------
+    You have:
+      - ds_full[psth_key]: a matrix X(unit, time) representing full-session activity.
+      - tdr_ds[w_key]: a vector w(unit) representing the TDR axis weights (one weight per unit).
+
+    The projection produces a 1D time series:
+        y(time) = sum_u w(u) * X_norm(u, time)
+
+    where X_norm is optionally normalized across time within each unit.
+
+    Inputs and expected structure
+    -----------------------------
+    ds_full:
+      - must contain data variable psth_key with dims ("unit", "time")
+      - must have a coordinate ds_unit_coord aligned to dim "unit"
+        (e.g. ds_full.coords["unit_index"] gives unit IDs)
+
+    tdr_ds:
+      - must contain data variable w_key (axis weights) with dim "unit" (or equivalent)
+      - must contain unit IDs either as:
+          - a coord: tdr_ds.coords[tdr_unit_coord]
+        or a variable:
+          - tdr_ds[tdr_unit_coord]
+
+    Key parameters
+    --------------
+    norm_mode:
+      - "none": no normalization, use raw firing rates
+      - "demean_time": subtract each unit's mean across time
+      - "zscore_time": subtract mean and divide by std across time (per unit)
+
+    require_all_units:
+      - False: use only the intersection of units (robust to mismatches)
+      - True: raise error if any TDR unit is missing from ds_full
+
+    eps:
+      - small constant to avoid division by zero if std=0 for a unit.
+
+    Returns
+    -------
+    xr.DataArray:
+      - 1D array over "time" containing the TDR projection time course.
+      - includes attrs describing how many units were used.
+    """
+
+    # -----------------------------
+    # 1) Validate required keys
+    # -----------------------------
+    # Ensures ds_full contains the PSTH variable we want to project.
+    if psth_key not in ds_full:
+        raise KeyError(f"ds_full missing data variable '{psth_key}'")
+
+    # Ensures ds_full contains the coordinate that maps each row ("unit") to a unit ID.
+    # This is critical because we need to align units between ds_full and tdr_ds.
+    if ds_unit_coord not in ds_full.coords:
+        raise KeyError(f"ds_full missing coord '{ds_unit_coord}' (expected on dim 'unit')")
+
+    # Ensures the TDR dataset has the axis weights.
+    if w_key not in tdr_ds:
+        raise KeyError(f"tdr_ds missing data variable '{w_key}' (axis weights)")
+
+    # Ensures the TDR dataset provides the unit IDs corresponding to the weights.
+    # Some TDR outputs store unit IDs as coords; others store as variables.
+    if tdr_unit_coord not in tdr_ds.coords and tdr_unit_coord not in tdr_ds:
+        raise KeyError(f"tdr_ds missing '{tdr_unit_coord}' (unit ids). In your case it is a coord.")
+
+    # -----------------------------
+    # 2) Extract unit ID arrays
+    # -----------------------------
+    # ds_units: unit IDs in ds_full in the order of the "unit" dimension.
+    # We cast to int so we can build robust dictionary mappings.
+    ds_units = np.asarray(ds_full.coords[ds_unit_coord].values).astype(int)
+
+    # tdr_units: unit IDs used in the TDR result, in the order matching the weight vector axis_w.
+    # If it's a coord, use coords; otherwise fall back to a data variable.
+    tdr_units = np.asarray(
+        (tdr_ds.coords[tdr_unit_coord] if tdr_unit_coord in tdr_ds.coords else tdr_ds[tdr_unit_coord]).values
+    ).astype(int)
+
+    # -----------------------------
+    # 3) Map ds_full unit IDs -> row positions
+    # -----------------------------
+    # This mapping lets us quickly find, for a given unit_id, which row index it corresponds to in ds_full.
+    # Example: ds_pos[12345] = 17 means unit_id 12345 is at unit dimension index 17 in ds_full.
+    ds_pos = {int(u): i for i, u in enumerate(ds_units.tolist())}
+
+    # Identify any TDR units not present in ds_full.
+    missing = [int(u) for u in tdr_units.tolist() if int(u) not in ds_pos]
+
+    # If strict alignment is required, fail early with an informative message.
+    if missing and require_all_units:
+        raise ValueError(f"{len(missing)} TDR units are missing from ds_full. Example: {missing[:10]}")
+
+    # -----------------------------
+    # 4) Determine overlap (intersection) in TDR order
+    # -----------------------------
+    # We keep units that appear in ds_full, but we preserve the ordering of tdr_units.
+    # This matters because weights are defined in TDR order; we want X rows in the same order as w.
+    kept_units = np.array([int(u) for u in tdr_units.tolist() if int(u) in ds_pos], dtype=int)
+
+    # If there is no overlap, projection is impossible.
+    if kept_units.size == 0:
+        raise ValueError("No overlapping units between tdr_ds and ds_full.")
+
+    # -----------------------------
+    # 5) Reindex ds_full PSTH to match the kept unit order
+    # -----------------------------
+    # da: the full PSTH matrix (unit, time).
+    da = ds_full[psth_key]
+
+    # da_u: PSTH subset in the exact same unit order as kept_units.
+    # We index by integer positions because ds_full's "unit" dimension index
+    # is not necessarily equal to unit IDs.
+    da_u = da.isel(unit=[ds_pos[int(u)] for u in kept_units])
+
+    # -----------------------------
+    # 6) Subset / reorder the TDR weights to match kept_units
+    # -----------------------------
+    # tdr_unit_to_pos maps unit_id -> its position in the TDR weight vector.
+    tdr_unit_to_pos = {int(u): i for i, u in enumerate(tdr_units.tolist())}
+
+    # w: full weight vector from the TDR dataset.
+    # reshape(-1) ensures it's 1D even if stored as (unit, 1) or similar.
+    w = np.asarray(tdr_ds[w_key].values, dtype=float).reshape(-1)
+
+    # w_kept: the subset of weights for the kept units in the same order as kept_units.
+    w_kept = np.array([w[tdr_unit_to_pos[int(u)]] for u in kept_units], dtype=float)
+
+    # -----------------------------
+    # 7) Convert to numpy for fast math: X(unit, time)
+    # -----------------------------
+    # X is the PSTH matrix aligned to kept_units ordering.
+    X = np.asarray(da_u.values, dtype=float)
+
+    # -----------------------------
+    # 8) Normalize across time within each unit (optional)
+    # -----------------------------
+    # Important detail:
+    # - axis=1 corresponds to time dimension, because X has shape (unit, time).
+    # - per-unit normalization ensures each unit contributes comparably regardless of baseline firing.
+    if norm_mode == "none":
+        Xn = X
+
+    elif norm_mode == "demean_time":
+        # mu has shape (unit, 1) so broadcasting works when subtracting from (unit, time).
+        mu = np.nanmean(X, axis=1, keepdims=True)
+        Xn = X - mu
+
+    elif norm_mode == "zscore_time":
+        mu = np.nanmean(X, axis=1, keepdims=True)
+        # Add eps to avoid divide-by-zero when a unit has zero variance across time.
+        sd = np.nanstd(X, axis=1, keepdims=True) + eps
+        Xn = (X - mu) / sd
+
+    else:
+        raise ValueError("norm_mode must be one of {'none','demean_time','zscore_time'}")
+
+    # -----------------------------
+    # 9) Project onto TDR axis
+    # -----------------------------
+    # We want y(time) = sum_unit w_kept(unit) * Xn(unit,time).
+    #
+    # np.tensordot with axes=([0],[0]) contracts the "unit" dimension:
+    #   w_kept: (unit,)
+    #   Xn:     (unit,time)
+    # output:   (time,)
+    y = np.tensordot(w_kept, Xn, axes=([0], [0]))
+
+    # -----------------------------
+    # 10) Package as xarray DataArray with time coordinate
+    # -----------------------------
+    # We preserve ds_full's time coordinate so downstream code can align on time directly.
+    time = ds_full.coords["time"].values
+
+    out = xr.DataArray(
+        y,
+        dims=("time",),
+        coords={"time": ("time", time)},
+        name="tdr_projection_full_session",
+        attrs={
+            # Record key metadata so the output is self-describing.
+            "psth_key": psth_key,
+            "norm_mode": norm_mode,
+            "n_units_in_tdr": int(tdr_units.size),
+            "n_units_in_ds_full": int(ds_units.size),
+            "n_units_used": int(kept_units.size),
+            "fraction_tdr_units_used": float(kept_units.size) / float(tdr_units.size),
+        },
+    )
+    return out
