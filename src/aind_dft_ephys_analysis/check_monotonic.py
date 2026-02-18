@@ -37,7 +37,6 @@ from create_psth import load_psth_raster_subset
 from ephys_utils import append_units_locations
 from general_utils import extract_session_name_core
 
-
 def summarize_monotonic_unit_df_by_latent_quantile(
     source: Union[str, Path, xr.DataArray, xr.Dataset],
     *,
@@ -1243,9 +1242,6 @@ def summarize_significant_and_monotonic_fractions(
 
 
 
-
-
-
 def show_unit_figures_from_df_inline(
     df: pd.DataFrame,
     *,
@@ -1257,129 +1253,225 @@ def show_unit_figures_from_df_inline(
     random_state: Optional[int] = 0,
     filename_template: str = "{latent}_unit_{unit}.png",
     folder_template: str = "{root}/{session}/{latent}",
-    figsize: tuple[float, float] = (10.0, 6.0),
-    dpi: int = 120,
-    title_mode: str = "fullpath",  # "basename" | "fullpath"
+    title_mode: str = "basename",  # "basename" | "fullpath"
     warn_missing: bool = True,
-) -> list[Path]:
+    extra_latents: Optional[Sequence[str]] = None,
+    figscale: float = 10,
+) -> List[Path]:
     """
-    Visualize raster plot PNG figures based on rows in a DataFrame.
+    Display raster plot PNG figures for units listed in `df`, arranged as:
+        - one row per unit (per selected DataFrame row)
+        - one column per latent folder (primary latent + extra_latents)
 
-    This function reconstructs file paths using:
-        root / session_name / latent_name / <latent>_unit_<unit>.png
+    This function is designed for notebook environments (Jupyter / Code Ocean).
+    It uses matplotlib subplots so that all figures for the same unit are shown
+    on the same row, enabling side-by-side comparison across latents.
 
-    It then opens and displays the corresponding PNG files inline
-    (using IPython.display.display), which is reliable in Jupyter / Code Ocean.
+    ----------------------------------------------------------------------------
+    Path construction logic
+    ----------------------------------------------------------------------------
+    For each row in `df` we extract:
+        session   = df[session_col]
+        row_latent= df[latent_col]
+        unit      = df[unit_col]
 
-    ------------------------------------------------------------------------
-    Expected directory structure
-    ------------------------------------------------------------------------
-    root/
-        <session_name>/
-            <latent_name>/
-                <latent_name>_unit_<unit_index>.png
+    We then define the column folders to show:
+        latents_to_show = [row_latent] + list(extra_latents)
+
+    For each column `folder_latent` in latents_to_show:
+      - The directory is built using `folder_template` with latent=folder_latent:
+            folder = folder_template.format(root=root, session=session, latent=folder_latent)
+
+      - The filename is built using `filename_template` and a *filename latent* rule:
+            - primary column (folder_latent == row_latent):
+                  filename_latent = row_latent
+            - extra columns (folder_latent in extra_latents):
+                  filename_latent = folder_latent
+
+        filename = filename_template.format(latent=filename_latent, unit=unit)
+
+    Therefore, the default expectation is:
+
+        root/
+            <session>/
+                <latent_folder>/
+                    <latent_folder>_unit_<unit>.png
 
     Example:
-    /root/capsule/scratch/raster_plot/
-        ecephys_753124_2024-12-10_17-24-56_sorted_2024-12-13_09-48-25/
-            QLearning_L2F1_softmax-sumQ-1/
-                QLearning_L2F1_softmax-sumQ-1_unit_35.png
+        /root/capsule/scratch/raster_plot/
+            ecephys_753124_2024-12-10_.../
+                QLearning_L2F1_softmax-sumQ-1/
+                    QLearning_L2F1_softmax-sumQ-1_unit_35.png
+                ForagingCompareThreshold-value-1/
+                    ForagingCompareThreshold-value-1_unit_35.png
 
-    ------------------------------------------------------------------------
+    ----------------------------------------------------------------------------
     Parameters
-    ------------------------------------------------------------------------
-    df : pd.DataFrame
-        DataFrame containing at least:
-            - session_name
-            - latent_name
-            - unit_index
+    ----------------------------------------------------------------------------
+    df : pandas.DataFrame
+        DataFrame specifying which unit figures to display.
+        Must contain at least the three columns given by:
+            - session_col
+            - latent_col
+            - unit_col
 
-        Typically this is your:
+        Typically this is a filtered table such as:
             significant_monotonic_df
 
-    root : str | Path
-        Base directory containing all raster plot outputs.
+        Each *row* is treated as one "unit to display".
+
+    root : str | pathlib.Path
+        Base directory containing all session folders with raster plot PNGs.
+        Default:
+            "/root/capsule/scratch/raster_plot"
+
+        Under this directory, the function expects a folder per session.
 
     session_col : str
-        Column name in df that contains session_name.
+        Column name in `df` that contains the session folder name.
+
+        Example values:
+            "ecephys_753124_2024-12-10_17-24-56_sorted_2024-12-13_09-48-25"
 
     latent_col : str
-        Column name in df that contains latent_name.
+        Column name in `df` that contains the primary latent name for each row.
+        This latent determines:
+            - the first subplot column (folder name)
+            - the primary filename prefix (primary column)
+
+        Example values:
+            "QLearning_L2F1_softmax-sumQ-1"
 
     unit_col : str
-        Column name in df that contains unit_index.
+        Column name in `df` that contains the unit identifier used in filenames.
+        This is converted to integer with `pd.to_numeric(..., errors="coerce")`,
+        and rows with non-numeric unit values are dropped.
+
+        Example values:
+            35, 87, 102
 
     n : int | None
-        If provided:
-            Randomly select n rows to display.
-        If None:
-            Display all rows.
+        If provided, randomly sample `n` rows (units) from `df` to display.
+        This sampling happens AFTER type sanitization (so invalid rows do not count).
+        Behavior:
+            - n <= 0: return [] without plotting
+            - n > number of valid rows: uses all valid rows
+
+        If None, all valid rows are shown.
 
     random_state : int | None
-        Random seed for reproducible sampling when n is specified.
+        Random seed for reproducible sampling when `n` is provided.
+        Passed to `DataFrame.sample(..., random_state=random_state)`.
+        Use None for non-deterministic sampling.
 
     filename_template : str
-        Template for filename.
-        Available fields:
-            {latent}
-            {unit}
+        Template used to build each PNG filename.
+        Must include placeholders:
+            - {latent} : the latent string used in the filename
+            - {unit}   : the unit integer
+
+        Default:
+            "{latent}_unit_{unit}.png"
+
+        Examples:
+            "{latent}_unit_{unit}.png"         -> QLearning..._unit_35.png
+            "{latent}/unit{unit}.png"          -> (not recommended unless your naming matches)
 
     folder_template : str
-        Template for folder structure.
-        Available fields:
-            {root}
-            {session}
-            {latent}
+        Template used to build the folder path for each figure.
+        Must include placeholders:
+            - {root}
+            - {session}
+            - {latent}
 
-    figsize : tuple
-        (Currently unused in inline display; kept for compatibility.)
+        Default:
+            "{root}/{session}/{latent}"
 
-    dpi : int
-        (Currently unused in inline display; kept for compatibility.)
+        This means each latent corresponds to a subfolder under the session folder.
 
     title_mode : str
-        "fullpath"  → show full file path above image
-        "basename"  → show only file name
+        Controls subplot titles:
+            - "basename": title is the latent folder name (compact, best for comparison)
+            - "fullpath": title is the full resolved file path (best for debugging missing files)
 
     warn_missing : bool
         If True:
-            Print missing file paths.
+            - Panels whose files are not found are labeled "[MISSING]"
+            - After plotting all requested rows, print a summary of missing file paths
+              (up to the first 10).
 
-    ------------------------------------------------------------------------
+        If False:
+            missing files are silently ignored (but still labeled in the panel).
+
+    extra_latents : Sequence[str] | None
+        Additional latent folder names to show for each unit, as extra columns.
+        If provided, columns are ordered as:
+            [row_latent] + extra_latents
+
+        Example:
+            extra_latents=["ForagingCompareThreshold-value-1", "ForagingCompareThreshold-value-2"]
+
+        Filename rule for extra columns (IMPORTANT):
+            the filename latent used is the *extra latent* itself.
+            So the function looks for:
+                .../<extra_latent>/<extra_latent>_unit_<unit>.png
+
+    figscale : float
+        Controls the overall displayed figure size per unit row.
+
+        For n_cols columns, the matplotlib figsize is:
+            (figscale * n_cols, figscale)
+
+        Examples:
+            - 2 columns, figscale=6  -> figsize=(12, 6)
+            - 3 columns, figscale=7  -> figsize=(21, 7)
+
+        Increase this if:
+            - text in PNGs is small
+            - you want more readable side-by-side comparison
+
+    ----------------------------------------------------------------------------
     Returns
-    ------------------------------------------------------------------------
-    opened_paths : list[Path]
-        List of successfully opened figure paths.
+    ----------------------------------------------------------------------------
+    opened_paths : list[pathlib.Path]
+        List of PNG paths that were successfully found and displayed.
+        Missing files are NOT included in this list.
+
+    ----------------------------------------------------------------------------
+    Notes / Common issues
+    ----------------------------------------------------------------------------
+    1) "Alternating empty columns":
+       Ensure display/show/close happens ONCE per unit row, after all axes are drawn.
+       Do not call display(fig) inside the inner column loop.
+
+    2) Missing extra-latent files:
+       This function expects extra-latent filenames to match the extra latent name.
+       If your extra-latent folders contain files named with the primary latent, you must
+       change the filename_latent rule accordingly.
+
+    3) Performance:
+       This reads PNG files from disk for every plotted panel. If plotting many units,
+       consider sampling via `n` or building a grid with multiple rows per page.
     """
-
-    # Import here to ensure this works only when running in notebook environments
-    try:
-        from IPython.display import display
-        from PIL import Image
-    except Exception as e:
-        raise RuntimeError(
-            "Inline display requires IPython and Pillow. "
-            "If running outside a notebook, use matplotlib-based viewer instead."
-        ) from e
-
-    # ---------------------------------------------------------------------
-    # 1) Validate required columns exist
-    # ---------------------------------------------------------------------
-    for col in (session_col, latent_col, unit_col):
-        if col not in df.columns:
-            raise KeyError(f"Missing required column in df: {col!r}")
-
     root = Path(root)
 
-    # ---------------------------------------------------------------------
-    # 2) Extract only required columns and sanitize types
-    # ---------------------------------------------------------------------
-    sub = df[[session_col, latent_col, unit_col]].copy()
+    extra_latents_list: List[str] = []
+    if extra_latents is not None:
+        for x in extra_latents:
+            if x is None:
+                continue
+            s = str(x).strip()
+            if s:
+                extra_latents_list.append(s)
 
+    for col in (session_col, latent_col, unit_col):
+        if col not in df.columns:
+            raise KeyError(f"Missing required column: {col!r}")
+
+    sub = df[[session_col, latent_col, unit_col]].copy()
     sub[session_col] = sub[session_col].astype(str)
     sub[latent_col] = sub[latent_col].astype(str)
 
-    # Ensure unit_index numeric
     sub[unit_col] = pd.to_numeric(sub[unit_col], errors="coerce")
     sub = sub.dropna(subset=[unit_col]).copy()
     sub[unit_col] = sub[unit_col].astype(int)
@@ -1387,9 +1479,6 @@ def show_unit_figures_from_df_inline(
     if len(sub) == 0:
         return []
 
-    # ---------------------------------------------------------------------
-    # 3) Random sampling (if requested)
-    # ---------------------------------------------------------------------
     if n is not None:
         if n <= 0:
             return []
@@ -1398,55 +1487,74 @@ def show_unit_figures_from_df_inline(
     else:
         sub = sub.reset_index(drop=True)
 
-    opened: list[Path] = []
-    missing: list[Path] = []
+    opened: List[Path] = []
+    missing: List[Path] = []
 
-    # ---------------------------------------------------------------------
-    # 4) Loop through rows and open figures
-    # ---------------------------------------------------------------------
+    n_cols = 1 + len(extra_latents_list)
+
     for i in range(len(sub)):
         session = sub.loc[i, session_col]
-        latent = sub.loc[i, latent_col]
+        row_latent = sub.loc[i, latent_col]
         unit = int(sub.loc[i, unit_col])
 
-        # Build folder path using template
-        folder_str = folder_template.format(
-            root=str(root),
-            session=session,
-            latent=latent
+        latents_to_show = [row_latent] + extra_latents_list
+
+        fig, axes = plt.subplots(
+            1,
+            n_cols,
+            figsize=(figscale * n_cols, figscale),
+            squeeze=False,
         )
+        axes = axes[0]
 
-        # Build filename
-        file_str = filename_template.format(
-            latent=latent,
-            unit=unit
-        )
+        for col_i, folder_latent in enumerate(latents_to_show):
+            filename_latent = row_latent if col_i == 0 else folder_latent
 
-        fp = Path(folder_str) / file_str
+            folder_str = folder_template.format(
+                root=str(root),
+                session=session,
+                latent=folder_latent,
+            )
+            file_str = filename_template.format(
+                latent=filename_latent,
+                unit=unit,
+            )
+            fp = Path(folder_str) / file_str
 
-        # Check existence
-        if not fp.exists():
-            missing.append(fp)
-            continue
+            ax = axes[col_i]
+            ax.axis("off")
 
-        # Print header for clarity
-        title = str(fp) if title_mode == "fullpath" else fp.name
-        print(title)
+            if fp.exists():
+                img = mpimg.imread(fp)
+                ax.imshow(img)
 
-        # Display image inline
-        display(Image.open(fp))
+                if title_mode == "fullpath":
+                    ax.set_title(str(fp), fontsize=9)
+                else:
+                    ax.set_title(str(folder_latent), fontsize=9)
 
-        opened.append(fp)
+                opened.append(fp)
+            else:
+                ax.set_title(f"{folder_latent}\n[MISSING]", fontsize=9)
+                missing.append(fp)
 
-    # ---------------------------------------------------------------------
-    # 5) Report missing files (if any)
-    # ---------------------------------------------------------------------
+        # IMPORTANT: show/close ONCE per unit, after all columns are drawn
+        plt.tight_layout()
+        try:
+            from IPython.display import display
+            display(fig)
+        except Exception:
+            plt.show()
+        plt.close(fig)
+
     if warn_missing and len(missing) > 0:
-        print(f"[WARN] Missing {len(missing)} files (showing up to 10):")
+        print(f"\n[WARN] Missing {len(missing)} files (showing up to 10):")
         for p in missing[:10]:
             print("  ", p)
 
     return opened
+
+
 
 
 
