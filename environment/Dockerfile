@@ -1,4 +1,4 @@
-# hash:sha256:4cd683629b6451f42d507d23e36309f3498077ecf2e0c49afd6ed765619eed3c
+# hash:sha256:ec1b490392664b6c81ea8174f0a6590c12c37d5decefcdd9637b55344c9b0700
 ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/c1-vscode:4.20.0-pylint2023.10.1-copilot1.143.601
 
@@ -36,4 +36,5 @@ RUN --mount=type=secret,id=git-access-token \
     spikeinterface[full]==0.102.2 \
     statsmodels==0.14.4 \
     -e git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-basic-analysis.git@5543aa88f3585200e4dc896c1a366de3803c0166#egg=aind-dynamic-foraging-basic-analysis \
-    -e git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-data-utils.git@c2984af731e2d85c250091cfa3cee95c247e5758#egg=aind-dynamic-foraging-data-utils
+    -e git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-data-utils.git@c2984af731e2d85c250091cfa3cee95c247e5758#egg=aind-dynamic-foraging-data-utils \
+    -e git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-models.git@CTT_update#egg=aind-dynamic-foraging-models

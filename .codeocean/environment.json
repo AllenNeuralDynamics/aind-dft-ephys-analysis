@@ -50,6 +50,9 @@
 					"version": "c2984af731e2d85c250091cfa3cee95c247e5758"
 				},
 				{
+					"name": "git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-models.git@CTT_update#egg=aind-dynamic-foraging-models"
+				},
+				{
 					"name": "hdmf-zarr",
 					"version": "0.11.0"
 				},
