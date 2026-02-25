@@ -1,20 +1,80 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Optional, Union, Dict, List, Tuple, Sequence
-
+# Standard library
 import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+# Third-party
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
 from scipy.optimize import minimize
-
 import statsmodels.api as sm
 from statsmodels.discrete.discrete_model import BinaryResults
 
+# Project-specific
+from aind_dynamic_foraging_models.generative_model import ForagerCollection
 from nwb_utils import NWBUtils
 
+def fit_ctt_from_nwb(
+    nwb: Any,
+    *,
+    number_of_learning_rate: int = 1,
+    reset_to_threshold: bool = False,
+    include_stay_bias: bool = True,
+    fix_threshold: bool = True,
+    threshold_fixed: float = 0.0,
+    clamp_params: Optional[Dict[str, Any]] = None,
+    workers: int = 4,
+    seed: int = 42,
+) -> Any:
+    """
+    Fit ForagerCompareThreshold from an in-memory NWB object and return the fitting_result.
+
+    Inputs
+    ------
+    nwb : in-memory NWB object (already loaded)
+    Parameters : model hyperparameters + fitting settings
+
+    Returns
+    -------
+    fitting_result : object returned by forager.fit(...) (contains LPT/AIC/BIC/x/etc.)
+    """
+    df = nwb.trials.to_dataframe()
+
+    choice = df.animal_response.map({0: 0, 1: 1, 2: np.nan}).to_numpy(dtype=float)
+    reward = (df.rewarded_historyL | df.rewarded_historyR).to_numpy(dtype=bool)
+
+    keep = ~np.isnan(choice)
+    choice_valid = choice[keep].astype(int)
+    reward_valid = reward[keep].astype(int)
+
+    fc = ForagerCollection()
+    forager = fc.get_forager(
+        agent_class_name="ForagerCompareThreshold",
+        agent_kwargs={
+            "number_of_learning_rate": int(number_of_learning_rate),
+            "reset_to_threshold": bool(reset_to_threshold),
+            "include_stay_bias": bool(include_stay_bias),
+            "fix_threshold": bool(fix_threshold),
+            "threshold_fixed": float(threshold_fixed),
+        },
+    )
+
+    DE_kwargs = dict(
+        workers=int(workers),
+        disp=False,
+        seed=np.random.default_rng(seed),
+    )
+
+    forager.fit(
+        choice_valid,
+        reward_valid,
+        clamp_params=clamp_params or {},
+        DE_kwargs=DE_kwargs,
+    )
+    return forager
 
 
 def fit_q_learning_model(
