@@ -29,7 +29,6 @@ import pandas as pd
 import xarray as xr
 
 
-
 def extract_ID_Date(session_name: str) -> Optional[Tuple[str, str]]:
     """
     Extract the animal ID and date string from a session name.
@@ -523,15 +522,6 @@ def load_ctt_results_dataframe(
     raise ValueError(f"Unsupported fmt: {fmt}. Use 'parquet', 'csv', or 'pkl'.")
 
 
-
-
-
-
-import json
-import numpy as np
-import pandas as pd
-from pathlib import Path
-from typing import Union, Optional, Sequence, Any
 
 
 def save_df_with_psth_csv(
