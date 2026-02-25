@@ -1302,6 +1302,7 @@ def generate_behavior_summary(
                     nwb_behavior_data=nwb_data,
                     fitted_latent=fit_dict,
                     latent_name=ln,
+                    model_alias=alias,
                 )
 
             # ---- Behavior-only, no model fit ('no_model') ----
