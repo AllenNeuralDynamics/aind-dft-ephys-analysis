@@ -38,7 +38,7 @@ RUN --mount=type=secret,id=git-access-token \
     -e git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-basic-analysis.git@5543aa88f3585200e4dc896c1a366de3803c0166#egg=aind-dynamic-foraging-basic-analysis \
     -e git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-data-utils.git@c2984af731e2d85c250091cfa3cee95c247e5758#egg=aind-dynamic-foraging-data-utils \
 
-RUN pip install git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-models.git@CTT_update#egg=aind-dynamic-foraging-models
+RUN pip install git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-models.git@update_CTT#egg=aind-dynamic-foraging-models
 
 #ADD "https://github.com/coder/code-server/releases/download/v4.95.3/code-server-4.95.3-linux-amd64.tar.gz" /.code-server/code-server.tar.gz
 	
