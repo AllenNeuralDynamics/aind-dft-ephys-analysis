@@ -34,7 +34,7 @@ from general_utils import (
 )
 from model_fitting import fit_q_learning_model
 from nwb_utils import NWBUtils
-
+from model_fitting import fit_ctt_from_nwb
 
 
 def silent_get_mle_model_fitting(*args, **kwargs):
@@ -741,7 +741,10 @@ def extract_fitted_data(
         # ------------------------------------------------------------------
 
         # ----- value for ForagingCompareThreshold -----
-        if base_name == 'value' and model_alias == 'ForagingCompareThreshold':
+        if base_name == "value" and model_alias in [
+            "ForagingCompareThreshold",
+            "ForagingCompareThreshold_L1_ResetF_StayBiasT_FixThrT0",
+        ]:
             return _trim_series(value_full, 'value', suffix)
 
         # ----- deltaQ -----
@@ -775,7 +778,7 @@ def extract_fitted_data(
                 return None
 
         # ----- Reward Prediction Error (RPE) -----
-        if base_name == 'RPE' and model_alias == 'ForagingCompareThreshold':
+        if base_name == 'RPE' and model_alias in ['ForagingCompareThreshold','ForagingCompareThreshold_L1_ResetF_StayBiasT_FixThrT0']:
             trials = nwb_behavior_data.trials
             rewardedL = trials['rewarded_historyL'][:]
             rewardedR = trials['rewarded_historyR'][:]
@@ -1181,10 +1184,27 @@ def generate_behavior_summary(
         elif alias == 'no_model':
             # Behavior-only quantities (reward_rate_N, etc.)
             fit_source = 'no_model'
-        elif alis == 'ForagingCompareThreshold_L1_ResetF_StayBiasT_FixThrT0':
-            
-            fit_source = 'local'
 
+        elif alias == 'ForagingCompareThreshold_L1_ResetF_StayBiasT_FixThrT0':
+            if alias not in local_fit_cache:
+                fit_source = 'local'
+                fitting_result = fit_ctt_from_nwb(
+                    nwb_data,
+                    number_of_learning_rate=1,
+                    reset_to_threshold=False,
+                    include_stay_bias=True,
+                    fix_threshold=True,
+                    threshold_fixed=0.0,
+                    workers=4,
+                    seed=42,
+                )
+                fit_dict={}
+                fit_dict["fitted_latent_variables"] = {}
+                result_dict = fitting_result.get_fitting_result_dict()
+                fit_dict["fitted_latent_variables"]["value"] = (
+                    result_dict.get("fitted_latent_variables", {}).get("value", None)
+                )
+                local_fit_cache[alias] = fit_dict
         else:
             # Remote / archived model fits
             if alias not in remote_fit_cache:
