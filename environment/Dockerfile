@@ -35,10 +35,10 @@ RUN --mount=type=secret,id=git-access-token \
     scipy==1.15.1 \
     spikeinterface[full]==0.102.2 \
     statsmodels==0.14.4 \
+    aind-behavior-gym \
     -e git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-basic-analysis.git@5543aa88f3585200e4dc896c1a366de3803c0166#egg=aind-dynamic-foraging-basic-analysis \
     -e git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-data-utils.git@c2984af731e2d85c250091cfa3cee95c247e5758#egg=aind-dynamic-foraging-data-utils
 
 RUN pip install --no-cache-dir \
     git+https://github.com/AllenNeuralDynamics/aind-dynamic-foraging-models.git@update_CTT#egg=aind-dynamic-foraging-models
-
 
