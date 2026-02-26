@@ -1802,6 +1802,7 @@ def _get_reward_and_choice_from_nwb(
 def plot_rpe_history_regression_from_nwb(
     nwb_data: Any,
     *,
+    summary: Optional[pd.DataFrame] = None,
     session_name: str=None,
     max_lag: int = 8,
     panel_width: float = 3.2,
