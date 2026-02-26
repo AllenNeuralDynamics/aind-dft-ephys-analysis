@@ -1486,6 +1486,7 @@ def save_combined_behavior_and_qlearning_summary(
     )
 
     # Re-use the same summary for the RPE regression
+    rpe_kwargs.setdefault("show_figure", False)
     fig_rpe, _, _ = plot_rpe_history_regression_from_nwb(
         nwb_data,
         summary=summary,
