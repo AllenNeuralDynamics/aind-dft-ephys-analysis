@@ -39,14 +39,15 @@ from typing import Dict, List, Optional, Tuple, Union, Literal
 # ==============================
 import numpy as np
 import xarray as xr
-from scipy import stats
-from sklearn.model_selection import KFold
 
 import matplotlib.pyplot as plt
-from matplotlib.cm import get_cmap, ScalarMappable
+from matplotlib.cm import ScalarMappable, get_cmap
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
+from scipy import stats
+from scipy.stats import pearsonr
+from sklearn.model_selection import KFold
 
 # ----------------------------- utilities -----------------------------
 
@@ -1374,3 +1375,153 @@ def project_full_session_to_tdr(
         },
     )
     return out
+
+
+
+
+
+def plot_projection_latent_segment(
+    zarr_path: str,
+    *,
+    time_window: Tuple[float, float] = (-1, 0),
+    window_trials: int = 100,
+    start_trial: Optional[int] = None,
+    random_seed: Optional[int] = None,
+    save_path: Optional[str] = None,
+    show: bool = True,
+):
+    """
+    Visualize the relationship between neural projection activity and a latent value
+    variable over a contiguous segment of trials.
+
+    Parameters
+    ----------
+    zarr_path : str
+        Path to the zarr dataset.
+    time_window : tuple of (float, float)
+        Time window (in seconds) used to average projection trace.
+    window_trials : int
+        Number of consecutive trials to visualize.
+    start_trial : int or None
+        Starting trial index. If None, randomly selected.
+    random_seed : int or None
+        Seed for reproducible random window selection.
+    save_path : str or None
+        If provided, save figure to this path.
+    show : bool
+        Whether to display the figure.
+
+    Returns
+    -------
+    r : float
+        Pearson correlation coefficient.
+    p : float
+        Pearson p-value.
+    start : int
+        Starting trial index.
+    end : int
+        Ending trial index.
+    """
+
+    # -----------------------------
+    # Load dataset
+    # -----------------------------
+    ds = xr.open_zarr(zarr_path, consolidated=False)
+
+    proj_trace = ds["projection_trace"]
+    latent = ds["latent"]
+    trial_ids = ds["trial_id"].values
+
+    # -----------------------------
+    # Compute per-trial projection
+    # -----------------------------
+    y_trial = proj_trace.sel(time=slice(time_window[0], time_window[1])).mean("time")
+
+    y_vals = y_trial.values
+    lat_vals = latent.values
+
+    n_trials = len(trial_ids)
+
+    # -----------------------------
+    # Select trial window
+    # -----------------------------
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
+    if window_trials >= n_trials:
+        start = 0
+    elif start_trial is not None:
+        start = start_trial
+    else:
+        start = np.random.randint(0, n_trials - window_trials)
+
+    end = min(start + window_trials, n_trials)
+
+    x_seg = trial_ids[start:end]
+    y_seg = y_vals[start:end]
+    lat_seg = lat_vals[start:end]
+
+    # -----------------------------
+    # Remove NaNs before correlation
+    # -----------------------------
+    mask = ~(np.isnan(y_seg) | np.isnan(lat_seg))
+    y_seg_clean = y_seg[mask]
+    lat_seg_clean = lat_seg[mask]
+
+    if len(y_seg_clean) > 1:
+        r, p = pearsonr(y_seg_clean, lat_seg_clean)
+    else:
+        r, p = np.nan, np.nan
+
+    # -----------------------------
+    # Plot
+    # -----------------------------
+    fig = plt.figure(figsize=(14, 5))
+    gs = fig.add_gridspec(1, 2, width_ratios=[3, 1])
+
+    ax1 = fig.add_subplot(gs[0])
+    ax2 = fig.add_subplot(gs[1])
+
+    color_proj = "#1f77b4"
+    color_lat = "#d62728"
+
+    # Left panel
+    ax1.plot(x_seg, y_seg, color=color_proj, linewidth=2)
+    ax1.set_xlabel("Trial")
+    ax1.set_ylabel("Avg TDR projection", color=color_proj)
+    ax1.tick_params(axis="y", labelcolor=color_proj)
+    ax1.set_title(f"Trial segment [{start}:{end}]")
+    ax1.spines["top"].set_visible(False)
+
+    ax1b = ax1.twinx()
+    ax1b.plot(x_seg, lat_seg, color=color_lat, linewidth=2, alpha=0.85)
+    ax1b.set_ylabel("Latent", color=color_lat)
+    ax1b.tick_params(axis="y", labelcolor=color_lat)
+    ax1b.spines["top"].set_visible(False)
+
+    # Right panel
+    ax2.scatter(lat_seg_clean, y_seg_clean, s=50, alpha=0.7, color="#2ca02c")
+
+    if len(y_seg_clean) > 1:
+        coef = np.polyfit(lat_seg_clean, y_seg_clean, 1)
+        xfit = np.linspace(np.min(lat_seg_clean), np.max(lat_seg_clean), 200)
+        yfit = coef[0] * xfit + coef[1]
+        ax2.plot(xfit, yfit, color="black", linewidth=2)
+
+    ax2.set_xlabel("Latent")
+    ax2.set_ylabel("Projection")
+    ax2.set_title(f"r = {r:.3f}" if not np.isnan(r) else "r = NaN")
+    ax2.spines["top"].set_visible(False)
+    ax2.spines["right"].set_visible(False)
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=300)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return r, p, start, end
