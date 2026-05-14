@@ -23,41 +23,35 @@ DEFAULT_VALUE_MAPPINGS: Dict[str, Dict[str, str]] = {
         # ALM
         "left ALM": "left ALM inactivation",
         "left ALM inactivation": "left ALM inactivation",
-        # VP inactivation
-        "VP inactivation": "left VP inactivation",
-        "left VP inactivation": "left VP inactivation",
         # VP GABAergic neuron inactivation
+        "VP inactivation": "left VP GABAergic neuron inactivation",
+        "left VP inactivation": "left VP GABAergic neuron inactivation",
         "Left VP GABAergic neuron inactivation": "left VP GABAergic neuron inactivation",
         # VP->MD stimulation
         "Left VP->MD stimulation": "left VP->MD stimulation",
         "left VP->MD stimulation": "left VP->MD stimulation",
-        # VP->MD (no qualifier)
-        "left VP->MD": "left VP->MD",
-        # MD
-        "left MD": "left MD",
+        "left VP->MD": "left VP->MD stimulation",
+        "left MD": "left VP->MD stimulation",
         # mPFC
-        "mPFC inactivation": "mPFC inactivation",
+        "mPFC inactivation": "left mPFC inactivation",
     },
     "laser_2_target_areas": {
         # ALM
         "right ALM": "right ALM inactivation",
         "right ALM inactivation": "right ALM inactivation",
-        # VP inactivation
-        "VP inactivation": "right VP inactivation",
-        "right VP inactivation": "right VP inactivation",
         # VP GABAergic neuron inactivation (note: dataset has double-space variant,
         # already collapsed to single space by the normalizer before lookup)
+        "VP inactivation": "right VP GABAergic neuron inactivation",
+        "right VP inactivation": "right VP GABAergic neuron inactivation",
         "Right VP GABAergic neuron inactivation": "right VP GABAergic neuron inactivation",
         # VP->MD stimulation
         "Right VP->MD stimulation": "right VP->MD stimulation",
         "right VP->MD stimulation": "right VP->MD stimulation",
-        # VP->MD (no qualifier) — also covers 'right vp->md' and the double-space variant
-        "right VP->MD": "right VP->MD",
-        "right vp->MD": "right VP->MD",
-        # MD
-        "right MD": "right MD",
+        "right VP->MD": "right VP->MD stimulation",
+        "right vp->MD": "right VP->MD stimulation",
+        "right MD": "right VP->MD stimulation",
         # mPFC
-        "mPFC inactivation": "mPFC inactivation",
+        "mPFC inactivation": "right mPFC inactivation",
     },
 }
 
