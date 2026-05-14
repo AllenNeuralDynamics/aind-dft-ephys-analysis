@@ -1,5 +1,7 @@
 import os
 import re
+import io
+import contextlib
 import warnings
 import unicodedata
 import numpy as np
@@ -492,7 +494,9 @@ def create_opto_data_frame_combined(
         if show_progress and not use_tqdm:
             print(f"[{i}/{total}] {nwb_path}")
 
-        nwb_data = NWBUtils.read_behavior_nwb(nwb_full_path=str(nwb_path))
+        # Silence noisy prints from downstream helpers; warnings still propagate.
+        with contextlib.redirect_stdout(io.StringIO()):
+            nwb_data = NWBUtils.read_behavior_nwb(nwb_full_path=str(nwb_path))
         if nwb_data is None:
             msg = f"Warning: Could not read NWB file {nwb_path}, skipping."
             if use_tqdm:
@@ -504,7 +508,8 @@ def create_opto_data_frame_combined(
             continue
 
         try:
-            df = create_opto_data_frame(nwb_data)
+            with contextlib.redirect_stdout(io.StringIO()):
+                df = create_opto_data_frame(nwb_data)
             newly_generated.append(df)
         except Exception as e:
             msg = f"Error processing {nwb_path}: {type(e).__name__}"
