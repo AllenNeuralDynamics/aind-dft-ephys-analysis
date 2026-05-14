@@ -841,35 +841,44 @@ def normalize_string_columns(
 
         return s
 
-    for c in columns:
-        df[c] = df[c].map(_normalize_value)
-
-    # Apply per-column alias -> canonical value mappings (after normalization).
+    # Build the effective alias -> canonical mapping (defaults + user overrides).
     effective_mappings: Dict[str, Dict[Any, Any]] = {}
     if apply_default_value_mappings:
-        # Deep copy to avoid mutating the module-level constant
         for col, m in DEFAULT_VALUE_MAPPINGS.items():
             effective_mappings[col] = dict(m)
     if value_mappings:
         for col, m in value_mappings.items():
             effective_mappings.setdefault(col, {}).update(m)
 
+    # Validate user-supplied mapping columns (defaults are silently skipped if absent).
+    user_unknown = [c for c in (value_mappings or {}) if c not in df.columns]
+    if user_unknown:
+        raise KeyError(
+            f"value_mappings references columns not in DataFrame: {user_unknown}"
+        )
+
+    # Apply alias -> canonical value mappings BEFORE the per-column normalization,
+    # so the canonical casing (e.g. "left VP GABAergic neuron inactivation") is
+    # preserved in the final output. Both mapping keys and the raw cell values are
+    # passed through `_normalize_value` only for *lookup*, while the stored value
+    # is the user-provided canonical string.
+    mapped_columns: set = set()
     if effective_mappings:
-        unknown_cols = [c for c in effective_mappings if c not in df.columns]
-        # Silently skip unknown columns from defaults; only raise for user-provided ones
-        user_unknown = [c for c in (value_mappings or {}) if c not in df.columns]
-        if user_unknown:
-            raise KeyError(
-                f"value_mappings references columns not in DataFrame: {user_unknown}"
-            )
         for col, mapping in effective_mappings.items():
             if col not in df.columns:
                 continue
-            # Normalize the mapping keys so users can write them in any casing/spacing.
-            normalized_mapping = {
-                _normalize_value(k): v for k, v in mapping.items()
-            }
-            df[col] = df[col].map(lambda v: normalized_mapping.get(v, v))
+            norm_to_canonical = {_normalize_value(k): v for k, v in mapping.items()}
+            df[col] = df[col].map(
+                lambda v: norm_to_canonical.get(_normalize_value(v), v)
+            )
+            mapped_columns.add(col)
+
+    # Standard per-column normalization (skip columns already replaced by a
+    # canonical value so their casing is preserved).
+    for c in columns:
+        if c in mapped_columns:
+            continue
+        df[c] = df[c].map(_normalize_value)
 
     return df
 
