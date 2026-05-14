@@ -507,7 +507,7 @@ def create_opto_data_frame_combined(
             df = create_opto_data_frame(nwb_data)
             newly_generated.append(df)
         except Exception as e:
-            msg = f"Error processing {Path(nwb_path).name}: {type(e).__name__}"
+            msg = f"Error processing {nwb_path}: {type(e).__name__}"
             if use_tqdm:
                 pbar.write(msg)
             else:
