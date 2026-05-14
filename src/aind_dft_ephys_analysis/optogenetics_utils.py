@@ -491,8 +491,12 @@ def create_opto_data_frame_combined(
     newly_generated: List[pd.DataFrame] = []
 
     for i, nwb_path in enumerate(nwb_files, start=1):
-        if show_progress and not use_tqdm:
-            print(f"[{i}/{total}] {nwb_path}")
+        progress_msg = f"[{i}/{total}] {Path(nwb_path).name}"
+        if show_progress:
+            if use_tqdm:
+                pbar.write(progress_msg)
+            else:
+                print(progress_msg)
 
         # Silence noisy prints from downstream helpers; warnings still propagate.
         with contextlib.redirect_stdout(io.StringIO()):
