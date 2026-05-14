@@ -1,5 +1,6 @@
 import os
 import re
+import warnings
 import unicodedata
 import numpy as np
 import pandas as pd
@@ -163,13 +164,21 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
             latent_name=ln
         )
         if arr is None:
-            raise ValueError(f"Latent '{ln}' could not be extracted for model '{model_alias}'.")
+            warnings.warn(
+                f"Latent '{ln}' could not be extracted for model '{model_alias}'. "
+                f"Filling column with None."
+            )
+            df[f'{model_alias}-{ln}'] = pd.Series([None] * n_trials, dtype=object)
+            continue
 
         # Enforce length == number of response trials
         if len(arr) != n_valid:
-            raise ValueError(
-                f"Latent '{ln}' length ({len(arr)}) != number of response trials ({n_valid})."
+            warnings.warn(
+                f"Latent '{ln}' length ({len(arr)}) != number of response trials "
+                f"({n_valid}). Filling column with None."
             )
+            df[f'{model_alias}-{ln}'] = pd.Series([None] * n_trials, dtype=object)
+            continue
 
         # Build column: None for no-response, values for valid trials
         col = [None] * n_trials
