@@ -669,6 +669,7 @@ def normalize_string_columns(
     to_lower: bool = True,
     unify_arrows: bool = True,
     convert_numeric: bool = True,
+    value_mappings: Optional[Dict[str, Dict[Any, Any]]] = None,
     inplace: bool = False,
 ) -> pd.DataFrame:
     """
@@ -685,6 +686,7 @@ def normalize_string_columns(
     - Uppercase OR lowercase normalization (mutually exclusive)
     - Numeric normalization (e.g. "50.0" -> 50.0)
     - Missing-value normalization (e.g. "NA", "none", "NaN" -> pd.NA)
+    - Optional per-column value remapping (alias -> canonical value)
 
     Parameters
     ----------
@@ -700,6 +702,25 @@ def normalize_string_columns(
         If True, normalize arrow variants to "->".
     convert_numeric : bool, default True
         If True, convert numeric-looking strings to numbers.
+    value_mappings : dict[str, dict], optional
+        Per-column alias -> canonical value mapping applied AFTER the standard
+        normalization steps. Example::
+
+            value_mappings={
+                "laser_1_target_areas": {
+                    "left ALM": "left ALM inactivation",
+                    "left ALM inactivation": "left ALM inactivation",
+                    "VP inactivation": "left VP inactivation",
+                    "left VP inactivation": "left VP inactivation",
+                },
+                "laser_2_target_areas": {
+                    "right ALM": "right ALM inactivation",
+                },
+            }
+
+        Mapping keys are themselves normalized (same rules as the values being
+        normalized) so you can write them in the most readable form regardless
+        of casing/whitespace in the data.
     inplace : bool, default False
         If True, modify the input DataFrame in place.
 
@@ -778,6 +799,20 @@ def normalize_string_columns(
 
     for c in columns:
         df[c] = df[c].map(_normalize_value)
+
+    # Apply per-column alias -> canonical value mappings (after normalization).
+    if value_mappings:
+        unknown_cols = [c for c in value_mappings if c not in df.columns]
+        if unknown_cols:
+            raise KeyError(
+                f"value_mappings references columns not in DataFrame: {unknown_cols}"
+            )
+        for col, mapping in value_mappings.items():
+            # Normalize the mapping keys so users can write them in any casing/spacing.
+            normalized_mapping = {
+                _normalize_value(k): v for k, v in mapping.items()
+            }
+            df[col] = df[col].map(lambda v: normalized_mapping.get(v, v))
 
     return df
 
