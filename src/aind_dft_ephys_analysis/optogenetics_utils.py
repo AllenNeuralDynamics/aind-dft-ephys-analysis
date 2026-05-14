@@ -13,6 +13,55 @@ from typing import List, Any, Union, Optional, Dict
 from behavior_utils import extract_fitted_data
 from nwb_utils import NWBUtils
 
+
+# Default per-column alias -> canonical value mapping consumed by
+# `normalize_string_columns`. Mapping keys are themselves passed through the
+# normalizer (lowercased, whitespace-collapsed, arrows unified, etc.), so write
+# them in the most readable form. Add new aliases here as the dataset grows.
+DEFAULT_VALUE_MAPPINGS: Dict[str, Dict[str, str]] = {
+    "laser_1_target_areas": {
+        # ALM
+        "left ALM": "left ALM inactivation",
+        "left ALM inactivation": "left ALM inactivation",
+        # VP inactivation
+        "VP inactivation": "left VP inactivation",
+        "left VP inactivation": "left VP inactivation",
+        # VP GABAergic neuron inactivation
+        "Left VP GABAergic neuron inactivation": "left VP GABAergic neuron inactivation",
+        # VP->MD stimulation
+        "Left VP->MD stimulation": "left VP->MD stimulation",
+        "left VP->MD stimulation": "left VP->MD stimulation",
+        # VP->MD (no qualifier)
+        "left VP->MD": "left VP->MD",
+        # MD
+        "left MD": "left MD",
+        # mPFC
+        "mPFC inactivation": "mPFC inactivation",
+    },
+    "laser_2_target_areas": {
+        # ALM
+        "right ALM": "right ALM inactivation",
+        "right ALM inactivation": "right ALM inactivation",
+        # VP inactivation
+        "VP inactivation": "right VP inactivation",
+        "right VP inactivation": "right VP inactivation",
+        # VP GABAergic neuron inactivation (note: dataset has double-space variant,
+        # already collapsed to single space by the normalizer before lookup)
+        "Right VP GABAergic neuron inactivation": "right VP GABAergic neuron inactivation",
+        # VP->MD stimulation
+        "Right VP->MD stimulation": "right VP->MD stimulation",
+        "right VP->MD stimulation": "right VP->MD stimulation",
+        # VP->MD (no qualifier) — also covers 'right vp->md' and the double-space variant
+        "right VP->MD": "right VP->MD",
+        "right vp->MD": "right VP->MD",
+        # MD
+        "right MD": "right MD",
+        # mPFC
+        "mPFC inactivation": "mPFC inactivation",
+    },
+}
+
+
 def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
     """
     Create a per-trial DataFrame from `nwb_data.intervals['trials']`, append the session
@@ -670,6 +719,7 @@ def normalize_string_columns(
     unify_arrows: bool = True,
     convert_numeric: bool = True,
     value_mappings: Optional[Dict[str, Dict[Any, Any]]] = None,
+    apply_default_value_mappings: bool = True,
     inplace: bool = False,
 ) -> pd.DataFrame:
     """
@@ -801,13 +851,26 @@ def normalize_string_columns(
         df[c] = df[c].map(_normalize_value)
 
     # Apply per-column alias -> canonical value mappings (after normalization).
+    effective_mappings: Dict[str, Dict[Any, Any]] = {}
+    if apply_default_value_mappings:
+        # Deep copy to avoid mutating the module-level constant
+        for col, m in DEFAULT_VALUE_MAPPINGS.items():
+            effective_mappings[col] = dict(m)
     if value_mappings:
-        unknown_cols = [c for c in value_mappings if c not in df.columns]
-        if unknown_cols:
+        for col, m in value_mappings.items():
+            effective_mappings.setdefault(col, {}).update(m)
+
+    if effective_mappings:
+        unknown_cols = [c for c in effective_mappings if c not in df.columns]
+        # Silently skip unknown columns from defaults; only raise for user-provided ones
+        user_unknown = [c for c in (value_mappings or {}) if c not in df.columns]
+        if user_unknown:
             raise KeyError(
-                f"value_mappings references columns not in DataFrame: {unknown_cols}"
+                f"value_mappings references columns not in DataFrame: {user_unknown}"
             )
-        for col, mapping in value_mappings.items():
+        for col, mapping in effective_mappings.items():
+            if col not in df.columns:
+                continue
             # Normalize the mapping keys so users can write them in any casing/spacing.
             normalized_mapping = {
                 _normalize_value(k): v for k, v in mapping.items()
