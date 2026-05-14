@@ -156,6 +156,7 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
 
     full_session_name = getattr(nwb_data, 'session_id', None)
 
+    missing_latents: List[str] = []
     for ln in latent_names:
         arr = extract_fitted_data(
             nwb_behavior_data=nwb_data,
@@ -164,19 +165,13 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
             latent_name=ln
         )
         if arr is None:
-            warnings.warn(
-                f"Latent '{ln}' could not be extracted for model '{model_alias}'. "
-                f"Filling column with None."
-            )
+            missing_latents.append(ln)
             df[f'{model_alias}-{ln}'] = pd.Series([None] * n_trials, dtype=object)
             continue
 
         # Enforce length == number of response trials
         if len(arr) != n_valid:
-            warnings.warn(
-                f"Latent '{ln}' length ({len(arr)}) != number of response trials "
-                f"({n_valid}). Filling column with None."
-            )
+            missing_latents.append(f"{ln}(len={len(arr)}!={n_valid})")
             df[f'{model_alias}-{ln}'] = pd.Series([None] * n_trials, dtype=object)
             continue
 
@@ -188,6 +183,11 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
 
         # Set dtype=object to preserve None
         df[f'{model_alias}-{ln}'] = pd.Series(col, dtype=object)
+
+    if missing_latents:
+        warnings.warn(
+            f"[{full_session_name}] missing {len(missing_latents)}/{len(latent_names)} latents."
+        )
 
     return df
 
@@ -507,7 +507,7 @@ def create_opto_data_frame_combined(
             df = create_opto_data_frame(nwb_data)
             newly_generated.append(df)
         except Exception as e:
-            msg = f"Error processing {nwb_path}: {e}"
+            msg = f"Error processing {Path(nwb_path).name}: {type(e).__name__}"
             if use_tqdm:
                 pbar.write(msg)
             else:
