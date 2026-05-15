@@ -820,3 +820,306 @@ def plot_rates_vs_latent(
 
     return (figs, summary_df) if return_table else figs
 
+
+def plot_on_off_block_rates(
+    combined_dataframe: pd.DataFrame,
+    vis_types: List[str] = ("stay", "switch", "win_stay", "lose_switch", "response"),
+    gap: int = 100,
+    criteria: Optional[Dict[str, Any]] = None,
+    session_col: str = "session",
+    subject_col: str = "subject_id",
+    laser_col: str = "laser_on_trial",
+    trial_id_col: str = "trial_num",
+    line_by: str = "session",   # {"session", "subject", "all"}
+    subject: Optional[str] = None,
+    session: Optional[str] = None,
+    exclude: Optional[Dict[str, Any]] = None,
+    share_y: bool = True,
+    return_table: bool = False,
+    figsize: Tuple[float, float] = (5.0, 4.5),
+):
+    """
+    Compare metric rates between **opto-on blocks** and **opto-off blocks**.
+
+    Block definition (per session, using `trial_id_col` as the trial position):
+
+      - First, select **opto** trials matching `criteria` (if any). Sort their
+        trial IDs ascending.
+      - **On-block**: a contiguous cluster of those opto trials where the gap
+        between consecutive opto trials is `<= gap`. The on-block spans every
+        trial whose `trial_id_col` value lies in
+        `[first_opto_in_cluster, last_opto_in_cluster]` (inclusive),
+        regardless of whether each individual trial was opto or not.
+      - **Off-block**: every trial in the session whose `trial_id_col` value
+        does NOT fall inside any on-block. Off-blocks may contain isolated
+        opto trials whose nearest opto neighbour is more than `gap` away
+        (those still don't form an on-block by themselves; a single isolated
+        opto trial defines a degenerate on-block of width 1, so it goes into
+        the on side).
+
+    Per session and per metric, the rate is the proportion of trials with the
+    metric==True over trials where the metric is not NA, within each block
+    type. Counts are kept so `line_by` pooling is exact.
+
+    Parameters
+    ----------
+    combined_dataframe : pandas.DataFrame
+        Per-trial DataFrame.
+    vis_types : list[str], default ("stay","switch","win_stay","lose_switch","response")
+        Which metrics to plot.
+    gap : int, default 5
+        Maximum allowed distance (in `trial_id_col` units) between consecutive
+        opto trials for them to be considered in the same on-block.
+    criteria : dict | None, default None
+        Extra filters applied to opto trials before clustering (same semantics
+        as in `plot_stay_switch_over_window`).
+    session_col, subject_col, laser_col, trial_id_col : str
+        Column names. `trial_id_col` is treated as an integer trial index used
+        only for clustering / interval membership tests.
+    line_by : {"session","subject","all"}
+        How to aggregate before plotting. "session" plots one paired (off→on)
+        line per session; "subject" pools sessions per subject (exact, by
+        summed counts); "all" pools everything into a single paired line.
+    subject, session : str | None
+        Optional pre-filters.
+    exclude : dict | None
+        Optional row-exclusion filter applied globally (same as in the
+        sibling functions).
+    share_y : bool, default True
+        Fix y-axis to [0, 1] for all metric figures.
+    return_table : bool, default False
+        Also return the per-session per-metric counts table.
+    figsize : (float, float)
+        Figure size for each metric.
+
+    Returns
+    -------
+    figs : dict[str, matplotlib.figure.Figure]
+        One figure per metric. X = {"off","on"}, Y = rate, with one line per
+        session/subject/all.
+    summary_df : pandas.DataFrame, optional
+        Tidy table with columns
+        ['session','subject_id','metric','block','n_success','n_trials','rate'].
+    """
+
+    df = combined_dataframe.copy()
+
+    # ---------- validation ----------
+    base_needed = {session_col, subject_col, laser_col, trial_id_col}
+    missing = sorted(base_needed - set(df.columns))
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    valid_metrics = {"stay", "switch", "win_stay", "lose_switch", "response"}
+    vis_types = list(vis_types)
+    bad = sorted(set(vis_types) - valid_metrics)
+    if bad:
+        raise ValueError(f"Unknown vis_types: {bad}. Valid: {sorted(valid_metrics)}")
+    miss_metrics = [m for m in vis_types if m not in df.columns]
+    if miss_metrics:
+        raise ValueError(f"Missing metric columns: {miss_metrics}")
+
+    if line_by not in {"session", "subject", "all"}:
+        raise ValueError("line_by must be 'session', 'subject', or 'all'.")
+
+    if not isinstance(gap, (int, np.integer)) or gap < 0:
+        raise ValueError("`gap` must be a non-negative integer.")
+
+    # ---------- optional narrowing ----------
+    if subject is not None:
+        df = df[df[subject_col].astype(str) == str(subject)]
+    if session is not None:
+        df = df[df[session_col].astype(str) == str(session)]
+    df = _drop_excluded(df, exclude)
+    if df.empty:
+        raise ValueError("No data left after applying subject/session/exclude filters.")
+
+    # ---------- helpers (reuse the same parsing logic as siblings) ----------
+    def _as_opto_bool(s: pd.Series) -> pd.Series:
+        if pd.api.types.is_bool_dtype(s):
+            return s.fillna(False)
+        truthy = {"1", "true", "yes", "on", "y", "t", 1}
+        falsy = {"0", "false", "no", "off", "n", "f", "", 0}
+        def parse(x):
+            if x is None or (isinstance(x, float) and pd.isna(x)) or pd.isna(x):
+                return False
+            if isinstance(x, (bool, np.bool_)):     return bool(x)
+            if isinstance(x, (int, np.integer)):    return x != 0
+            if isinstance(x, (float, np.floating)): return int(x) != 0
+            if isinstance(x, str):
+                xs = x.strip().lower()
+                if xs in truthy: return True
+                if xs in falsy:  return False
+            return False
+        return s.map(parse)
+
+    def _as_bool_series(s: pd.Series) -> pd.Series:
+        if pd.api.types.is_bool_dtype(s):
+            return s.astype("boolean")
+        truthy = {"1", "true", "yes", "on", "y", "t"}
+        falsy = {"0", "false", "no", "off", "n", "f", ""}
+        def parse(x):
+            if x is None or (isinstance(x, float) and pd.isna(x)) or pd.isna(x):
+                return pd.NA
+            if isinstance(x, (bool, np.bool_)):     return bool(x)
+            if isinstance(x, (int, np.integer)):    return x != 0
+            if isinstance(x, (float, np.floating)): return int(x) != 0
+            if isinstance(x, str):
+                xs = x.strip().lower()
+                if xs in truthy: return True
+                if xs in falsy:  return False
+                return pd.NA
+            return pd.NA
+        return s.map(parse).astype("boolean")
+
+    def _apply_criteria(x: pd.DataFrame, crit: Optional[Dict[str, Any]]) -> pd.DataFrame:
+        if not crit:
+            return x
+        mask = pd.Series(True, index=x.index)
+        for k, v in crit.items():
+            if k not in x.columns:
+                continue
+            if v is None:                            mask &= x[k].isna()
+            elif isinstance(v, (list, tuple, set)):  mask &= x[k].isin(list(v))
+            else:                                    mask &= (x[k] == v)
+        return x[mask]
+
+    # ---------- normalize ----------
+    df["_is_opto"] = _as_opto_bool(df[laser_col])
+    df[trial_id_col] = pd.to_numeric(df[trial_id_col], errors="coerce")
+    df = df.dropna(subset=[trial_id_col]).copy()
+    df[trial_id_col] = df[trial_id_col].astype(int)
+
+    for m in vis_types:
+        df[m] = _as_bool_series(df[m])
+
+    # ---------- per-session block computation ----------
+    rows = []
+    for sess_id, g in df.groupby(session_col, sort=False):
+        if g.empty:
+            continue
+        subj_id = str(g[subject_col].iloc[0])
+
+        anchors = _apply_criteria(g[g["_is_opto"]], criteria)
+        opto_ids = np.sort(anchors[trial_id_col].astype(int).unique())
+
+        # Build on-block intervals [start, end] (inclusive) by clustering opto ids.
+        on_intervals: List[Tuple[int, int]] = []
+        if opto_ids.size > 0:
+            cluster_start = opto_ids[0]
+            cluster_end = opto_ids[0]
+            for tid in opto_ids[1:]:
+                if (tid - cluster_end) <= gap:
+                    cluster_end = tid
+                else:
+                    on_intervals.append((int(cluster_start), int(cluster_end)))
+                    cluster_start = tid
+                    cluster_end = tid
+            on_intervals.append((int(cluster_start), int(cluster_end)))
+
+        # Mask: True if a trial's trial_id falls in any on-interval.
+        tids = g[trial_id_col].astype(int).values
+        in_on = np.zeros(len(g), dtype=bool)
+        for a, b in on_intervals:
+            in_on |= (tids >= a) & (tids <= b)
+
+        on_df = g.iloc[in_on]
+        off_df = g.iloc[~in_on]
+
+        for block_name, block_df in (("on", on_df), ("off", off_df)):
+            for metric in vis_types:
+                vals = block_df[metric]
+                n_used = int(vals.notna().sum())
+                n_success = int(vals.fillna(False).sum())
+                rate = (n_success / n_used) if n_used > 0 else np.nan
+                rows.append({
+                    "session": str(sess_id),
+                    "subject_id": subj_id,
+                    "metric": metric,
+                    "block": block_name,
+                    "n_success": n_success,
+                    "n_trials": n_used,
+                    "rate": rate,
+                })
+
+    summary_df = pd.DataFrame(rows)
+    if summary_df.empty:
+        raise ValueError("No data to plot. Check filters/criteria/gap and that opto trials exist.")
+
+    # ---------- pooling for line_by ----------
+    if line_by == "subject":
+        agg = (
+            summary_df
+            .groupby(["subject_id", "metric", "block"], as_index=False)[["n_success", "n_trials"]]
+            .sum()
+        )
+        agg["rate"] = np.where(agg["n_trials"] > 0, agg["n_success"] / agg["n_trials"], np.nan)
+        agg["session"] = agg["subject_id"]
+        plot_table = agg[["session", "subject_id", "metric", "block", "rate", "n_trials"]].copy()
+        line_labels = sorted(plot_table["session"].unique().tolist())
+    elif line_by == "all":
+        agg = (
+            summary_df
+            .groupby(["metric", "block"], as_index=False)[["n_success", "n_trials"]]
+            .sum()
+        )
+        agg["rate"] = np.where(agg["n_trials"] > 0, agg["n_success"] / agg["n_trials"], np.nan)
+        agg["session"] = "ALL"
+        agg["subject_id"] = "ALL"
+        plot_table = agg[["session", "subject_id", "metric", "block", "rate", "n_trials"]].copy()
+        line_labels = ["ALL"]
+    else:
+        plot_table = summary_df[["session", "subject_id", "metric", "block", "rate", "n_trials"]].copy()
+        line_labels = sorted(plot_table["session"].unique().tolist())
+
+    # ---------- plotting ----------
+    subjects_present = sorted(plot_table["subject_id"].dropna().astype(str).unique().tolist())
+    cmap = plt.get_cmap("tab20", max(1, len(subjects_present)))
+    subject_to_color = {s: cmap(i % cmap.N) for i, s in enumerate(subjects_present)}
+
+    block_order = ["off", "on"]
+    x_pos = {b: i for i, b in enumerate(block_order)}
+
+    figs: Dict[str, plt.Figure] = {}
+    for metric in vis_types:
+        sub = plot_table[plot_table["metric"] == metric]
+        if sub.empty:
+            continue
+
+        fig, ax = plt.subplots(figsize=figsize)
+        for label in line_labels:
+            ldf = sub[sub["session"] == label]
+            if ldf.empty:
+                continue
+            subj = ldf["subject_id"].iloc[0]
+            color = subject_to_color.get(str(subj), None)
+            ys = [
+                ldf.loc[ldf["block"] == b, "rate"].iloc[0]
+                if (ldf["block"] == b).any() else np.nan
+                for b in block_order
+            ]
+            xs = [x_pos[b] for b in block_order]
+            ax.plot(xs, ys, marker="o", linewidth=1.4, alpha=0.95, color=color)
+
+        ax.set_xticks([x_pos[b] for b in block_order])
+        ax.set_xticklabels([f"opto {b}" for b in block_order])
+        ax.set_xlim(-0.5, len(block_order) - 0.5)
+        title_map = {"session": "Per-session", "subject": "Subject-pooled", "all": "All-data pooled"}
+        ax.set_title(f"{title_map[line_by]}: {metric.replace('_', ' ').title()} (gap={gap})")
+        ax.set_ylabel("Rate")
+        if share_y:
+            ax.set_ylim(0.0, 1.0)
+        ax.grid(True, axis="y", alpha=0.25)
+
+        from matplotlib.lines import Line2D
+        handles = [
+            Line2D([0], [0], color=subject_to_color[s], lw=2, label=s)
+            for s in subjects_present
+        ]
+        if handles:
+            ax.legend(handles=handles, title="Subject", bbox_to_anchor=(1.02, 1), loc="upper left")
+
+        figs[metric] = fig
+
+    return (figs, summary_df) if return_table else figs
+
