@@ -244,6 +244,7 @@ def find_unique_combinations(
     columns: List[str],
     count_col: str = "n_trials",
     include_na: bool = True,
+    include_id_lists: bool = False,
 ) -> pd.DataFrame:
     """
     Find unique value combinations in the given columns and count trials per combo,
@@ -262,6 +263,12 @@ def find_unique_combinations(
         If True, keep groups where at least one column is NA/None
         (NaN is treated as a valid group level).
         If False, drop rows with NA in any of the specified columns before grouping.
+    include_id_lists : bool, default False
+        If True, also include two list-valued columns:
+          - 'animals_IDs' : sorted list of unique subject_id values per combo
+          - 'session_IDs' : sorted list of unique session values per combo
+        Requires 'subject_id' / 'session' columns to be present (silently skipped
+        otherwise).
 
     Returns
     -------
@@ -270,6 +277,8 @@ def find_unique_combinations(
           - '{count_col}': total rows in the group
           - 'n_session'  : number of unique sessions contributing to the group
           - 'n_mice'     : number of unique subject_id values contributing to the group
+          - 'animals_IDs': (optional) sorted list of unique subject_ids
+          - 'session_IDs': (optional) sorted list of unique sessions
     """
     # Validate columns
     missing = [c for c in columns if c not in df.columns]
@@ -310,8 +319,22 @@ def find_unique_combinations(
     else:
         n_mice = pd.Series(pd.NA, index=counts.index, dtype="Int64", name="n_mice")
 
+    pieces = [counts, n_session, n_mice]
+
+    if include_id_lists:
+        if have_subject:
+            animals_ids = gb["subject_id"].apply(
+                lambda s: sorted({str(v) for v in s.dropna().unique()})
+            ).rename("animals_IDs")
+            pieces.append(animals_ids)
+        if have_session:
+            session_ids = gb["session"].apply(
+                lambda s: sorted({str(v) for v in s.dropna().unique()})
+            ).rename("session_IDs")
+            pieces.append(session_ids)
+
     out = (
-        pd.concat([counts, n_session, n_mice], axis=1)
+        pd.concat(pieces, axis=1)
         .reset_index()
         .sort_values(by=count_col, ascending=False, kind="stable")
         .reset_index(drop=True)
@@ -331,7 +354,8 @@ def find_unique_stimulation(
         'session_wide_control', 'fraction_of_session', 'session_start_with',
         'session_alternation'
     ],
-    strict: bool = False
+    strict: bool = False,
+    include_id_lists: bool = True,
 ) -> pd.DataFrame:
     """
     Return unique stimulation parameter combinations.
@@ -345,6 +369,9 @@ def find_unique_stimulation(
     strict : bool
         If True, raise an error when any requested column is missing.
         If False, silently ignore missing columns and use the intersection.
+    include_id_lists : bool, default True
+        If True, also include 'animals_IDs' and 'session_IDs' columns containing
+        sorted lists of unique subject_id / session values for each combination.
 
     Returns
     -------
@@ -363,7 +390,7 @@ def find_unique_stimulation(
         return pd.DataFrame(columns=[])
 
     # Use your helper to get unique combos
-    return find_unique_combinations(df, present)
+    return find_unique_combinations(df, present, include_id_lists=include_id_lists)
 
 def _collect_nwb_files(sources: Union[str, Path, Iterable[Union[str, Path]]]) -> List[Path]:
     """
