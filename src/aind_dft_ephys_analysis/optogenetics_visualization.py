@@ -4,6 +4,41 @@ import matplotlib.pyplot as plt
 from typing import List, Dict, Any, Tuple, Optional, Union
 
 
+def _drop_excluded(
+    df: pd.DataFrame,
+    exclude: Optional[Dict[str, Any]],
+) -> pd.DataFrame:
+    """
+    Drop rows from `df` whose values match any of the entries in `exclude`.
+
+    `exclude` maps column name -> value(s) to exclude. Values may be:
+      - a single scalar  (drop rows where df[col] == value)
+      - a list/tuple/set (drop rows where df[col] is in the collection)
+      - None             (drop rows where df[col] is NA/None)
+
+    Unknown columns are silently skipped (so callers can pass a generic
+    exclude dict without worrying about every column being present).
+    Comparisons are done as strings for robustness against mixed dtypes
+    (e.g., int vs. str subject ids), except for the None/NA case.
+    """
+    if not exclude or df.empty:
+        return df
+    keep = pd.Series(True, index=df.index)
+    for col, val in exclude.items():
+        if col not in df.columns:
+            continue
+        if val is None:
+            keep &= ~df[col].isna()
+            continue
+        col_str = df[col].astype(str)
+        if isinstance(val, (list, tuple, set)):
+            bad = {str(v) for v in val}
+            keep &= ~col_str.isin(bad)
+        else:
+            keep &= col_str != str(val)
+    return df[keep]
+
+
 def plot_stay_switch_over_window(
     combined_dataframe: pd.DataFrame,
     vis_types: List[str] = ("stay", "switch", "win_stay", "lose_switch", "response"),
@@ -17,6 +52,7 @@ def plot_stay_switch_over_window(
     # (optional) narrow the dataset
     subject: Optional[str] = None,
     session: Optional[str] = None,
+    exclude: Optional[Dict[str, Any]] = None,
     share_y: bool = True,
     return_table: bool = False,
     figsize: Tuple[float, float] = (6.0, 4.5),
@@ -78,6 +114,14 @@ def plot_stay_switch_over_window(
     session : str | None, default None
         Optional: restrict to a single session before plotting.
 
+    exclude : dict | None, default None
+        Optional row-exclusion filter applied globally before any analysis.
+        Maps column name -> value(s) to exclude. Values may be a single scalar,
+        a list/tuple/set of values, or None (to exclude rows where the column
+        is NA). Unknown columns are silently ignored. Example::
+
+            exclude={"subject_id": ["780289"], "session": ["780285_2025-05-05_13-19-38"]}
+
     share_y : bool, default True
         If True, fix y-limits to [0, 1] for all figures.
 
@@ -127,8 +171,9 @@ def plot_stay_switch_over_window(
         df = df[df[subject_col].astype(str) == str(subject)]
     if session is not None:
         df = df[df[session_col].astype(str) == str(session)]
+    df = _drop_excluded(df, exclude)
     if df.empty:
-        raise ValueError("No data left after applying subject/session filters.")
+        raise ValueError("No data left after applying subject/session/exclude filters.")
 
     # ---------- helpers ----------
     def _as_opto_bool(s: pd.Series) -> pd.Series:
@@ -345,6 +390,7 @@ def plot_rates_vs_latent(
     line_by: str = "subject",   # {"session","subject","all"}
     subject: Optional[str] = None,
     session: Optional[str] = None,
+    exclude: Optional[Dict[str, Any]] = None,
     response_latent_fill: str = "ffill",  # {"ffill","bfill","nearest","none"}
     share_y: bool = True,
     return_table: bool = False,
@@ -410,6 +456,13 @@ def plot_rates_vs_latent(
         If provided, pre-filter to this subject (string-compared).
     session : str or None, optional
         If provided, pre-filter to this session (string-compared).
+    exclude : dict or None, optional
+        Row-exclusion filter applied globally before any analysis. Maps column
+        name -> value(s) to exclude. Values may be a single scalar, a
+        list/tuple/set of values, or None (to exclude rows where the column is
+        NA). Unknown columns are silently ignored. Example::
+
+            exclude={"subject_id": ["780289"], "session": ["780285_2025-05-05_13-19-38"]}
     response_latent_fill : {"ffill","bfill","nearest","none"}, optional
         Fill strategy for latent values used **only** when binning the "response" metric.
         Many pipelines attach latent only to responded trials; filling ensures non-response
@@ -472,8 +525,9 @@ def plot_rates_vs_latent(
         df = df[df[subject_col].astype(str) == str(subject)]
     if session is not None:
         df = df[df[session_col].astype(str) == str(session)]
+    df = _drop_excluded(df, exclude)
     if df.empty:
-        raise ValueError("No data left after applying subject/session filters.")
+        raise ValueError("No data left after applying subject/session/exclude filters.")
 
     # ---------- helpers ----------
     def _as_opto_bool(s: pd.Series) -> pd.Series:
