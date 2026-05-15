@@ -1003,19 +1003,24 @@ def plot_on_off_block_rates(
         anchors = _apply_criteria(g[g["_is_opto"]], criteria)
         opto_ids = np.sort(anchors[trial_id_col].astype(int).unique())
 
+        # Skip sessions with NO opto anchors matching `criteria`. Without anchors
+        # there is no on-block to compare against, and including such sessions
+        # would leak unrelated subjects/conditions into the off-block stats.
+        if opto_ids.size == 0:
+            continue
+
         # Build on-block intervals [start, end] (inclusive) by clustering opto ids.
         on_intervals: List[Tuple[int, int]] = []
-        if opto_ids.size > 0:
-            cluster_start = opto_ids[0]
-            cluster_end = opto_ids[0]
-            for tid in opto_ids[1:]:
-                if (tid - cluster_end) <= gap:
-                    cluster_end = tid
-                else:
-                    on_intervals.append((int(cluster_start), int(cluster_end)))
-                    cluster_start = tid
-                    cluster_end = tid
-            on_intervals.append((int(cluster_start), int(cluster_end)))
+        cluster_start = opto_ids[0]
+        cluster_end = opto_ids[0]
+        for tid in opto_ids[1:]:
+            if (tid - cluster_end) <= gap:
+                cluster_end = tid
+            else:
+                on_intervals.append((int(cluster_start), int(cluster_end)))
+                cluster_start = tid
+                cluster_end = tid
+        on_intervals.append((int(cluster_start), int(cluster_end)))
 
         # Mask: True if a trial's trial_id falls in any on-interval.
         tids = g[trial_id_col].astype(int).values
