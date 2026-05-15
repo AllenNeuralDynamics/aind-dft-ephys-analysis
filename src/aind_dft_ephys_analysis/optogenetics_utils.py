@@ -356,6 +356,7 @@ def find_unique_stimulation(
     ],
     strict: bool = False,
     include_id_lists: bool = True,
+    include: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     """
     Return unique stimulation parameter combinations.
@@ -372,12 +373,44 @@ def find_unique_stimulation(
     include_id_lists : bool, default True
         If True, also include 'animals_IDs' and 'session_IDs' columns containing
         sorted lists of unique subject_id / session values for each combination.
+    include : dict[str, Any], optional
+        Pre-filter the DataFrame to only rows whose values match. Maps column
+        name -> value(s) to **keep**. Values may be:
+          - a single scalar  (keep rows where df[col] == value)
+          - a list/tuple/set (keep rows where df[col] is in the collection)
+          - None             (keep rows where df[col] is NA)
+        Comparisons are done as strings for robustness against mixed dtypes.
+        Unknown columns are silently ignored. Example::
+
+            include={
+                "laser_1_target_areas": ["left VP GABAergic neuron inactivation"],
+                "laser_2_target_areas": ["right VP GABAergic neuron inactivation"],
+            }
 
     Returns
     -------
     pd.DataFrame
         Unique combinations across the available columns (no duplicates).
     """
+    # Optional inclusion pre-filter (string-compared for robustness).
+    if include:
+        keep = pd.Series(True, index=df.index)
+        for col, val in include.items():
+            if col not in df.columns:
+                continue
+            if val is None:
+                keep &= df[col].isna()
+                continue
+            col_str = df[col].astype(str)
+            if isinstance(val, (list, tuple, set)):
+                wanted = {str(v) for v in val}
+                keep &= col_str.isin(wanted)
+            else:
+                keep &= col_str == str(val)
+        df = df[keep]
+        if df.empty:
+            return pd.DataFrame(columns=[])
+
     # Determine which requested columns are present
     present = [c for c in columns if c in df.columns]
     missing = [c for c in columns if c not in df.columns]
