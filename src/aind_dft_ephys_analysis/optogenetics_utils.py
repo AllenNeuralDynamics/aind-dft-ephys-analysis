@@ -31,7 +31,8 @@ DEFAULT_VALUE_MAPPINGS: Dict[str, Dict[str, str]] = {
         "Left VP->MD stimulation": "left VP->MD stimulation",
         "left VP->MD stimulation": "left VP->MD stimulation",
         "left VP->MD": "left VP->MD stimulation",
-        "left MD": "left VP->MD stimulation",
+        # left MD inactivation
+        "left MD": "left MD inactivation",
         # mPFC
         "mPFC inactivation": "left mPFC inactivation",
     },
@@ -49,7 +50,8 @@ DEFAULT_VALUE_MAPPINGS: Dict[str, Dict[str, str]] = {
         "right VP->MD stimulation": "right VP->MD stimulation",
         "right VP->MD": "right VP->MD stimulation",
         "right vp->MD": "right VP->MD stimulation",
-        "right MD": "right VP->MD stimulation",
+        # MD inactivation
+        "right MD": "right MD inactivation",
         # mPFC
         "mPFC inactivation": "right mPFC inactivation",
     },
