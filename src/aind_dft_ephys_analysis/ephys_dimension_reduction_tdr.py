@@ -122,16 +122,20 @@ def extract_trial_unit_rates(
         bin_size : float or None
             Bin size from dataset attrs if present.
     """
-    if align == "go_cue":
-        var = "psth_go_cue"
-        trial_dim = "trial_go_cue"
-        trial_coord = "trial_index_go_cue"
-    elif align == "reward_go_cue_start":
-        var = "psth_reward_go_cue_start"
-        trial_dim = "trial_reward_go_cue_start"
-        trial_coord = "trial_index_reward_go_cue_start"
-    else:
-        raise ValueError(f"Unknown align='{align}'")
+    allowed_aligns = {
+        "go_cue",
+        "reward_go_cue_start",
+        "trial_start",
+    }
+
+    if align not in allowed_aligns:
+        raise ValueError(
+            f"Unknown align='{align}'. Expected one of: {sorted(allowed_aligns)}"
+        )
+
+    var = f"psth_{align}"
+    trial_dim = f"trial_{align}"
+    trial_coord = f"trial_index_{align}"
 
     assert var in psth_da.data_vars, f"{var} not in dataset data_vars."
     da = psth_da[var]  # (unit, trial, time)
@@ -181,16 +185,20 @@ def extract_trial_unit_timecube(
         time : np.ndarray
             (Tt,) time vector used for the third dimension of `cube`.
     """
-    if align == "go_cue":
-        var = "psth_go_cue"
-        trial_dim = "trial_go_cue"
-        trial_coord = "trial_index_go_cue"
-    elif align == "reward_go_cue_start":
-        var = "psth_reward_go_cue_start"
-        trial_dim = "trial_reward_go_cue_start"
-        trial_coord = "trial_index_reward_go_cue_start"
-    else:
-        raise ValueError(f"Unknown align='{align}'")
+    allowed_aligns = {
+        "go_cue",
+        "reward_go_cue_start",
+        "trial_start",
+    }
+
+    if align not in allowed_aligns:
+        raise ValueError(
+            f"Unknown align='{align}'. Expected one of: {sorted(allowed_aligns)}"
+        )
+
+    var = f"psth_{align}"
+    trial_dim = f"trial_{align}"
+    trial_coord = f"trial_index_{align}"
     da = psth_da[var]
     time = psth_da["time"].values
     if time_window is None:
