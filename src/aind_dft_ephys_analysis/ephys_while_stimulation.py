@@ -56,12 +56,18 @@ _ALIGN_TO_VAR = {
 
 
 def _align_keys(align: str) -> Tuple[str, str, str]:
-    """Return ``(data_var, trial_dim, trial_coord)`` for a PSTH alignment."""
-    if align not in _ALIGN_TO_VAR:
-        raise ValueError(
-            f"Unknown align='{align}'. Valid: {sorted(_ALIGN_TO_VAR)}"
-        )
-    return _ALIGN_TO_VAR[align]
+    """Return ``(data_var, trial_dim, trial_coord)`` for a PSTH alignment.
+
+    Known alignments are taken from :data:`_ALIGN_TO_VAR`. For any other
+    string, the names are derived by convention (``psth_{align}``,
+    ``trial_{align}``, ``trial_index_{align}``) so newly-supported alignments
+    (e.g. ``"ITI_start"``) work without editing the map.
+    """
+    if align in _ALIGN_TO_VAR:
+        return _ALIGN_TO_VAR[align]
+    if not isinstance(align, str) or not align:
+        raise ValueError(f"align must be a non-empty string, got {align!r}")
+    return (f"psth_{align}", f"trial_{align}", f"trial_index_{align}")
 
 
 def _device_names(nwb_data: Any) -> np.ndarray:
