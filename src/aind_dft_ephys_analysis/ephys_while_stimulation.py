@@ -235,10 +235,30 @@ def load_tdr_axis(tdr_path: str | Path) -> Tuple[np.ndarray, np.ndarray]:
     raise KeyError("No axis weights found in TDR dataset.")
 
 
-def _pick_psth_array(psth: xr.Dataset | xr.DataArray) -> xr.DataArray:
-    """Return a DataArray with dims that include ``unit`` and ``time``."""
+def _pick_psth_array(
+    psth: xr.Dataset | xr.DataArray, align: Optional[str] = None
+) -> xr.DataArray:
+    """Return a DataArray with dims that include ``unit`` and ``time``.
+
+    If ``align`` is provided, the corresponding variable from
+    :data:`_ALIGN_TO_VAR` is selected explicitly; otherwise the first known
+    PSTH variable is used.
+    """
     if isinstance(psth, xr.DataArray):
         return psth
+    if align is not None:
+        var, _, _ = _align_keys(align)
+        if var not in psth.data_vars:
+            raise KeyError(
+                f"PSTH dataset has no variable '{var}' for align='{align}'. "
+                f"Available: {sorted(psth.data_vars)}"
+            )
+        v = psth[var]
+        if "unit" not in v.dims or "time" not in v.dims:
+            raise RuntimeError(
+                f"Variable '{var}' is missing 'unit' or 'time' dim."
+            )
+        return v
     for name in ("psth_go_cue", "psth_reward_go_cue_start"):
         if name in psth.data_vars:
             v = psth[name]
@@ -250,8 +270,17 @@ def _pick_psth_array(psth: xr.Dataset | xr.DataArray) -> xr.DataArray:
     raise RuntimeError("No DataArray with dims ('unit','time') found in PSTH.")
 
 
-def _find_trial_dim_and_coord(arr: xr.DataArray) -> Tuple[str, str]:
-    """Locate the trial dim and an integer-labeled trial coord on ``arr``."""
+def _find_trial_dim_and_coord(
+    arr: xr.DataArray, align: Optional[str] = None
+) -> Tuple[str, str]:
+    """Locate the trial dim and an integer-labeled trial coord on ``arr``.
+
+    If ``align`` is given, prefer the trial dim/coord from :data:`_ALIGN_TO_VAR`.
+    """
+    if align is not None:
+        _, td, tc = _align_keys(align)
+        if td in arr.dims and tc in arr.coords:
+            return td, tc
     candidates = (
         "trial_go_cue",
         "trial_reward_go_cue_start",
@@ -281,6 +310,8 @@ def project_psth_with_tdr_axis(
     tdr_path: str | Path,
     include_trials: np.ndarray,
     target_probes: Sequence[str],
+    *,
+    align: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Project a PSTH onto a stored TDR axis for a chosen set of absolute trials.
@@ -301,8 +332,8 @@ def project_psth_with_tdr_axis(
         Unit IDs that were actually used in the projection (after probe ∩ TDR
         alignment), in the order matching ``w``.
     """
-    arr = _pick_psth_array(psth)
-    trial_dim, trial_coord = _find_trial_dim_and_coord(arr)
+    arr = _pick_psth_array(psth, align=align)
+    trial_dim, trial_coord = _find_trial_dim_and_coord(arr, align=align)
 
     arr_filt, p_units = filter_psth_units_by_probe(arr, nwb_data, target_probes)
 
@@ -1057,6 +1088,7 @@ def _run_single_session_tdr_projection(
             tdr_path=tdr_path,
             include_trials=include_trials,
             target_probes=target_probes,
+            align=align,
         )
         latent_vals = np.array(
             [response_id_to_latent.get(int(tid), np.nan) for tid in include_trials],
