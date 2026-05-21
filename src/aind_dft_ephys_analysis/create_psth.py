@@ -35,7 +35,7 @@ from behavior_utils import extract_event_timestamps, find_trials
 def extract_neuron_psth_to_zarr(
     nwb_data: Any,
     units: Optional[Iterable[int]] = None,
-    align_to_event: Union[str, Sequence[str]] = ["go_cue","reward_go_cue_start","trial_start"]
+    align_to_event: Union[str, Sequence[str]] = ["go_cue","reward_go_cue_start","trial_start"],
     time_window: Tuple[float, float] = (-3.0, 5.0),
     bin_size: float = 0.05,
     trial_type: Optional[str] = None,
