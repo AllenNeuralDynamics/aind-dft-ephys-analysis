@@ -22,13 +22,16 @@ Public API
   (cond A vs cond B) with Welch/FDR significance.
 - :func:`plot_multi_group_timecourses`       — population-average firing rate
   over time for multiple trial groups.
+- :func:`run_session_tdr_projection_pipeline` — end-to-end: from a session
+  name, ensure PSTH + behavior summary + TDR axis exist (build them on demand)
+  and return projection results under any number of laser conditions.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, Literal, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -682,3 +685,394 @@ def plot_multi_group_timecourses(
         fig=fig,
         ax=ax,
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. High-level pipeline: session -> projections under multiple conditions
+# ---------------------------------------------------------------------------
+
+# Type aliases for the `conditions` argument of
+# :func:`run_session_tdr_projection_pipeline`.
+#
+# Each condition value can be either:
+#   - a sequence/array of absolute trial IDs (used as-is, then intersected
+#     with response trials), or
+#   - a mapping with one of the following keys:
+#       * "laser_index": int  -> use the laser-condition summary row at this
+#         positional index (after sorting by n_trials desc, the default of
+#         :func:`summarize_laser_conditions`).
+#       * "laser_off": True  -> use non-laser trials (intersected with response).
+#       * "shift": int       -> shift the trial IDs by this many trials before
+#         intersecting with response (useful for "stim-1" / "stim+1" controls).
+ConditionSpec = Union[Sequence[int], np.ndarray, Mapping[str, Any]]
+
+
+@dataclass
+class TDRProjectionResult:
+    """Container for one condition's TDR projection."""
+
+    label: str
+    Y: np.ndarray             # (n_trials, n_time)
+    t: np.ndarray             # (n_time,)
+    trial_ids: np.ndarray     # absolute trial IDs, matches Y rows
+    latent: np.ndarray        # latent values for these trials
+    unit_ids: np.ndarray      # absolute NWB unit IDs used in the projection
+
+
+def _ensure_psth_zarr(
+    session_name: str,
+    binsize: float,
+    save_folder: str | Path,
+    align_to_event: Sequence[str],
+    time_window: Tuple[float, float],
+) -> Tuple[Path, Any]:
+    """Return ``(zarr_path, nwb_data)``, generating the PSTH zarr if missing."""
+    from nwb_utils import NWBUtils
+    from create_psth import extract_neuron_psth_to_zarr
+
+    save_folder = Path(save_folder)
+    save_folder.mkdir(parents=True, exist_ok=True)
+    zarr_path = save_folder / f"{session_name}_{binsize}s.zarr"
+
+    nwb_data, _ = NWBUtils.combine_nwb(session_name=session_name)
+    if nwb_data is None:
+        raise RuntimeError(f"Could not open NWB for session: {session_name}")
+
+    if not zarr_path.exists():
+        print(f"[INFO] PSTH missing, generating: {zarr_path}")
+        extract_neuron_psth_to_zarr(
+            nwb_data=nwb_data,
+            align_to_event=list(align_to_event),
+            time_window=tuple(time_window),
+            bin_size=float(binsize),
+            save_folder=str(save_folder),
+            save_name=f"{session_name}_{binsize}s",
+        )
+    return zarr_path, nwb_data
+
+
+def _ensure_behavior_summary(
+    session_name: str, save_folder: str | Path
+) -> Path:
+    """Return path to the behavior summary CSV, generating it if missing."""
+    from behavior_utils import generate_behavior_summary_combined
+
+    save_folder = Path(save_folder)
+    save_folder.mkdir(parents=True, exist_ok=True)
+    csv_path = save_folder / f"behavior_summary-{session_name}.csv"
+    if not csv_path.exists():
+        print(f"[INFO] Behavior summary missing, generating: {csv_path}")
+        generate_behavior_summary_combined(
+            session_names=[session_name],
+            save_result=True,
+            save_folder=str(save_folder),
+            save_name=csv_path.name,
+        )
+    return csv_path
+
+
+def _ensure_tdr_axis(
+    *,
+    session_name: str,
+    latent_var: str,
+    time_window: Tuple[float, float],
+    align: str,
+    target_probes: Sequence[str],
+    psth_da: xr.Dataset | xr.DataArray,
+    behavior_df: pd.DataFrame,
+    nwb_data: Any,
+    tdr_folder: str | Path,
+) -> Path:
+    """Return path to the TDR zarr for ``(session, latent, window)``; build if absent."""
+    from ephys_dimension_reduction_tdr import tdr_from_psth
+
+    tdr_folder = Path(tdr_folder)
+    tdr_folder.mkdir(parents=True, exist_ok=True)
+    tw0, tw1 = time_window
+    tdr_path = tdr_folder / f"tdr_{session_name}_{latent_var}_timewindow_{tw0}_{tw1}.zarr"
+    if tdr_path.exists():
+        return tdr_path
+
+    print(f"[INFO] TDR axis missing, building: {tdr_path}")
+    if latent_var not in behavior_df.columns:
+        raise KeyError(f"'{latent_var}' not in behavior CSV columns.")
+    if "response_trials" not in behavior_df.columns:
+        raise KeyError("Column 'response_trials' missing in behavior summary CSV.")
+    response_ids = np.asarray(behavior_df["response_trials"][0], dtype=int)
+
+    include_trials, resp_keep_mask = build_response_nonlaser_trials(
+        nwb_data, response_ids
+    )
+    if include_trials.size == 0:
+        raise RuntimeError(f"No response ∩ non-laser trials for {session_name}")
+
+    latent_response_only = np.asarray(behavior_df[latent_var][0], dtype=float)
+    if latent_response_only.shape[0] != response_ids.shape[0]:
+        raise ValueError(
+            f"Length mismatch for {latent_var}: latent={latent_response_only.shape[0]} "
+            f"vs response_ids={response_ids.shape[0]}"
+        )
+    latent_filtered = latent_response_only[resp_keep_mask]
+
+    psth_da_filtered, _ = filter_psth_units_by_probe(
+        psth_da, nwb_data, target_probes
+    )
+    tdr_from_psth(
+        psth_da_filtered,
+        latent=latent_filtered,
+        align=align,
+        time_window=[tw0, tw1],
+        include_trials=include_trials,
+        require_all_ids=True,
+        save_path=str(tdr_path),
+        save_format="zarr",
+    )
+    return tdr_path
+
+
+def _resolve_condition_trials(
+    spec: ConditionSpec,
+    *,
+    summary: pd.DataFrame,
+    response_ids: np.ndarray,
+    nwb_data: Any,
+) -> np.ndarray:
+    """Resolve a condition spec to absolute trial IDs (intersected with response)."""
+    if isinstance(spec, Mapping):
+        if spec.get("laser_off"):
+            laser_flags = np.asarray(
+                nwb_data.trials["laser_on_trial"][:], dtype=int
+            )
+            trials = np.where(laser_flags == 0)[0]
+        elif "laser_index" in spec:
+            idx = int(spec["laser_index"])
+            if idx < 0 or idx >= len(summary):
+                raise IndexError(
+                    f"laser_index={idx} out of range for summary with "
+                    f"{len(summary)} rows."
+                )
+            trials = np.asarray(summary["trial_ids"].iloc[idx], dtype=int)
+        else:
+            raise ValueError(
+                "Condition mapping must contain 'laser_index' or 'laser_off'."
+            )
+        shift = int(spec.get("shift", 0))
+        if shift:
+            trials = trials + shift
+    else:
+        trials = np.asarray(spec, dtype=int).ravel()
+
+    return np.intersect1d(trials, response_ids)
+
+
+def run_session_tdr_projection_pipeline(
+    session_name: Union[str, Sequence[str]],
+    *,
+    latent_var: str,
+    time_window: Tuple[float, float],
+    conditions: Mapping[str, ConditionSpec],
+    target_probes: Union[Sequence[str], Mapping[str, Sequence[str]]],
+    binsize: float = 0.1,
+    align: str = "go_cue",
+    psth_align_events: Sequence[str] = ("go_cue", "reward_go_cue_start"),
+    psth_time_window: Tuple[float, float] = (-6.0, 6.0),
+    psth_folder: str | Path = "/root/capsule/scratch",
+    behavior_folder: str | Path = "/root/capsule/scratch",
+    tdr_folder: str | Path = "/root/capsule/scratch",
+) -> Union[Dict[str, TDRProjectionResult], Dict[str, Dict[str, TDRProjectionResult]]]:
+    """
+    End-to-end pipeline: from one or more session names, return TDR projections
+    under one or more laser conditions.
+
+    Steps (per session)
+    -------------------
+    1. Ensure the PSTH zarr exists at
+       ``{psth_folder}/{session_name}_{binsize}s.zarr`` (build with
+       ``extract_neuron_psth_to_zarr`` if missing).
+    2. Ensure the behavior summary CSV exists at
+       ``{behavior_folder}/behavior_summary-{session_name}.csv`` (build with
+       ``generate_behavior_summary_combined`` if missing).
+    3. Ensure the TDR axis zarr exists for ``(latent_var, time_window)`` at
+       ``{tdr_folder}/tdr_{session_name}_{latent_var}_timewindow_{tw0}_{tw1}.zarr``
+       (build with ``tdr_from_psth`` on response ∩ non-laser trials if missing).
+    4. For each condition in ``conditions``, project the PSTH onto the stored
+       TDR axis and return the result.
+
+    Parameters
+    ----------
+    session_name
+        Either a single session id (str) or a list of session ids. Sessions are
+        processed independently; failures are reported and skipped.
+    latent_var
+        Behavior-summary column to fit the TDR axis on.
+    time_window
+        ``(t0, t1)`` (seconds) window used when the TDR axis was/is fit.
+    conditions
+        Mapping ``label -> spec``. Spec can be:
+
+        - a list/array of absolute trial IDs, or
+        - a dict with keys:
+
+          * ``"laser_off": True`` — use non-laser trials.
+          * ``"laser_index": int`` — use row ``int`` of
+            :func:`summarize_laser_conditions`.
+          * ``"shift": int`` (optional) — shift the resolved trial IDs by this
+            many trials before intersecting with response (e.g. ``-1`` /
+            ``+1``).
+    target_probes
+        Either a single list of probe names applied to every session, or a
+        mapping ``session_name -> probes`` to use different probes per session.
+        A ``KeyError`` is raised if a session is missing from the mapping.
+    binsize, align, psth_align_events, psth_time_window
+        PSTH parameters; only used when the PSTH zarr has to be built.
+    psth_folder, behavior_folder, tdr_folder
+        Where to read/write the corresponding artifacts.
+
+    Returns
+    -------
+    dict
+        - If ``session_name`` is a single string: ``{condition_label: result}``
+          (backwards compatible).
+        - If ``session_name`` is a list/tuple: ``{session_name: {condition_label: result}}``.
+
+        Each result is a :class:`TDRProjectionResult` containing ``Y``
+        (trials × time), ``t``, the absolute ``trial_ids`` used, the matching
+        ``latent`` values (NaN if the trial is not in the response set), and
+        the absolute ``unit_ids`` used in the projection.
+    """
+    single_session = isinstance(session_name, str)
+    sessions = [session_name] if single_session else list(session_name)
+
+    # Resolve target_probes into a per-session mapping.
+    if isinstance(target_probes, Mapping):
+        missing = [s for s in sessions if s not in target_probes]
+        if missing:
+            raise KeyError(
+                f"target_probes mapping is missing entries for sessions: {missing}"
+            )
+        probes_for: Dict[str, Sequence[str]] = {s: target_probes[s] for s in sessions}
+    else:
+        probes_for = {s: target_probes for s in sessions}
+
+    all_results: Dict[str, Dict[str, TDRProjectionResult]] = {}
+    for sess in sessions:
+        try:
+            all_results[sess] = _run_single_session_tdr_projection(
+                session_name=sess,
+                latent_var=latent_var,
+                time_window=time_window,
+                conditions=conditions,
+                target_probes=probes_for[sess],
+                binsize=binsize,
+                align=align,
+                psth_align_events=psth_align_events,
+                psth_time_window=psth_time_window,
+                psth_folder=psth_folder,
+                behavior_folder=behavior_folder,
+                tdr_folder=tdr_folder,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"❌ Error processing session {sess}: {type(e).__name__}: {e}")
+            if single_session:
+                raise
+            all_results[sess] = {}
+
+    return all_results[sessions[0]] if single_session else all_results
+
+
+def _run_single_session_tdr_projection(
+    *,
+    session_name: str,
+    latent_var: str,
+    time_window: Tuple[float, float],
+    conditions: Mapping[str, ConditionSpec],
+    target_probes: Sequence[str],
+    binsize: float,
+    align: str,
+    psth_align_events: Sequence[str],
+    psth_time_window: Tuple[float, float],
+    psth_folder: str | Path,
+    behavior_folder: str | Path,
+    tdr_folder: str | Path,
+) -> Dict[str, TDRProjectionResult]:
+    """Run the full pipeline for a single session. See public wrapper for docs."""
+    from create_psth import load_zarr
+    from general_utils import smart_read_csv
+
+    # 1) PSTH + NWB
+    psth_path, nwb_data = _ensure_psth_zarr(
+        session_name=session_name,
+        binsize=binsize,
+        save_folder=psth_folder,
+        align_to_event=psth_align_events,
+        time_window=psth_time_window,
+    )
+    psth = load_zarr(str(psth_path))
+
+    # 2) Behavior summary
+    csv_path = _ensure_behavior_summary(session_name, behavior_folder)
+    behavior_df = smart_read_csv(str(csv_path))
+    if "response_trials" not in behavior_df.columns:
+        raise KeyError("Column 'response_trials' missing in behavior summary CSV.")
+    response_ids = np.asarray(behavior_df["response_trials"][0], dtype=int)
+
+    # 3) TDR axis
+    tdr_path = _ensure_tdr_axis(
+        session_name=session_name,
+        latent_var=latent_var,
+        time_window=time_window,
+        align=align,
+        target_probes=target_probes,
+        psth_da=psth,
+        behavior_df=behavior_df,
+        nwb_data=nwb_data,
+        tdr_folder=tdr_folder,
+    )
+
+    # Latent on the response-only axis (used to label projected trials).
+    if latent_var not in behavior_df.columns:
+        raise KeyError(f"'{latent_var}' not in behavior CSV columns.")
+    latent_response_only = np.asarray(behavior_df[latent_var][0], dtype=float)
+    if latent_response_only.shape[0] != response_ids.shape[0]:
+        raise ValueError(
+            f"Latent length mismatch for {latent_var}: "
+            f"{latent_response_only.shape[0]} vs {response_ids.shape[0]}"
+        )
+    response_id_to_latent = dict(zip(response_ids.tolist(), latent_response_only))
+
+    # 4) Resolve conditions and project
+    summary = summarize_laser_conditions(nwb_data)
+    results: Dict[str, TDRProjectionResult] = {}
+    for label, spec in conditions.items():
+        include_trials = _resolve_condition_trials(
+            spec, summary=summary, response_ids=response_ids, nwb_data=nwb_data
+        )
+        if include_trials.size == 0:
+            print(f"[WARN] [{session_name}] Condition '{label}' resolved to 0 trials; skipping.")
+            continue
+
+        Y, t, used_unit_ids = project_psth_with_tdr_axis(
+            psth=psth,
+            nwb_data=nwb_data,
+            tdr_path=tdr_path,
+            include_trials=include_trials,
+            target_probes=target_probes,
+        )
+        latent_vals = np.array(
+            [response_id_to_latent.get(int(tid), np.nan) for tid in include_trials],
+            dtype=float,
+        )
+        results[label] = TDRProjectionResult(
+            label=label,
+            Y=Y,
+            t=t,
+            trial_ids=include_trials.astype(int),
+            latent=latent_vals,
+            unit_ids=used_unit_ids,
+        )
+        print(
+            f"[OK] [{session_name}] {label}: Y={Y.shape}, "
+            f"n_trials={include_trials.size}, n_units={used_unit_ids.size}"
+        )
+
+    return results
