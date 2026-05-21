@@ -762,8 +762,14 @@ def _ensure_psth_zarr(
     save_folder: str | Path,
     align_to_event: Sequence[str],
     time_window: Tuple[float, float],
+    required_aligns: Sequence[str] = (),
 ) -> Tuple[Path, Any]:
-    """Return ``(zarr_path, nwb_data)``, generating the PSTH zarr if missing."""
+    """Return ``(zarr_path, nwb_data)``, generating the PSTH zarr if missing.
+
+    If the zarr already exists but is missing any alignment listed in
+    ``required_aligns`` (i.e. lacks ``psth_{align}``), it is rebuilt with the
+    union of its existing alignments and the missing ones.
+    """
     from nwb_utils import NWBUtils
     from create_psth import extract_neuron_psth_to_zarr
 
@@ -775,11 +781,36 @@ def _ensure_psth_zarr(
     if nwb_data is None:
         raise RuntimeError(f"Could not open NWB for session: {session_name}")
 
-    if not zarr_path.exists():
-        print(f"[INFO] PSTH missing, generating: {zarr_path}")
+    needs_build = not zarr_path.exists()
+    events_to_build = list(align_to_event)
+
+    if not needs_build and required_aligns:
+        try:
+            existing = xr.open_zarr(str(zarr_path), consolidated=False)
+            existing_aligns = {
+                name[len("psth_") :]
+                for name in existing.data_vars
+                if name.startswith("psth_")
+            }
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] Could not inspect {zarr_path} ({e}); will rebuild.")
+            existing_aligns = set()
+            needs_build = True
+
+        missing_aligns = [a for a in required_aligns if a not in existing_aligns]
+        if missing_aligns:
+            print(
+                f"[INFO] PSTH at {zarr_path} missing aligns {missing_aligns}; "
+                f"rebuilding with existing ∪ missing."
+            )
+            events_to_build = sorted(set(existing_aligns) | set(required_aligns))
+            needs_build = True
+
+    if needs_build:
+        print(f"[INFO] Generating PSTH: {zarr_path} (aligns={events_to_build})")
         extract_neuron_psth_to_zarr(
             nwb_data=nwb_data,
-            align_to_event=list(align_to_event),
+            align_to_event=events_to_build,
             time_window=tuple(time_window),
             bin_size=float(binsize),
             save_folder=str(save_folder),
@@ -911,7 +942,7 @@ def run_session_tdr_projection_pipeline(
     target_probes: Union[Sequence[str], Mapping[str, Sequence[str]]],
     binsize: float = 0.1,
     align: str = "go_cue",
-    psth_align_events: Sequence[str] = ("go_cue", "reward_go_cue_start"),
+    psth_align_events: Sequence[str] = ("go_cue", "reward_go_cue_start", "trial_start"),
     psth_time_window: Tuple[float, float] = (-6.0, 6.0),
     psth_folder: str | Path = "/root/capsule/scratch",
     behavior_folder: str | Path = "/root/capsule/scratch",
@@ -1037,12 +1068,16 @@ def _run_single_session_tdr_projection(
     from general_utils import smart_read_csv
 
     # 1) PSTH + NWB
+    # Always ensure the requested `align` is among the alignments stored in
+    # the PSTH zarr (rebuild it on demand if not).
+    psth_aligns = list(dict.fromkeys(list(psth_align_events) + [align]))
     psth_path, nwb_data = _ensure_psth_zarr(
         session_name=session_name,
         binsize=binsize,
         save_folder=psth_folder,
-        align_to_event=psth_align_events,
+        align_to_event=psth_aligns,
         time_window=psth_time_window,
+        required_aligns=[align],
     )
     psth = load_zarr(str(psth_path))
 
