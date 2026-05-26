@@ -117,6 +117,11 @@ def extract_trial_unit_rates(
             "trial_reward_go_cue_start",
             "trial_index_reward_go_cue_start",
         )
+    elif isinstance(align, str) and align:
+        # Convention-based fallback (matches ephys_while_stimulation._align_keys).
+        var, trial_dim, trial_coord = (
+            f"psth_{align}", f"trial_{align}", f"trial_index_{align}",
+        )
     else:
         raise ValueError(f"Unknown align='{align}'")
 
@@ -212,6 +217,11 @@ def extract_trial_unit_timecube(
             "psth_reward_go_cue_start",
             "trial_reward_go_cue_start",
             "trial_index_reward_go_cue_start",
+        )
+    elif isinstance(align, str) and align:
+        # Convention-based fallback (matches ephys_while_stimulation._align_keys).
+        var, trial_dim, trial_coord = (
+            f"psth_{align}", f"trial_{align}", f"trial_index_{align}",
         )
     else:
         raise ValueError(f"Unknown align='{align}'")
