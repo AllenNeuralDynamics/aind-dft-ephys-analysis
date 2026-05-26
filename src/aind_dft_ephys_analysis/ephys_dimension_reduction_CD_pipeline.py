@@ -107,7 +107,7 @@ def build_cd_for_session(
     psth_root: str | Path,
     behavior_root: str | Path,
     cd_root: str | Path,
-    metadata: pd.DataFrame,
+    metadata: Optional[pd.DataFrame] = None,
     binsize: str = "0.1",
     align: str = "go_cue",
     brain_regions_groups: Sequence[Sequence[str]] = ((),),
@@ -126,10 +126,15 @@ def build_cd_for_session(
 
     Returns a list of failures: ``[(session, region_label, scope, error_msg)]``.
 
-    Parameters mirror the previous in-notebook loop. ``metadata`` must contain
-    at least the columns ``sorted_session_name``, ``brain_region``, and
-    ``unit_index`` (used to pick units per region group).
+    ``metadata`` may be ``None`` or empty:
+      * If ``None``, every region group is treated as "all units" (no filter
+        per region), and the min-units check is skipped.
+      * If a DataFrame is provided, it must contain the columns
+        ``sorted_session_name``, ``brain_region``, and ``unit_index``. Empty
+        DataFrames (or sessions absent from the table) yield zero units and
+        each region group is skipped.
     """
+    metadata_empty = metadata is None or len(metadata) == 0
     from create_psth import load_zarr
     from general_utils import smart_read_csv
 
@@ -156,16 +161,20 @@ def build_cd_for_session(
 
     for region_group in brain_regions_groups:
         region_lbl, region_print = region_label(region_group)
-        if region_group:
-            mask = (
-                (metadata["sorted_session_name"] == session)
-                & (metadata["brain_region"].isin(region_group))
-            )
+        if metadata_empty:
+            unit_indices = None  # use all units
         else:
-            mask = metadata["sorted_session_name"] == session
-        unit_indices = metadata.loc[mask, "unit_index"].to_numpy()
+            if region_group:
+                mask = (
+                    (metadata["sorted_session_name"] == session)
+                    & (metadata["brain_region"].isin(region_group))
+                )
+            else:
+                mask = metadata["sorted_session_name"] == session
+            unit_indices = metadata.loc[mask, "unit_index"].to_numpy()
 
-        if len(unit_indices) < min_units_num:
+        n_units = "ALL" if unit_indices is None else len(unit_indices)
+        if unit_indices is not None and len(unit_indices) < min_units_num:
             if verbose:
                 print(
                     f"  Skip region {region_lbl} ({region_print}): "
@@ -173,7 +182,7 @@ def build_cd_for_session(
                 )
             continue
         if verbose:
-            print(f"  Region {region_lbl} ({region_print}): {len(unit_indices)} units")
+            print(f"  Region {region_lbl} ({region_print}): {n_units} units")
 
         for time_window in time_windows:
             tw0, tw1 = time_window
@@ -214,7 +223,7 @@ def build_cd_dataset(
     psth_root: str | Path,
     behavior_root: str | Path,
     cd_root: str | Path,
-    metadata: pd.DataFrame,
+    metadata: Optional[pd.DataFrame] = None,
     **kwargs: Any,
 ) -> List[Tuple[str, ...]]:
     """
