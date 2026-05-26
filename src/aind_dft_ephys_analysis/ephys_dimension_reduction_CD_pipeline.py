@@ -84,12 +84,18 @@ def cd_save_path(
     region_lbl: str,
     trial_types: Sequence[str],
     time_window: Sequence[float],
+    align: Optional[str] = None,
 ) -> Path:
-    """Return the standard CD zarr path for a session/region/trial-types/window."""
+    """Return the standard CD zarr path for a session/region/trial-types/window.
+
+    If ``align`` is given, ``_ALIGN_{align}`` is appended just before ``.zarr``.
+    The session-extraction regex (``^CD_(?P<session>.+?)_RG_``) is unaffected.
+    """
     tw0, tw1 = time_window
+    align_suffix = f"_ALIGN_{align}" if align else ""
     return (
         Path(cd_root)
-        / f"CD_{session}_{region_lbl}_{trial_types[0]}_{trial_types[1]}_TW_{tw0}_{tw1}.zarr"
+        / f"CD_{session}_{region_lbl}_{trial_types[0]}_{trial_types[1]}_TW_{tw0}_{tw1}{align_suffix}.zarr"
     )
 
 
@@ -99,6 +105,29 @@ def _clean_ids(series_value: Any) -> np.ndarray:
     if arr.dtype.kind == "f":
         arr = arr[~np.isnan(arr)]
     return arr.astype(int)
+
+
+def _write_pipeline_attrs(zarr_path: str | Path, **extra_attrs: Any) -> None:
+    """
+    Merge ``extra_attrs`` into the root ``.zattrs`` of an existing zarr store.
+
+    Used to persist pipeline-level params (binsize, region_group, trial_types,
+    ...) that ``coding_direction_from_psth`` does not know about.
+    """
+    import json
+
+    zattrs_path = Path(zarr_path) / ".zattrs"
+    if not zattrs_path.exists():
+        return  # not a top-level zarr we can amend
+    try:
+        with open(zattrs_path, "r") as f:
+            attrs = json.load(f)
+    except Exception:  # noqa: BLE001
+        attrs = {}
+    pipeline_attrs = {k: v for k, v in extra_attrs.items() if v is not None}
+    attrs["pipeline"] = pipeline_attrs
+    with open(zattrs_path, "w") as f:
+        json.dump(attrs, f)
 
 
 def build_cd_for_session(
@@ -186,7 +215,9 @@ def build_cd_for_session(
 
         for time_window in time_windows:
             tw0, tw1 = time_window
-            save_path = cd_save_path(cd_root, session, region_lbl, trial_types, time_window)
+            save_path = cd_save_path(
+                cd_root, session, region_lbl, trial_types, time_window, align=align,
+            )
             try:
                 out = coding_direction_from_psth(
                     psth_da=psth_da,
@@ -202,6 +233,23 @@ def build_cd_for_session(
                     save_format="zarr",
                     overwrite=overwrite,
                     unit_ids=unit_indices,
+                )
+                _write_pipeline_attrs(
+                    save_path,
+                    session=session,
+                    align=align,
+                    binsize=binsize,
+                    region_label=region_lbl,
+                    region_group=list(region_group),
+                    trial_types=list(trial_types),
+                    time_window=list(time_window),
+                    projection_time_window=projection_time_window,
+                    two_fold_cv=bool(two_fold_cv),
+                    norm_mode=norm_mode,
+                    min_units_num=int(min_units_num),
+                    random_state=int(random_state),
+                    n_units=(int(len(unit_indices)) if unit_indices is not None else -1),
+                    unit_ids=(unit_indices.tolist() if unit_indices is not None else None),
                 )
                 if verbose:
                     print(
