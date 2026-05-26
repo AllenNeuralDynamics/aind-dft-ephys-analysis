@@ -515,6 +515,80 @@ def aggregate_cd_sessions(
 # 3. VISUALIZE / ANALYZE
 # ---------------------------------------------------------------------------
 
+def compute_per_trial_event_offsets(
+    session_name: str,
+    *,
+    event_start: str = "trial_start",
+    event_end: str = "go_cue",
+    align: Optional[str] = None,
+) -> Dict[int, Tuple[float, float]]:
+    """
+    Per-trial ``(t_event_start, t_event_end)`` offsets relative to ``align``.
+
+    Loads the session NWB once and returns
+    ``{trial_index: (start_offset, end_offset)}``.
+
+    Only events whose ``extract_event_timestamps`` result is one entry per
+    trial (indexed by trial index) are supported — e.g. ``"trial_start"``,
+    ``"trial_end"``, ``"go_cue"``. If ``align`` is ``None`` it defaults to
+    ``event_start`` (so the start offset is exactly 0).
+
+    Trials with NaN times are dropped.
+    """
+    from nwb_utils import NWBUtils
+    from behavior_utils import extract_event_timestamps
+
+    nwb_data = NWBUtils.read_ophys_or_behavior_nwb(session_name=session_name)
+    if nwb_data is None:
+        raise FileNotFoundError(f"Could not load NWB for session '{session_name}'.")
+
+    if align is None:
+        align = event_start
+    try:
+        t_start = np.asarray(extract_event_timestamps(nwb_data, event_start), dtype=float)
+        t_end = np.asarray(extract_event_timestamps(nwb_data, event_end), dtype=float)
+        t_align = np.asarray(extract_event_timestamps(nwb_data, align), dtype=float)
+    finally:
+        try:
+            nwb_data.io.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    n = min(len(t_start), len(t_end), len(t_align))
+    out: Dict[int, Tuple[float, float]] = {}
+    for i in range(n):
+        s = t_start[i] - t_align[i]
+        e = t_end[i] - t_align[i]
+        if np.isfinite(s) and np.isfinite(e):
+            out[int(i)] = (float(s), float(e))
+    return out
+
+
+def _mask_trace_per_trial(
+    trace: np.ndarray,
+    trial_ids: np.ndarray,
+    time: np.ndarray,
+    window_map: Dict[int, Tuple[float, float]],
+) -> np.ndarray:
+    """Return a copy of ``trace`` with per-trial out-of-window samples set to NaN.
+
+    Trials missing from ``window_map`` are dropped (set to all-NaN), so the
+    nanmean-based plotters simply ignore them.
+    """
+    if trace.ndim != 2 or trace.size == 0:
+        return trace
+    out = trace.astype(float, copy=True)
+    for i, tid in enumerate(trial_ids):
+        win = window_map.get(int(tid))
+        if win is None:
+            out[i, :] = np.nan
+            continue
+        t0, t1 = win
+        mask = (time >= t0) & (time <= t1)
+        out[i, ~mask] = np.nan
+    return out
+
+
 def plot_cd_session(
     sess: CDSessionData,
     *,
@@ -522,28 +596,73 @@ def plot_cd_session(
     smooth_gauss: float = 0.1,
     smooth_moving_window: int = 5,
     plot_single_trial: bool = True,
+    restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
 ) -> None:
-    """Run the standard 3-panel CD plot for a single session (train projections)."""
+    """Run the standard 3-panel CD plot for a single session (train projections).
+
+    Parameters
+    ----------
+    restrict_window_per_trial : dict[int, (float, float)], optional
+        Per-trial ``(t0, t1)`` window (seconds, relative to the CD's align
+        event). Samples outside each trial's window are set to NaN before
+        plotting, so trials with shorter ITIs contribute only where they
+        actually have data. Build via :func:`compute_per_trial_event_offsets`.
+    restrict_events : (event_start, event_end), optional
+        Convenience shortcut: if given (and ``restrict_window_per_trial`` is
+        not), call :func:`compute_per_trial_event_offsets` automatically.
+        Default ``("trial_start", "go_cue")`` would limit each trial to its
+        own ITI.
+    restrict_align : str, optional
+        Forwarded to :func:`compute_per_trial_event_offsets` when
+        ``restrict_events`` is used. Defaults to ``event_start`` there.
+    """
+    proj_A = sess.proj_train_A
+    proj_B = sess.proj_train_B
+    title_suffix = ""
+
+    if restrict_window_per_trial is None and restrict_events is not None:
+        ev_start, ev_end = restrict_events
+        restrict_window_per_trial = compute_per_trial_event_offsets(
+            sess.session,
+            event_start=ev_start,
+            event_end=ev_end,
+            align=restrict_align,
+        )
+
+    if restrict_window_per_trial is not None:
+        proj_A = _mask_trace_per_trial(
+            sess.proj_train_A, sess.trial_id_train_A, sess.time, restrict_window_per_trial,
+        )
+        proj_B = _mask_trace_per_trial(
+            sess.proj_train_B, sess.trial_id_train_B, sess.time, restrict_window_per_trial,
+        )
+        if restrict_events is not None:
+            title_suffix = f" [{restrict_events[0]}→{restrict_events[1]}]"
+        else:
+            title_suffix = " [per-trial window]"
+
     plot_cd_projection(
         sess.time,
-        sess.proj_train_A, sess.proj_train_B,
+        proj_A, proj_B,
         average=True,
         smooth=smooth_gauss, dt=sess.dt, smooth_mode="gaussian",
-        title=f"[{sess.session}] Coding Direction Projection (Smoothed)",
+        title=f"[{sess.session}] Coding Direction Projection (Smoothed){title_suffix}",
     )
     if plot_single_trial:
         plot_cd_projection(
             sess.time,
-            sess.proj_train_A, sess.proj_train_B,
+            proj_A, proj_B,
             average=False,
             smooth=smooth_moving_window, smooth_mode="moving",
-            title=f"[{sess.session}] Single-Trial CD Projections (Smoothed)",
+            title=f"[{sess.session}] Single-Trial CD Projections (Smoothed){title_suffix}",
         )
     plot_cd_window_distribution(
-        sess.time, sess.proj_train_A, sess.proj_train_B,
+        sess.time, proj_A, proj_B,
         window=distribution_window,
         kind="hist", bins=40, hist_overlay=True,
-        title=f"[{sess.session}] Train set",
+        title=f"[{sess.session}] Train set{title_suffix}",
     )
 
 
