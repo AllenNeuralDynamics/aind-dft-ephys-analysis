@@ -36,7 +36,7 @@ def extract_neuron_psth_to_zarr(
     nwb_data: Any,
     units: Optional[Iterable[int]] = None,
     align_to_event: Union[str, Sequence[str]] = ["go_cue","reward_go_cue_start","trial_start"],
-    time_window: Tuple[float, float] = (-3.0, 5.0),
+    time_window: Tuple[float, float] = (-20.0, 20.0),
     bin_size: float = 0.05,
     trial_type: Optional[str] = None,
     save_folder: Union[str, Path] = "/root/capsule/results",
@@ -56,7 +56,7 @@ def extract_neuron_psth_to_zarr(
     align_to_event : str or sequence of str, default "go_cue"
         Name(s) of behavioral event(s) to align spike trains to. For each
         event you get one `psth_<event>` and one `raster_<event>` variable.
-    time_window : tuple of (float, float), default (-3.0, 5.0)
+    time_window : tuple of (float, float), default (-10.0, 20.0)
         Time window (in seconds) around each event timestamp. First value
         is start (can be negative), second is end.
     bin_size : float, default 0.05
