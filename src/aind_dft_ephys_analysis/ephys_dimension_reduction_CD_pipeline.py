@@ -569,23 +569,45 @@ def _mask_trace_per_trial(
     trial_ids: np.ndarray,
     time: np.ndarray,
     window_map: Dict[int, Tuple[float, float]],
+    *,
+    smooth_seconds: Optional[float] = None,
+    dt: Optional[float] = None,
+    smooth_mode: str = "gaussian",
 ) -> np.ndarray:
     """Return a copy of ``trace`` with per-trial out-of-window samples set to NaN.
 
-    Trials missing from ``window_map`` are dropped (set to all-NaN), so the
-    nanmean-based plotters simply ignore them.
+    Trials missing from ``window_map`` are dropped (set to all-NaN).
+
+    If ``smooth_seconds`` is given (and > 0), each trial is smoothed *within*
+    its own valid window first, then masked. This avoids the NaN propagation
+    of ``gaussian_filter1d`` / ``uniform_filter1d`` on full traces (which
+    would otherwise wipe out the entire row).
     """
     if trace.ndim != 2 or trace.size == 0:
         return trace
-    out = trace.astype(float, copy=True)
+    out = np.full_like(trace, np.nan, dtype=float)
+
+    do_smooth = smooth_seconds is not None and smooth_seconds > 0
+    if do_smooth:
+        from scipy.ndimage import gaussian_filter1d, uniform_filter1d
+
+        kernel_pts = max(1, int(round(smooth_seconds / (dt or 1.0))))
+
     for i, tid in enumerate(trial_ids):
         win = window_map.get(int(tid))
         if win is None:
-            out[i, :] = np.nan
             continue
         t0, t1 = win
         mask = (time >= t0) & (time <= t1)
-        out[i, ~mask] = np.nan
+        if not np.any(mask):
+            continue
+        seg = trace[i, mask].astype(float, copy=True)
+        if do_smooth and seg.size > 1:
+            if smooth_mode == "gaussian":
+                seg = gaussian_filter1d(seg, sigma=kernel_pts, mode="nearest")
+            else:
+                seg = uniform_filter1d(seg, size=kernel_pts, mode="nearest")
+        out[i, mask] = seg
     return out
 
 
@@ -634,20 +656,28 @@ def plot_cd_session(
     if restrict_window_per_trial is not None:
         proj_A = _mask_trace_per_trial(
             sess.proj_train_A, sess.trial_id_train_A, sess.time, restrict_window_per_trial,
+            smooth_seconds=smooth_gauss, dt=sess.dt, smooth_mode="gaussian",
         )
         proj_B = _mask_trace_per_trial(
             sess.proj_train_B, sess.trial_id_train_B, sess.time, restrict_window_per_trial,
+            smooth_seconds=smooth_gauss, dt=sess.dt, smooth_mode="gaussian",
         )
         if restrict_events is not None:
             title_suffix = f" [{restrict_events[0]}→{restrict_events[1]}]"
         else:
             title_suffix = " [per-trial window]"
 
+    # When per-trial restriction is on, smoothing is already done per-trial
+    # within each valid window (NaN-safe). Disable the plotter's smoothing
+    # so it does not re-smooth and propagate NaNs across the trace.
+    proj_smooth_gauss = None if restrict_window_per_trial is not None else smooth_gauss
+    proj_smooth_moving = None if restrict_window_per_trial is not None else smooth_moving_window
+
     plot_cd_projection(
         sess.time,
         proj_A, proj_B,
         average=True,
-        smooth=smooth_gauss, dt=sess.dt, smooth_mode="gaussian",
+        smooth=proj_smooth_gauss, dt=sess.dt, smooth_mode="gaussian",
         title=f"[{sess.session}] Coding Direction Projection (Smoothed){title_suffix}",
     )
     if plot_single_trial:
@@ -655,7 +685,7 @@ def plot_cd_session(
             sess.time,
             proj_A, proj_B,
             average=False,
-            smooth=smooth_moving_window, smooth_mode="moving",
+            smooth=proj_smooth_moving, smooth_mode="moving",
             title=f"[{sess.session}] Single-Trial CD Projections (Smoothed){title_suffix}",
         )
     plot_cd_window_distribution(
