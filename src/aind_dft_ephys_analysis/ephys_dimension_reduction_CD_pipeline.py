@@ -621,6 +621,7 @@ def plot_cd_session(
     restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
     restrict_events: Optional[Tuple[str, str]] = None,
     restrict_align: Optional[str] = None,
+    xlim: Optional[Tuple[float, float]] = None,
 ) -> None:
     """Run the standard 3-panel CD plot for a single session (train projections).
 
@@ -639,6 +640,10 @@ def plot_cd_session(
     restrict_align : str, optional
         Forwarded to :func:`compute_per_trial_event_offsets` when
         ``restrict_events`` is used. Defaults to ``event_start`` there.
+    xlim : (float, float), optional
+        x-axis limits (seconds) for the projection plots. If ``None`` and
+        ``restrict_events`` is given, auto-zooms to the central 95% of the
+        per-trial windows so very long trials don't blow up the axis.
     """
     proj_A = sess.proj_train_A
     proj_B = sess.proj_train_B
@@ -673,11 +678,18 @@ def plot_cd_session(
     proj_smooth_gauss = None if restrict_window_per_trial is not None else smooth_gauss
     proj_smooth_moving = None if restrict_window_per_trial is not None else smooth_moving_window
 
+    # Auto-zoom xlim to the central 95% of per-trial windows when restricting.
+    if xlim is None and restrict_window_per_trial:
+        starts = np.array([w[0] for w in restrict_window_per_trial.values()])
+        ends = np.array([w[1] for w in restrict_window_per_trial.values()])
+        xlim = (float(np.quantile(starts, 0.025)), float(np.quantile(ends, 0.975)))
+
     plot_cd_projection(
         sess.time,
         proj_A, proj_B,
         average=True,
         smooth=proj_smooth_gauss, dt=sess.dt, smooth_mode="gaussian",
+        xlim=xlim,
         title=f"[{sess.session}] Coding Direction Projection (Smoothed){title_suffix}",
     )
     if plot_single_trial:
@@ -686,6 +698,7 @@ def plot_cd_session(
             proj_A, proj_B,
             average=False,
             smooth=proj_smooth_moving, smooth_mode="moving",
+            xlim=xlim,
             title=f"[{sess.session}] Single-Trial CD Projections (Smoothed){title_suffix}",
         )
     plot_cd_window_distribution(
