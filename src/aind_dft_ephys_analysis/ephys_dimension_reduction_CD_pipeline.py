@@ -41,6 +41,7 @@ Three groups of helpers:
 from __future__ import annotations
 
 import glob
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -337,6 +338,8 @@ class CDSessionData:
     switch_RL_ids: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=int))
     # convenience: switch subsets per train/test × A/B
     subsets: Dict[str, np.ndarray] = field(default_factory=dict)
+    # class names (from build-time trial_types); falls back to ("Type A","Type B")
+    trial_types: Tuple[str, str] = ("Type A", "Type B")
 
     def counts(self) -> Dict[str, int]:
         """Trial counts for each split × class × switch type."""
@@ -392,6 +395,19 @@ def load_cd_session(
     m = _SESSION_RE.match(os.path.basename(str(zarr_path)))
     session = m.group("session") if m else os.path.basename(str(zarr_path))
 
+    # Try to recover class labels from pipeline attrs written at build time.
+    tt: Tuple[str, str] = ("Type A", "Type B")
+    pipeline_attrs = ds.attrs.get("pipeline")
+    if isinstance(pipeline_attrs, str):
+        try:
+            pipeline_attrs = json.loads(pipeline_attrs)
+        except Exception:  # noqa: BLE001
+            pipeline_attrs = None
+    if isinstance(pipeline_attrs, dict):
+        tt_list = pipeline_attrs.get("trial_types")
+        if isinstance(tt_list, (list, tuple)) and len(tt_list) >= 2:
+            tt = (str(tt_list[0]), str(tt_list[1]))
+
     sess = CDSessionData(
         session=session,
         time=time,
@@ -404,6 +420,7 @@ def load_cd_session(
         trial_id_train_B=_ids("trial_id_train_B"),
         trial_id_test_A=_ids("trial_id_test_A"),
         trial_id_test_B=_ids("trial_id_test_B"),
+        trial_types=tt,
     )
 
     def _col_ids(col: str) -> np.ndarray:
@@ -684,12 +701,18 @@ def plot_cd_session(
         ends = np.array([w[1] for w in restrict_window_per_trial.values()])
         xlim = (float(np.quantile(starts, 0.025)), float(np.quantile(ends, 0.975)))
 
+    n_A = int(sess.proj_train_A.shape[0]) if sess.proj_train_A.ndim == 2 else 0
+    n_B = int(sess.proj_train_B.shape[0]) if sess.proj_train_B.ndim == 2 else 0
+    name_A, name_B = sess.trial_types
+    labels = (f"{name_A} (n={n_A})", f"{name_B} (n={n_B})")
+
     plot_cd_projection(
         sess.time,
         proj_A, proj_B,
         average=True,
         smooth=proj_smooth_gauss, dt=sess.dt, smooth_mode="gaussian",
         xlim=xlim,
+        labels=labels,
         title=f"[{sess.session}] Coding Direction Projection (Smoothed){title_suffix}",
     )
     if plot_single_trial:
@@ -699,12 +722,14 @@ def plot_cd_session(
             average=False,
             smooth=proj_smooth_moving, smooth_mode="moving",
             xlim=xlim,
+            labels=labels,
             title=f"[{sess.session}] Single-Trial CD Projections (Smoothed){title_suffix}",
         )
     plot_cd_window_distribution(
         sess.time, proj_A, proj_B,
         window=distribution_window,
         kind="hist", bins=40, hist_overlay=True,
+        labels=labels,
         title=f"[{sess.session}] Train set{title_suffix}",
     )
 
