@@ -844,17 +844,106 @@ def _plot_pair(
     )
 
 
+def _select_all_trials_for_type(
+    sess: CDSessionData, col: str,
+) -> np.ndarray:
+    """Select rows of ``sess.proj_all_trials`` whose trial IDs are in ``df[col][0]``."""
+    if sess.proj_all_trials.size == 0 or sess.behavior_df is None:
+        return np.empty((0, len(sess.time)), dtype=float)
+    if col not in sess.behavior_df.columns:
+        return np.empty((0, len(sess.time)), dtype=float)
+    try:
+        tids = np.asarray(sess.behavior_df[col].iloc[0], dtype=int).ravel()
+    except Exception:  # noqa: BLE001
+        return np.empty((0, len(sess.time)), dtype=float)
+    mask = np.isin(sess.trial_id_all_trials, tids)
+    return sess.proj_all_trials[mask]
+
+
 def plot_cd_aggregate(
     agg: CDAggregate,
     *,
+    sessions_data: Optional[Sequence[CDSessionData]] = None,
+    trial_types: Optional[Sequence[str]] = None,
     distribution_window: Tuple[float, float] = (-1.0, 0.0),
     smooth_gauss: float = 0.1,
     show: bool = True,
 ) -> None:
-    """Average + window-distribution plots for A-vs-B and LR-vs-RL pooled across sessions."""
+    """Average + window-distribution plots pooled across sessions.
+
+    Parameters
+    ----------
+    agg : CDAggregate
+        Aggregate built by :func:`aggregate_cd_sessions`. Used when
+        ``trial_types`` is None.
+    sessions_data, trial_types : optional
+        If both provided, projections for the requested behavior columns are
+        pulled from each session's ``proj_all_trials`` (the all-trials
+        projection onto the final CD axis) and concatenated. ``agg`` is then
+        used only for the time axis.
+        - One name → single-class display (no comparison plot).
+        - Two names → first vs second (e.g. ``["right_choice_trials","left_choice_trials"]``).
+    """
     if agg.time is None:
         print("[viz] No aggregated data; skip plots.")
         return
+
+    # ---- Trial-types mode: pool from per-session proj_all_trials ----
+    if trial_types is not None:
+        if sessions_data is None:
+            raise ValueError(
+                "plot_cd_aggregate: sessions_data must be provided when trial_types is set."
+            )
+        tt_list = [trial_types] if isinstance(trial_types, str) else list(trial_types)
+        if len(tt_list) not in (1, 2):
+            raise ValueError("trial_types must contain 1 or 2 column names.")
+
+        A_parts = [_select_all_trials_for_type(s, tt_list[0]) for s in sessions_data]
+        A_all = _cat_or_none(A_parts)
+        n_A = int(A_all.shape[0]) if A_all is not None else 0
+
+        if len(tt_list) == 2:
+            B_parts = [_select_all_trials_for_type(s, tt_list[1]) for s in sessions_data]
+            B_all = _cat_or_none(B_parts)
+            n_B = int(B_all.shape[0]) if B_all is not None else 0
+            if A_all is None or B_all is None:
+                print(f"[viz] Empty pool for {tt_list[0]} or {tt_list[1]}; skip plot.")
+                return
+            labels = (f"{tt_list[0]} (n={n_A})", f"{tt_list[1]} (n={n_B})")
+            plot_cd_projection(
+                agg.time, A_all, B_all,
+                average=True,
+                smooth=smooth_gauss, dt=agg.dt, smooth_mode="gaussian",
+                labels=labels,
+                title=f"[All Sessions] {tt_list[0]} vs {tt_list[1]} (mean±CI)",
+            )
+            plot_cd_window_distribution(
+                agg.time, A_all, B_all,
+                window=distribution_window, kind="hist", bins=40, hist_overlay=True,
+                labels=labels,
+                title=(
+                    f"[All Sessions] {tt_list[0]} vs {tt_list[1]}, "
+                    f"Window [{distribution_window[0]},{distribution_window[1]}]s"
+                ),
+            )
+        else:
+            if A_all is None:
+                print(f"[viz] Empty pool for {tt_list[0]}; skip plot.")
+                return
+            # Single group: pass A as both A and B with empty B handled by plotter
+            empty_B = np.empty((0, A_all.shape[1]), dtype=A_all.dtype)
+            plot_cd_projection(
+                agg.time, A_all, empty_B,
+                average=True,
+                smooth=smooth_gauss, dt=agg.dt, smooth_mode="gaussian",
+                labels=(f"{tt_list[0]} (n={n_A})", "(none)"),
+                title=f"[All Sessions] {tt_list[0]} (mean±CI)",
+            )
+
+        if show:
+            plt.show()
+        return
+
 
     # A vs B (train, test)
     _plot_pair(
