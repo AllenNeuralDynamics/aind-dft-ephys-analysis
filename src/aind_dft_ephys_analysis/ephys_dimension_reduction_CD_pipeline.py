@@ -46,7 +46,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -631,6 +631,7 @@ def _mask_trace_per_trial(
 def plot_cd_session(
     sess: CDSessionData,
     *,
+    split: Literal["train", "test"] = "train",
     distribution_window: Tuple[float, float] = (0.3, 2.0),
     smooth_gauss: float = 0.1,
     smooth_moving_window: int = 5,
@@ -640,10 +641,16 @@ def plot_cd_session(
     restrict_align: Optional[str] = None,
     xlim: Optional[Tuple[float, float]] = None,
 ) -> None:
-    """Run the standard 3-panel CD plot for a single session (train projections).
+    """Run the standard 3-panel CD plot for a single session.
 
     Parameters
     ----------
+    split : {'train', 'test'}, default 'train'
+        Which projections to plot.
+        - 'train': in-sample projections (each trial projected onto the CD
+          axis fit on the same half it belonged to). Larger A–B separation.
+        - 'test' : cross-validated projections (each trial projected onto the
+          axis fit on the *other* half). Unbiased estimate of separability.
     restrict_window_per_trial : dict[int, (float, float)], optional
         Per-trial ``(t0, t1)`` window (seconds, relative to the CD's align
         event). Samples outside each trial's window are set to NaN before
@@ -662,8 +669,19 @@ def plot_cd_session(
         ``restrict_events`` is given, auto-zooms to the central 95% of the
         per-trial windows so very long trials don't blow up the axis.
     """
-    proj_A = sess.proj_train_A
-    proj_B = sess.proj_train_B
+    if split == "train":
+        raw_A, raw_B = sess.proj_train_A, sess.proj_train_B
+        ids_A, ids_B = sess.trial_id_train_A, sess.trial_id_train_B
+        split_lbl = "Train"
+    elif split == "test":
+        raw_A, raw_B = sess.proj_test_A, sess.proj_test_B
+        ids_A, ids_B = sess.trial_id_test_A, sess.trial_id_test_B
+        split_lbl = "Test (CV)"
+    else:
+        raise ValueError(f"split must be 'train' or 'test', got {split!r}")
+
+    proj_A = raw_A
+    proj_B = raw_B
     title_suffix = ""
 
     if restrict_window_per_trial is None and restrict_events is not None:
@@ -677,11 +695,11 @@ def plot_cd_session(
 
     if restrict_window_per_trial is not None:
         proj_A = _mask_trace_per_trial(
-            sess.proj_train_A, sess.trial_id_train_A, sess.time, restrict_window_per_trial,
+            raw_A, ids_A, sess.time, restrict_window_per_trial,
             smooth_seconds=smooth_gauss, dt=sess.dt, smooth_mode="gaussian",
         )
         proj_B = _mask_trace_per_trial(
-            sess.proj_train_B, sess.trial_id_train_B, sess.time, restrict_window_per_trial,
+            raw_B, ids_B, sess.time, restrict_window_per_trial,
             smooth_seconds=smooth_gauss, dt=sess.dt, smooth_mode="gaussian",
         )
         if restrict_events is not None:
@@ -701,8 +719,8 @@ def plot_cd_session(
         ends = np.array([w[1] for w in restrict_window_per_trial.values()])
         xlim = (float(np.quantile(starts, 0.025)), float(np.quantile(ends, 0.975)))
 
-    n_A = int(sess.proj_train_A.shape[0]) if sess.proj_train_A.ndim == 2 else 0
-    n_B = int(sess.proj_train_B.shape[0]) if sess.proj_train_B.ndim == 2 else 0
+    n_A = int(raw_A.shape[0]) if raw_A.ndim == 2 else 0
+    n_B = int(raw_B.shape[0]) if raw_B.ndim == 2 else 0
     name_A, name_B = sess.trial_types
     labels = (f"{name_A} (n={n_A})", f"{name_B} (n={n_B})")
 
@@ -713,7 +731,7 @@ def plot_cd_session(
         smooth=proj_smooth_gauss, dt=sess.dt, smooth_mode="gaussian",
         xlim=xlim,
         labels=labels,
-        title=f"[{sess.session}] Coding Direction Projection (Smoothed){title_suffix}",
+        title=f"[{sess.session}] {split_lbl} CD Projection (Smoothed){title_suffix}",
     )
     if plot_single_trial:
         plot_cd_projection(
@@ -723,14 +741,14 @@ def plot_cd_session(
             smooth=proj_smooth_moving, smooth_mode="moving",
             xlim=xlim,
             labels=labels,
-            title=f"[{sess.session}] Single-Trial CD Projections (Smoothed){title_suffix}",
+            title=f"[{sess.session}] {split_lbl} Single-Trial CD Projections (Smoothed){title_suffix}",
         )
     plot_cd_window_distribution(
         sess.time, proj_A, proj_B,
         window=distribution_window,
         kind="hist", bins=40, hist_overlay=True,
         labels=labels,
-        title=f"[{sess.session}] Train set{title_suffix}",
+        title=f"[{sess.session}] {split_lbl} set{title_suffix}",
     )
 
 
