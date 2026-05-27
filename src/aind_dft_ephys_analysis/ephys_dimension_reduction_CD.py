@@ -724,6 +724,32 @@ def coding_direction_from_psth(
     R_all_z = (R_all - mu_all) / sigma_all
     w_final_all = _compute_cd_axis(R_all_z, labels_all_pm1)
 
+    # ---- Project EVERY trial in the session onto the final CD axis ----
+    # Uses w_final_all + mu_all/sigma_all (fit on all A∪B trials), then
+    # applies the same post-hoc normalization used for train/test so all
+    # projection arrays in this dataset are directly comparable. Useful for
+    # downstream analyses that want CD projections of trials that are not
+    # in trial_ids_typeA or trial_ids_typeB.
+    R_full_z_all = (R_fit_full - mu_all) / sigma_all
+    y_full_raw = R_full_z_all @ w_final_all                                  # (T_full,)
+    cube_full_z_all = (cube_full - mu_all[:, :, None]) / sigma_all[:, :, None]
+    Yt_full_raw = np.tensordot(cube_full_z_all, w_final_all, axes=([1], [0]))  # (T_full, Tt)
+
+    if norm_mode_used == "divide_sqrtN":
+        projection_all_trials = y_full_raw / norm_factor
+        projection_trace_all_trials = Yt_full_raw / norm_factor
+    elif norm_mode_used == "unit_variance_fit":
+        projection_all_trials = y_full_raw / norm_factor
+        projection_trace_all_trials = Yt_full_raw / norm_factor
+    elif norm_mode_used == "zscore_fit":
+        projection_all_trials = (y_full_raw - y_mean) / norm_factor
+        projection_trace_all_trials = (Yt_full_raw - y_mean) / norm_factor
+    else:
+        projection_all_trials = y_full_raw.copy()
+        projection_trace_all_trials = Yt_full_raw.copy()
+
+    trial_ids_all_trials = trial_ids_full.astype(int)
+
     out = {
         # Axes & combined (normalized) outputs
         "axis_w": w_first_fold,
@@ -748,6 +774,10 @@ def coding_direction_from_psth(
         "projection_test_B": projection_test_B,
         "projection_trace_test_B": projection_trace_test_B,
         "trial_ids_test_B": trial_ids_test_B,
+        # ---- NEW: projections of ALL trials onto the final CD axis ----
+        "projection_all_trials": projection_all_trials,
+        "projection_trace_all_trials": projection_trace_all_trials,
+        "trial_ids_all_trials": trial_ids_all_trials,
         # Time & metrics
         "time_for_projection": time_vec,
         "metrics": {
@@ -841,6 +871,10 @@ def coding_direction_from_psth(
                 projection_test_B=projection_test_B,
                 projection_trace_test_B=projection_trace_test_B,
                 trial_ids_test_B=trial_ids_test_B,
+                # ---- NEW: all-trials projections (final CD axis) ----
+                projection_all_trials=projection_all_trials,
+                projection_trace_all_trials=projection_trace_all_trials,
+                trial_ids_all_trials=trial_ids_all_trials,
                 # meta
                 labels_test=lab_test_all,
                 trial_ids_test=id_test_all,
@@ -871,6 +905,9 @@ def coding_direction_from_psth(
                     "projection_trace_train_A": (("trial_train_A", "time"), projection_trace_train_A),
                     "projection_train_B": (("trial_train_B",), projection_train_B),
                     "projection_trace_train_B": (("trial_train_B", "time"), projection_trace_train_B),
+                    # all trials (final CD axis fit on all A∪B)
+                    "projection_all_trials": (("trial_all",), projection_all_trials),
+                    "projection_trace_all_trials": (("trial_all", "time"), projection_trace_all_trials),
                     # axes
                     "axis_w": (("unit",), w_first_fold),
                     "axis_w_all": (("unit",), w_final_all),
@@ -882,6 +919,7 @@ def coding_direction_from_psth(
                     "trial_id_test_B": ("trial_test_B", trial_ids_test_B),
                     "trial_id_train_A": ("trial_train_A", trial_ids_train_A),
                     "trial_id_train_B": ("trial_train_B", trial_ids_train_B),
+                    "trial_id_all": ("trial_all", trial_ids_all_trials),
                     "time": ("time", np.asarray(time_vec, dtype=float)),
                     "unit_id": ("unit", np.asarray(unit_ids_selected, dtype=int)),
                 },
