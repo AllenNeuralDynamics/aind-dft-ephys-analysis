@@ -340,6 +340,11 @@ class CDSessionData:
     subsets: Dict[str, np.ndarray] = field(default_factory=dict)
     # class names (from build-time trial_types); falls back to ("Type A","Type B")
     trial_types: Tuple[str, str] = ("Type A", "Type B")
+    # ALL-trials projections onto the final CD axis (may be empty for old zarrs)
+    proj_all_trials: np.ndarray = field(default_factory=lambda: np.empty((0, 0)))
+    trial_id_all_trials: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=int))
+    # Raw behavior DataFrame (single-row per session) for trial-type lookups
+    behavior_df: Optional[pd.DataFrame] = None
 
     def counts(self) -> Dict[str, int]:
         """Trial counts for each split × class × switch type."""
@@ -408,6 +413,16 @@ def load_cd_session(
         if isinstance(tt_list, (list, tuple)) and len(tt_list) >= 2:
             tt = (str(tt_list[0]), str(tt_list[1]))
 
+    # All-trials projections (optional; present only in newer zarrs)
+    if "projection_trace_all_trials" in ds.data_vars:
+        proj_all = _trace("projection_trace_all_trials")
+        trial_id_all = _ids("trial_id_all") if "trial_id_all" in ds.coords else np.arange(
+            proj_all.shape[0], dtype=int
+        )
+    else:
+        proj_all = np.empty((0, len(time)))
+        trial_id_all = np.empty(0, dtype=int)
+
     sess = CDSessionData(
         session=session,
         time=time,
@@ -421,6 +436,9 @@ def load_cd_session(
         trial_id_test_A=_ids("trial_id_test_A"),
         trial_id_test_B=_ids("trial_id_test_B"),
         trial_types=tt,
+        proj_all_trials=proj_all,
+        trial_id_all_trials=trial_id_all,
+        behavior_df=df,
     )
 
     def _col_ids(col: str) -> np.ndarray:
@@ -632,6 +650,7 @@ def plot_cd_session(
     sess: CDSessionData,
     *,
     split: Literal["train", "test"] = "train",
+    trial_types: Optional[Sequence[str]] = None,
     distribution_window: Tuple[float, float] = (0.3, 2.0),
     smooth_gauss: float = 0.1,
     smooth_moving_window: int = 5,
@@ -646,11 +665,21 @@ def plot_cd_session(
     Parameters
     ----------
     split : {'train', 'test'}, default 'train'
-        Which projections to plot.
+        Which projections to plot when ``trial_types`` is None.
         - 'train': in-sample projections (each trial projected onto the CD
           axis fit on the same half it belonged to). Larger A–B separation.
         - 'test' : cross-validated projections (each trial projected onto the
           axis fit on the *other* half). Unbiased estimate of separability.
+    trial_types : sequence of str, optional
+        If provided, projections are pulled from ``sess.proj_all_trials`` and
+        selected by trial-ID lookup into ``sess.behavior_df`` for each named
+        column. ``split`` is ignored in this mode (the final CD axis is the
+        same for all trials).
+        - One name → only that group is plotted (single-class display: the
+          "B" series is empty).
+        - Two names → first is A, second is B.
+        Requires the zarr to contain ``projection_trace_all_trials`` and the
+        behavior CSV to contain the requested column(s).
     restrict_window_per_trial : dict[int, (float, float)], optional
         Per-trial ``(t0, t1)`` window (seconds, relative to the CD's align
         event). Samples outside each trial's window are set to NaN before
@@ -669,16 +698,56 @@ def plot_cd_session(
         ``restrict_events`` is given, auto-zooms to the central 95% of the
         per-trial windows so very long trials don't blow up the axis.
     """
-    if split == "train":
-        raw_A, raw_B = sess.proj_train_A, sess.proj_train_B
-        ids_A, ids_B = sess.trial_id_train_A, sess.trial_id_train_B
-        split_lbl = "Train"
-    elif split == "test":
-        raw_A, raw_B = sess.proj_test_A, sess.proj_test_B
-        ids_A, ids_B = sess.trial_id_test_A, sess.trial_id_test_B
-        split_lbl = "Test (CV)"
+    # ----- Build (raw_A, raw_B, ids_A, ids_B, split_lbl, name_A, name_B) -----
+    if trial_types is not None:
+        if sess.proj_all_trials.size == 0:
+            raise ValueError(
+                f"[{sess.session}] proj_all_trials is empty; rebuild CD zarr "
+                "to include projection_trace_all_trials."
+            )
+        if sess.behavior_df is None:
+            raise ValueError(f"[{sess.session}] behavior_df missing; cannot resolve trial_types.")
+        tt_list = [trial_types] if isinstance(trial_types, str) else list(trial_types)
+        if len(tt_list) not in (1, 2):
+            raise ValueError("trial_types must contain 1 or 2 column names.")
+
+        def _ids_from_df(col: str) -> np.ndarray:
+            if col not in sess.behavior_df.columns:
+                raise KeyError(
+                    f"[{sess.session}] column {col!r} not found in behavior CSV."
+                )
+            try:
+                return np.asarray(sess.behavior_df[col].iloc[0], dtype=int).ravel()
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"[{sess.session}] could not parse {col!r}: {e}") from e
+
+        def _select(col: str) -> Tuple[np.ndarray, np.ndarray]:
+            tids = _ids_from_df(col)
+            mask = np.isin(sess.trial_id_all_trials, tids)
+            return sess.proj_all_trials[mask], sess.trial_id_all_trials[mask]
+
+        raw_A, ids_A = _select(tt_list[0])
+        name_A = tt_list[0]
+        if len(tt_list) == 2:
+            raw_B, ids_B = _select(tt_list[1])
+            name_B = tt_list[1]
+        else:
+            raw_B = np.empty((0, sess.proj_all_trials.shape[1]), dtype=sess.proj_all_trials.dtype)
+            ids_B = np.empty(0, dtype=int)
+            name_B = ""
+        split_lbl = "All-trials CD"
     else:
-        raise ValueError(f"split must be 'train' or 'test', got {split!r}")
+        if split == "train":
+            raw_A, raw_B = sess.proj_train_A, sess.proj_train_B
+            ids_A, ids_B = sess.trial_id_train_A, sess.trial_id_train_B
+            split_lbl = "Train"
+        elif split == "test":
+            raw_A, raw_B = sess.proj_test_A, sess.proj_test_B
+            ids_A, ids_B = sess.trial_id_test_A, sess.trial_id_test_B
+            split_lbl = "Test (CV)"
+        else:
+            raise ValueError(f"split must be 'train' or 'test', got {split!r}")
+        name_A, name_B = sess.trial_types
 
     proj_A = raw_A
     proj_B = raw_B
@@ -697,11 +766,11 @@ def plot_cd_session(
         proj_A = _mask_trace_per_trial(
             raw_A, ids_A, sess.time, restrict_window_per_trial,
             smooth_seconds=smooth_gauss, dt=sess.dt, smooth_mode="gaussian",
-        )
+        ) if raw_A.size else raw_A
         proj_B = _mask_trace_per_trial(
             raw_B, ids_B, sess.time, restrict_window_per_trial,
             smooth_seconds=smooth_gauss, dt=sess.dt, smooth_mode="gaussian",
-        )
+        ) if raw_B.size else raw_B
         if restrict_events is not None:
             title_suffix = f" [{restrict_events[0]}→{restrict_events[1]}]"
         else:
@@ -721,8 +790,10 @@ def plot_cd_session(
 
     n_A = int(raw_A.shape[0]) if raw_A.ndim == 2 else 0
     n_B = int(raw_B.shape[0]) if raw_B.ndim == 2 else 0
-    name_A, name_B = sess.trial_types
-    labels = (f"{name_A} (n={n_A})", f"{name_B} (n={n_B})")
+    labels = (
+        f"{name_A} (n={n_A})",
+        f"{name_B} (n={n_B})" if name_B else "(none)",
+    )
 
     plot_cd_projection(
         sess.time,
