@@ -137,6 +137,7 @@ def plot_cd_projection(
     trace_B: np.ndarray,
     *,
     average: bool = True,
+    show_mean: bool = True,
     error: Optional[Literal["sem", "std", "ci"]] = "ci",
     ci_level: float = 0.95,
     smooth: Optional[float] = None,
@@ -322,22 +323,26 @@ def plot_cd_projection(
                     )
             ax.plot(time_plot, mean, color=color, lw=linewidth_mean, label=label)
         else:
-            # Faint single trials + thick mean on top
+            # Faint single trials + optional thick mean on top
             for tr in traces:
                 ax.plot(time_plot, tr, color=color, alpha=alpha_single, lw=1.0)
-            if error is not None:
-                band = _compute_error(traces)
-                if band is not None:
-                    lower, upper = band
-                    ax.fill_between(
-                        time_plot,
-                        lower,
-                        upper,
-                        color=color,
-                        alpha=0.25,
-                        lw=0,
-                    )
-            ax.plot(time_plot, mean, color=color, lw=linewidth_mean, label=label)
+            if show_mean:
+                if error is not None:
+                    band = _compute_error(traces)
+                    if band is not None:
+                        lower, upper = band
+                        ax.fill_between(
+                            time_plot,
+                            lower,
+                            upper,
+                            color=color,
+                            alpha=0.25,
+                            lw=0,
+                        )
+                ax.plot(time_plot, mean, color=color, lw=linewidth_mean, label=label)
+            else:
+                # Add a thin legend handle so the label still shows up.
+                ax.plot([], [], color=color, lw=linewidth_mean, label=label)
 
     _plot_group(trace_A_sm, colors[0], labels[0])
     _plot_group(trace_B_sm, colors[1], labels[1])
