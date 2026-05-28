@@ -493,6 +493,7 @@ def coding_direction_from_psth(
     overwrite: bool = True,
     norm_mode: str = "divide_sqrtN",
     unit_ids: Optional[Union[np.ndarray, List[int]]] = None,
+    zscore_units: bool = False,
 ) -> Dict:
     """
     Compute a Coding Direction (typeA - typeB) using half of trials for training,
@@ -529,6 +530,14 @@ def coding_direction_from_psth(
     unit_ids : array-like of int or None, optional
         If provided, compute the coding direction using only units whose
         `unit_index` matches these IDs. If None, all units are used.
+    zscore_units : bool, default False
+        If True, apply per-unit, across-trials z-score within the fit window
+        (computed on TRAIN trials for per-fold axes, and on all A∪B trials for
+        the final axis). The same mu/sigma are reused to standardize test
+        trials and every time bin of the PSTH cube. If False (default), no
+        z-score is applied: the CD axis is the unit-norm difference of
+        class-mean raw firing rates (in Hz), and projections are computed in
+        the original units.
 
     Returns
     -------
@@ -605,10 +614,16 @@ def coding_direction_from_psth(
         y_tr_labels = fd["train_labels"].astype(float)[train_order]
         y_te_labels = fd["test_labels"].astype(float)[test_order]
 
-        # Z-score using TRAIN trials only (fit window)
+        # Optional z-score using TRAIN trials only (fit window).
+        # When disabled, mu=0 and sigma=1 are used so the CD axis is the
+        # unit-norm difference of class-mean raw rates.
         R_tr = R_fit_full[tr_idx]
-        mu = R_tr.mean(axis=0, keepdims=True)
-        sigma = R_tr.std(axis=0, keepdims=True) + 1e-9
+        if zscore_units:
+            mu = R_tr.mean(axis=0, keepdims=True)
+            sigma = R_tr.std(axis=0, keepdims=True) + 1e-9
+        else:
+            mu = np.zeros((1, R_tr.shape[1]), dtype=R_tr.dtype)
+            sigma = np.ones((1, R_tr.shape[1]), dtype=R_tr.dtype)
         R_tr_z = (R_tr - mu) / sigma
 
         # CD axis on training
@@ -719,8 +734,12 @@ def coding_direction_from_psth(
     labels_all_pm1 = labels_all_pm1[perm]
 
     R_all = R_fit_full[idx_all_inc]
-    mu_all = R_all.mean(axis=0, keepdims=True)
-    sigma_all = R_all.std(axis=0, keepdims=True) + 1e-9
+    if zscore_units:
+        mu_all = R_all.mean(axis=0, keepdims=True)
+        sigma_all = R_all.std(axis=0, keepdims=True) + 1e-9
+    else:
+        mu_all = np.zeros((1, R_all.shape[1]), dtype=R_all.dtype)
+        sigma_all = np.ones((1, R_all.shape[1]), dtype=R_all.dtype)
     R_all_z = (R_all - mu_all) / sigma_all
     w_final_all = _compute_cd_axis(R_all_z, labels_all_pm1)
 
