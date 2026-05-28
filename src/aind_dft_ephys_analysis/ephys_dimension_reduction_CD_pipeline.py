@@ -658,6 +658,8 @@ def plot_cd_session(
     smooth_gauss: float = 0.1,
     smooth_moving_window: int = 5,
     plot_single_trial: bool = True,
+    random_sample_trial_N: Optional[int] = None,
+    random_sample_seed: Optional[int] = 0,
     restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
     restrict_events: Optional[Tuple[str, str]] = None,
     restrict_align: Optional[str] = None,
@@ -808,13 +810,33 @@ def plot_cd_session(
         title=f"[{sess.session}] {split_lbl} CD Projection (Smoothed){title_suffix}",
     )
     if plot_single_trial:
+        if random_sample_trial_N is not None and random_sample_trial_N > 0:
+            rng = np.random.default_rng(random_sample_seed)
+
+            def _sample(arr: np.ndarray) -> np.ndarray:
+                if arr.ndim != 2 or arr.shape[0] <= random_sample_trial_N:
+                    return arr
+                sel = rng.choice(arr.shape[0], size=random_sample_trial_N, replace=False)
+                return arr[np.sort(sel)]
+
+            proj_A_st = _sample(proj_A)
+            proj_B_st = _sample(proj_B)
+            n_A_st = int(proj_A_st.shape[0]) if proj_A_st.ndim == 2 else 0
+            n_B_st = int(proj_B_st.shape[0]) if proj_B_st.ndim == 2 else 0
+            labels_st = (
+                f"{name_A} (n={n_A_st}/{n_A})",
+                f"{name_B} (n={n_B_st}/{n_B})" if name_B else "(none)",
+            )
+        else:
+            proj_A_st, proj_B_st = proj_A, proj_B
+            labels_st = labels
         plot_cd_projection(
             sess.time,
-            proj_A, proj_B,
+            proj_A_st, proj_B_st,
             average=False,
             smooth=proj_smooth_moving, smooth_mode="moving",
             xlim=xlim,
-            labels=labels,
+            labels=labels_st,
             title=f"[{sess.session}] {split_lbl} Single-Trial CD Projections (Smoothed){title_suffix}",
         )
     plot_cd_window_distribution(
