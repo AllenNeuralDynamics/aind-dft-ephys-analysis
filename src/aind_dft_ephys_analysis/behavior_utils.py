@@ -946,6 +946,8 @@ def find_trials(
         - 'unrewarded'       : trials where no reward and response != 2
         - 'left_rewarded'    : trials where left side was rewarded
         - 'right_rewarded'   : trials where right side was rewarded
+        - 'left_unrewarded'  : left-choice trials that were not rewarded
+        - 'right_unrewarded' : right-choice trials that were not rewarded
         - 'left_choice'      : left choice trials
         - 'right_choice'     : right choice trials
 
@@ -1042,6 +1044,12 @@ def find_trials(
         return np.where(rewardedL)[0].tolist()
     elif trial_type == 'right_rewarded':
         return np.where(rewardedR)[0].tolist()
+    elif trial_type == 'left_unrewarded':
+        mask = np.logical_and(resp == 0, ~rewarded)
+        return np.where(mask)[0].tolist()
+    elif trial_type == 'right_unrewarded':
+        mask = np.logical_and(resp == 1, ~rewarded)
+        return np.where(mask)[0].tolist()
     else:
         raise ValueError(f"Unsupported trial_type '{trial_type}'")
 
