@@ -1147,6 +1147,7 @@ def generate_behavior_summary(
         trial_types = [
             'no_response', 'response', 'rewarded', 'unrewarded',
             'left_rewarded', 'right_rewarded',
+            'left_unrewarded', 'right_unrewarded',
             'switch_trial',
             'switch_trial_reward',
             'switch_trial_noreward',
