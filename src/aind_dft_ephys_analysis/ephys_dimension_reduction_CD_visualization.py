@@ -359,3 +359,211 @@ def plot_cd_projection(
     ax.axhline(0, color="k", lw=0.8, ls="--", alpha=0.6)
     plt.tight_layout()
     plt.show()
+
+
+def plot_cd_heatmap(
+    time: np.ndarray,
+    trace_A: np.ndarray,
+    trace_B: Optional[np.ndarray] = None,
+    *,
+    smooth: Optional[float] = None,
+    smooth_mode: Literal["gaussian", "moving"] = "gaussian",
+    dt: Optional[float] = None,
+    edge_handling: Literal["reflect", "nearest", "mirror", "wrap"] = "reflect",
+    sort_by: Optional[Literal["mean", "peak_time", "peak_value", "none"]] = "mean",
+    sort_window: Optional[Tuple[float, float]] = None,
+    sort_ascending: bool = False,
+    cmap: str = "RdBu_r",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    vrange_quantile: float = 0.99,
+    symmetric_colorbar: bool = True,
+    labels: Tuple[str, str] = ("Type A", "Type B"),
+    figsize: Optional[Tuple[float, float]] = None,
+    xlim: Optional[Tuple[float, float]] = None,
+    title: Optional[str] = None,
+    xlabel: str = "Time (s)",
+    ylabel: str = "Trial (sorted)",
+    show_colorbar: bool = True,
+    show_event_line: bool = True,
+) -> None:
+    """
+    Single-trial CD-projection heatmap for one or two classes.
+
+    Parameters
+    ----------
+    time : (T,)
+        Time vector (seconds).
+    trace_A, trace_B : (n_trials, T)
+        Per-trial projection traces. ``trace_B`` may be None or empty to plot
+        a single panel.
+    smooth, smooth_mode, dt, edge_handling
+        Temporal smoothing applied to each trial before display. ``smooth`` is
+        interpreted in *seconds* if ``dt`` is given, otherwise in *samples*.
+    sort_by : {'mean','peak_time','peak_value','none'} or None
+        Sort each class's rows. ``'mean'`` (default) sorts by within-window
+        average; ``'peak_time'`` by argmax time; ``'peak_value'`` by maximum
+        value; ``'none'``/``None`` keeps input order.
+    sort_window : (t0, t1), optional
+        Time window used by the sort statistic. Defaults to the full ``xlim``
+        if set, otherwise the full time axis.
+    sort_ascending : bool, default False
+        Sort direction (default: largest at top).
+    cmap : str
+        Matplotlib colormap.
+    vmin, vmax : float, optional
+        Color limits. If both None, computed from the central ``vrange_quantile``
+        of the (smoothed) data, optionally made symmetric around 0.
+    vrange_quantile : float, default 0.99
+        When auto-computing limits, use this two-sided quantile.
+    symmetric_colorbar : bool, default True
+        Force ``vmin = -vmax`` when auto-computing limits (useful for diverging
+        colormaps like ``RdBu_r``).
+    labels : (label_A, label_B)
+        Subplot titles (suffixed with trial counts).
+    figsize : (w, h), optional
+        Figure size. Default scales with number of panels.
+    xlim, title, xlabel, ylabel
+        Standard axis controls.
+    show_colorbar : bool
+        Append a colorbar to the right of the heatmaps.
+    show_event_line : bool
+        Draw a vertical line at t=0 if it lies within ``xlim``.
+    """
+    # ---- normalize inputs ----
+    have_A = isinstance(trace_A, np.ndarray) and trace_A.ndim == 2 and trace_A.size > 0
+    have_B = isinstance(trace_B, np.ndarray) and trace_B.ndim == 2 and trace_B.size > 0
+    if not have_A and not have_B:
+        print("[heatmap] No data to plot.")
+        return
+
+    # ---- smoothing helpers (mirror plot_cd_projection) ----
+    def _kernel_pts() -> int:
+        if smooth is None or smooth <= 0:
+            return 0
+        return max(1, int(round(smooth if dt is None else smooth / dt)))
+
+    def _smooth(tr: np.ndarray) -> np.ndarray:
+        k = _kernel_pts()
+        if k <= 1 or tr.size == 0:
+            return tr
+        if smooth_mode == "gaussian":
+            return gaussian_filter1d(tr, sigma=k, axis=-1, mode=edge_handling, truncate=3.0)
+        elif smooth_mode == "moving":
+            return uniform_filter1d(tr, size=k, axis=-1, mode=edge_handling)
+        else:
+            raise ValueError("smooth_mode must be 'gaussian' or 'moving'.")
+
+    A_sm = _smooth(trace_A) if have_A else None
+    B_sm = _smooth(trace_B) if have_B else None
+
+    # ---- sort window mask ----
+    def _sort_mask() -> np.ndarray:
+        if sort_window is not None:
+            t0, t1 = sort_window
+        elif xlim is not None:
+            t0, t1 = xlim
+        else:
+            return np.ones_like(time, dtype=bool)
+        return (time >= t0) & (time <= t1)
+
+    def _sort_order(mat: np.ndarray) -> np.ndarray:
+        if sort_by in (None, "none"):
+            return np.arange(mat.shape[0])
+        m = _sort_mask()
+        seg = mat[:, m] if np.any(m) else mat
+        if sort_by == "mean":
+            stat = np.nanmean(seg, axis=1)
+        elif sort_by == "peak_value":
+            stat = np.nanmax(seg, axis=1)
+        elif sort_by == "peak_time":
+            # argmax along sorted segment; map back to global time axis
+            idx = np.nanargmax(np.where(np.isnan(seg), -np.inf, seg), axis=1)
+            local_time = time[m] if np.any(m) else time
+            stat = local_time[idx]
+        else:
+            raise ValueError(f"Unsupported sort_by={sort_by!r}")
+        # NaN-safe argsort: push NaNs to bottom
+        nan_mask = np.isnan(stat)
+        order = np.argsort(np.where(nan_mask, -np.inf if sort_ascending else np.inf, stat))
+        if not sort_ascending:
+            order = order[::-1]
+        return order
+
+    A_plot = A_sm[_sort_order(A_sm)] if have_A else None
+    B_plot = B_sm[_sort_order(B_sm)] if have_B else None
+
+    # ---- color limits ----
+    if vmin is None and vmax is None:
+        pool = []
+        if A_plot is not None:
+            pool.append(A_plot[np.isfinite(A_plot)])
+        if B_plot is not None:
+            pool.append(B_plot[np.isfinite(B_plot)])
+        if pool:
+            flat = np.concatenate(pool)
+            if flat.size:
+                lo = float(np.quantile(flat, 1.0 - vrange_quantile))
+                hi = float(np.quantile(flat, vrange_quantile))
+                if symmetric_colorbar:
+                    m = max(abs(lo), abs(hi))
+                    vmin, vmax = -m, m
+                else:
+                    vmin, vmax = lo, hi
+    if vmin is None:
+        vmin = -1.0
+    if vmax is None:
+        vmax = 1.0
+
+    # ---- figure / axes ----
+    n_panels = int(have_A) + int(have_B)
+    if figsize is None:
+        figsize = (7.0, 3.0 + 1.5 * n_panels)
+    fig, axes = plt.subplots(
+        n_panels, 1, figsize=figsize, sharex=True,
+        squeeze=False,
+    )
+    axes = axes[:, 0]
+
+    extent_lo = float(time[0])
+    extent_hi = float(time[-1])
+
+    panels = []
+    if have_A:
+        panels.append((A_plot, f"{labels[0]} (n={A_plot.shape[0]})"))
+    if have_B:
+        panels.append((B_plot, f"{labels[1]} (n={B_plot.shape[0]})"))
+
+    im = None
+    for ax, (mat, panel_title) in zip(axes, panels):
+        im = ax.imshow(
+            mat,
+            aspect="auto",
+            origin="lower",
+            extent=[extent_lo, extent_hi, 0, mat.shape[0]],
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            interpolation="nearest",
+        )
+        ax.set_ylabel(ylabel)
+        ax.set_title(panel_title)
+        if show_event_line:
+            lo_x = xlim[0] if xlim else extent_lo
+            hi_x = xlim[1] if xlim else extent_hi
+            if lo_x <= 0.0 <= hi_x:
+                ax.axvline(0.0, color="k", lw=0.8, ls="--", alpha=0.7)
+
+    axes[-1].set_xlabel(xlabel)
+    if xlim is not None:
+        axes[-1].set_xlim(xlim)
+    if title:
+        fig.suptitle(title)
+
+    if show_colorbar and im is not None:
+        fig.subplots_adjust(right=0.88)
+        cax = fig.add_axes([0.9, 0.15, 0.02, 0.7])
+        fig.colorbar(im, cax=cax, label="CD projection")
+    else:
+        plt.tight_layout()
+    plt.show()

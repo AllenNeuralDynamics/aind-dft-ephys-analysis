@@ -57,6 +57,7 @@ from ephys_dimension_reduction_CD import coding_direction_from_psth
 from ephys_dimension_reduction_CD_visualization import (
     plot_cd_window_distribution,
     plot_cd_projection,
+    plot_cd_heatmap,
 )
 
 
@@ -847,6 +848,159 @@ def plot_cd_session(
         kind="hist", bins=40, hist_overlay=True,
         labels=labels,
         title=f"[{sess.session}] {split_lbl} set{title_suffix}",
+    )
+
+
+def plot_cd_session_heatmap(
+    sess: CDSessionData,
+    *,
+    split: Literal["train", "test"] = "train",
+    trial_types: Optional[Sequence[str]] = None,
+    smooth_gauss: float = 0.1,
+    smooth_mode: Literal["gaussian", "moving"] = "gaussian",
+    sort_by: Optional[Literal["mean", "peak_time", "peak_value", "none"]] = "mean",
+    sort_window: Optional[Tuple[float, float]] = None,
+    sort_ascending: bool = False,
+    random_sample_trial_N: Optional[int] = None,
+    random_sample_seed: Optional[int] = 0,
+    restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
+    xlim: Optional[Tuple[float, float]] = None,
+    cmap: str = "RdBu_r",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    vrange_quantile: float = 0.99,
+    symmetric_colorbar: bool = True,
+    figsize: Optional[Tuple[float, float]] = None,
+) -> None:
+    """Single-trial CD-projection heatmap for one session.
+
+    Mirrors :func:`plot_cd_session` for trial selection (``split`` or
+    ``trial_types``), per-trial windowing (``restrict_events`` /
+    ``restrict_window_per_trial``), smoothing, and optional random
+    subsampling, but renders per-trial traces as a 2-D heatmap (one row per
+    trial). Each class becomes its own panel; rows are sorted within each
+    panel according to ``sort_by``.
+    """
+    # ----- Trial selection (mirrors plot_cd_session) -----
+    if trial_types is not None:
+        if sess.proj_all_trials.size == 0:
+            raise ValueError(
+                f"[{sess.session}] proj_all_trials is empty; rebuild CD zarr "
+                "to include projection_trace_all_trials."
+            )
+        if sess.behavior_df is None:
+            raise ValueError(f"[{sess.session}] behavior_df missing; cannot resolve trial_types.")
+        tt_list = [trial_types] if isinstance(trial_types, str) else list(trial_types)
+        if len(tt_list) not in (1, 2):
+            raise ValueError("trial_types must contain 1 or 2 column names.")
+
+        def _ids_from_df(col: str) -> np.ndarray:
+            if col not in sess.behavior_df.columns:
+                raise KeyError(
+                    f"[{sess.session}] column {col!r} not found in behavior CSV."
+                )
+            try:
+                return np.asarray(sess.behavior_df[col].iloc[0], dtype=int).ravel()
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"[{sess.session}] could not parse {col!r}: {e}") from e
+
+        def _select(col: str) -> Tuple[np.ndarray, np.ndarray]:
+            tids = _ids_from_df(col)
+            mask = np.isin(sess.trial_id_all_trials, tids)
+            return sess.proj_all_trials[mask], sess.trial_id_all_trials[mask]
+
+        raw_A, ids_A = _select(tt_list[0])
+        name_A = tt_list[0]
+        if len(tt_list) == 2:
+            raw_B, ids_B = _select(tt_list[1])
+            name_B = tt_list[1]
+        else:
+            raw_B = np.empty((0, sess.proj_all_trials.shape[1]), dtype=sess.proj_all_trials.dtype)
+            ids_B = np.empty(0, dtype=int)
+            name_B = ""
+        split_lbl = "All-trials CD"
+    else:
+        if split == "train":
+            raw_A, raw_B = sess.proj_train_A, sess.proj_train_B
+            ids_A, ids_B = sess.trial_id_train_A, sess.trial_id_train_B
+            split_lbl = "Train"
+        elif split == "test":
+            raw_A, raw_B = sess.proj_test_A, sess.proj_test_B
+            ids_A, ids_B = sess.trial_id_test_A, sess.trial_id_test_B
+            split_lbl = "Test (CV)"
+        else:
+            raise ValueError(f"split must be 'train' or 'test', got {split!r}")
+        name_A, name_B = sess.trial_types
+
+    proj_A = raw_A
+    proj_B = raw_B
+    title_suffix = ""
+
+    if restrict_window_per_trial is None and restrict_events is not None:
+        ev_start, ev_end = restrict_events
+        restrict_window_per_trial = compute_per_trial_event_offsets(
+            sess.session,
+            event_start=ev_start,
+            event_end=ev_end,
+            align=restrict_align,
+        )
+
+    if restrict_window_per_trial is not None:
+        proj_A = _mask_trace_per_trial(
+            raw_A, ids_A, sess.time, restrict_window_per_trial,
+            smooth_seconds=smooth_gauss, dt=sess.dt, smooth_mode=smooth_mode,
+        ) if raw_A.size else raw_A
+        proj_B = _mask_trace_per_trial(
+            raw_B, ids_B, sess.time, restrict_window_per_trial,
+            smooth_seconds=smooth_gauss, dt=sess.dt, smooth_mode=smooth_mode,
+        ) if raw_B.size else raw_B
+        if restrict_events is not None:
+            title_suffix = f" [{restrict_events[0]}\u2192{restrict_events[1]}]"
+        else:
+            title_suffix = " [per-trial window]"
+
+    # If per-trial restriction handled smoothing, skip it inside the heatmap.
+    hm_smooth = None if restrict_window_per_trial is not None else smooth_gauss
+
+    if xlim is None and restrict_window_per_trial:
+        starts = np.array([w[0] for w in restrict_window_per_trial.values()])
+        ends = np.array([w[1] for w in restrict_window_per_trial.values()])
+        xlim = (float(np.quantile(starts, 0.025)), float(np.quantile(ends, 0.975)))
+
+    # Optional random subsampling per class
+    if random_sample_trial_N is not None and random_sample_trial_N > 0:
+        rng = np.random.default_rng(random_sample_seed)
+
+        def _sample(arr: np.ndarray) -> np.ndarray:
+            if arr.ndim != 2 or arr.shape[0] <= random_sample_trial_N:
+                return arr
+            sel = rng.choice(arr.shape[0], size=random_sample_trial_N, replace=False)
+            return arr[np.sort(sel)]
+
+        proj_A = _sample(proj_A)
+        proj_B = _sample(proj_B)
+
+    plot_cd_heatmap(
+        sess.time,
+        proj_A,
+        proj_B if (isinstance(proj_B, np.ndarray) and proj_B.size) else None,
+        smooth=hm_smooth,
+        smooth_mode=smooth_mode,
+        dt=sess.dt,
+        sort_by=sort_by,
+        sort_window=sort_window,
+        sort_ascending=sort_ascending,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        vrange_quantile=vrange_quantile,
+        symmetric_colorbar=symmetric_colorbar,
+        labels=(name_A, name_B or "(none)"),
+        figsize=figsize,
+        xlim=xlim,
+        title=f"[{sess.session}] {split_lbl} Single-Trial CD Heatmap{title_suffix}",
     )
 
 
