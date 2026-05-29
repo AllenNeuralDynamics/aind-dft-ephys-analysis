@@ -1166,6 +1166,224 @@ def plot_cd_session_heatmap(
     )
 
 
+def plot_cd_session_bumps(
+    sess: CDSessionData,
+    *,
+    split: Literal["train", "test"] = "train",
+    trial_types: Optional[Sequence[str]] = None,
+    search_window: Tuple[float, float] = (0.0, 3.0),
+    polarity: Literal["pos", "neg", "both"] = "both",
+    smooth_sigma_sec: Optional[float] = 0.1,
+    min_amplitude: Optional[float] = None,
+    min_prominence: Optional[float] = 1.0,
+    min_width_sec: Optional[float] = 0.1,
+    max_per_trial: int = 1,
+    random_sample_trial_N: Optional[int] = None,
+    random_sample_seed: Optional[int] = 0,
+    restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
+    shape_window: Tuple[float, float] = (-1.0, 2.0),
+    xlim: Optional[Tuple[float, float]] = None,
+    cmap: str = "RdBu_r",
+    vrange_quantile: float = 0.99,
+    return_df: bool = False,
+) -> Optional[Dict[str, pd.DataFrame]]:
+    """Detect and visualize transient bumps in per-trial CD projections.
+
+    Mirrors :func:`plot_cd_session_heatmap` for trial selection
+    (``split`` / ``trial_types``), per-trial re-alignment
+    (``restrict_align`` vs build-time align), per-trial masking
+    (``restrict_events`` / ``restrict_window_per_trial``), and optional
+    random subsampling. Each class becomes one bump-detection figure plus
+    a printed median±IQR summary.
+
+    Parameters
+    ----------
+    search_window : (t0, t1), default (0, 3)
+        Time interval (seconds, in the same frame as the displayed traces,
+        i.e. after re-alignment) within which to search for the bump.
+    polarity, smooth_sigma_sec, min_amplitude, min_prominence,
+    min_width_sec, max_per_trial
+        Forwarded to :func:`ephys_dimension_reduction_CD_bump.detect_bumps`.
+    shape_window : (t0, t1)
+        Window (relative to each detected peak) used for the peak-aligned
+        mean ± SEM shape plot.
+    return_df : bool
+        If True, return ``{class_name: bumps_df}`` (in addition to plotting).
+    """
+    from ephys_dimension_reduction_CD_bump import (
+        detect_bumps, plot_bumps, summarize_bumps,
+    )
+
+    # ----- Trial selection (mirrors plot_cd_session_heatmap) -----
+    if trial_types is not None:
+        if sess.proj_all_trials.size == 0:
+            raise ValueError(
+                f"[{sess.session}] proj_all_trials is empty; rebuild CD zarr "
+                "to include projection_trace_all_trials."
+            )
+        if sess.behavior_df is None:
+            raise ValueError(f"[{sess.session}] behavior_df missing; cannot resolve trial_types.")
+        tt_list = [trial_types] if isinstance(trial_types, str) else list(trial_types)
+        if len(tt_list) not in (1, 2):
+            raise ValueError("trial_types must contain 1 or 2 column names.")
+
+        def _ids_from_df(col: str) -> np.ndarray:
+            if col not in sess.behavior_df.columns:
+                raise KeyError(
+                    f"[{sess.session}] column {col!r} not found in behavior CSV."
+                )
+            try:
+                return np.asarray(sess.behavior_df[col].iloc[0], dtype=int).ravel()
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"[{sess.session}] could not parse {col!r}: {e}") from e
+
+        def _select(col: str) -> Tuple[np.ndarray, np.ndarray]:
+            tids = _ids_from_df(col)
+            mask = np.isin(sess.trial_id_all_trials, tids)
+            return sess.proj_all_trials[mask], sess.trial_id_all_trials[mask]
+
+        raw_A, ids_A = _select(tt_list[0])
+        name_A = tt_list[0]
+        if len(tt_list) == 2:
+            raw_B, ids_B = _select(tt_list[1])
+            name_B = tt_list[1]
+        else:
+            raw_B = np.empty((0, sess.proj_all_trials.shape[1]), dtype=sess.proj_all_trials.dtype)
+            ids_B = np.empty(0, dtype=int)
+            name_B = ""
+        split_lbl = "All-trials CD"
+    else:
+        if split == "train":
+            raw_A, raw_B = sess.proj_train_A, sess.proj_train_B
+            ids_A, ids_B = sess.trial_id_train_A, sess.trial_id_train_B
+            split_lbl = "Train"
+        elif split == "test":
+            raw_A, raw_B = sess.proj_test_A, sess.proj_test_B
+            ids_A, ids_B = sess.trial_id_test_A, sess.trial_id_test_B
+            split_lbl = "Test (CV)"
+        else:
+            raise ValueError(f"split must be 'train' or 'test', got {split!r}")
+        name_A, name_B = sess.trial_types
+
+    proj_A = raw_A
+    proj_B = raw_B
+    title_suffix = ""
+
+    # ----- Per-trial re-alignment (same logic as plot_cd_session_heatmap) -----
+    realigned = False
+    if (
+        restrict_align is not None
+        and sess.build_align is not None
+        and restrict_align != sess.build_align
+    ):
+        try:
+            shifts = compute_per_trial_align_shifts(
+                sess.session,
+                from_align=sess.build_align,
+                to_align=restrict_align,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[warn] could not re-align {sess.session} "
+                f"({sess.build_align}->{restrict_align}): {e}"
+            )
+            shifts = {}
+        if shifts:
+            proj_A = _realign_traces(raw_A, ids_A, sess.dt, shifts) if raw_A.size else raw_A
+            proj_B = _realign_traces(raw_B, ids_B, sess.dt, shifts) if raw_B.size else raw_B
+            raw_A = proj_A
+            raw_B = proj_B
+            realigned = True
+
+    if restrict_window_per_trial is None and restrict_events is not None:
+        ev_start, ev_end = restrict_events
+        restrict_window_per_trial = compute_per_trial_event_offsets(
+            sess.session,
+            event_start=ev_start,
+            event_end=ev_end,
+            align=restrict_align,
+        )
+
+    if restrict_window_per_trial is not None:
+        proj_A = _mask_trace_per_trial(
+            raw_A, ids_A, sess.time, restrict_window_per_trial,
+            smooth_seconds=None, dt=sess.dt, smooth_mode="gaussian",
+        ) if raw_A.size else raw_A
+        proj_B = _mask_trace_per_trial(
+            raw_B, ids_B, sess.time, restrict_window_per_trial,
+            smooth_seconds=None, dt=sess.dt, smooth_mode="gaussian",
+        ) if raw_B.size else raw_B
+        if restrict_events is not None:
+            title_suffix = f" [{restrict_events[0]}\u2192{restrict_events[1]}]"
+        else:
+            title_suffix = " [per-trial window]"
+    if realigned:
+        title_suffix += f" (re-aligned to {restrict_align})"
+
+    if xlim is None and restrict_window_per_trial:
+        starts = np.array([w[0] for w in restrict_window_per_trial.values()])
+        ends = np.array([w[1] for w in restrict_window_per_trial.values()])
+        xlim = (float(np.quantile(starts, 0.025)), float(np.quantile(ends, 0.975)))
+
+    # Optional random subsampling per class (keep ids paired with traces).
+    if random_sample_trial_N is not None and random_sample_trial_N > 0:
+        rng = np.random.default_rng(random_sample_seed)
+
+        def _sample(arr: np.ndarray, ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            if arr.ndim != 2 or arr.shape[0] <= random_sample_trial_N:
+                return arr, ids
+            sel = np.sort(rng.choice(arr.shape[0], size=random_sample_trial_N, replace=False))
+            return arr[sel], ids[sel]
+
+        proj_A, ids_A = _sample(proj_A, ids_A)
+        proj_B, ids_B = _sample(proj_B, ids_B)
+
+    results: Dict[str, pd.DataFrame] = {}
+    for proj, ids, name in (
+        (proj_A, ids_A, name_A),
+        (proj_B, ids_B, name_B),
+    ):
+        if not (isinstance(proj, np.ndarray) and proj.ndim == 2 and proj.size and name):
+            continue
+        df = detect_bumps(
+            proj, sess.time,
+            trial_ids=ids, dt=sess.dt,
+            search_window=search_window,
+            polarity=polarity,
+            smooth_sigma_sec=smooth_sigma_sec,
+            min_amplitude=min_amplitude,
+            min_prominence=min_prominence,
+            min_width_sec=min_width_sec,
+            max_per_trial=max_per_trial,
+        )
+        summary = summarize_bumps(df)
+        n_trials = int(proj.shape[0])
+        n_trials_with_bump = int(df["trial_index"].nunique()) if not df.empty else 0
+        print(
+            f"\n[{sess.session}] {name}: {n_trials_with_bump}/{n_trials} "
+            f"trials with bump in {search_window} s"
+        )
+        if not summary.empty:
+            print(summary.to_string(index=False))
+        plot_bumps(
+            proj, sess.time, df,
+            dt=sess.dt,
+            cmap=cmap,
+            vrange_quantile=vrange_quantile,
+            xlim=xlim,
+            shape_window=shape_window,
+            title=(
+                f"[{sess.session}] {name} (n={n_trials}) — "
+                f"{split_lbl} bumps{title_suffix}"
+            ),
+        )
+        results[name] = df
+
+    return results if return_df else None
+
+
 def _plot_pair(
     time: np.ndarray, dt: float, A: Optional[np.ndarray], B: Optional[np.ndarray],
     *, title_prefix: str, distribution_window: Tuple[float, float],
