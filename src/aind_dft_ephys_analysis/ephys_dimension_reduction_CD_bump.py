@@ -401,3 +401,65 @@ def plot_bumps(
         fig.suptitle(title, fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.96 if title else 1))
     plt.show()
+
+
+def plot_inter_peak_intervals(
+    bumps_df: pd.DataFrame,
+    *,
+    title: str = "",
+    bins: int = 30,
+    max_ipi_sec: Optional[float] = None,
+) -> Optional[pd.DataFrame]:
+    """Per-polarity inter-peak-interval (IPI) distribution.
+
+    For each trial, sort that trial's peaks of one polarity by ``t_peak`` and
+    take consecutive differences. Trials with fewer than 2 peaks of that
+    polarity contribute nothing.
+
+    Returns a long-form DataFrame with columns
+    ``trial_id, trial_index, polarity, ipi_sec`` (or ``None`` if no IPIs).
+    Also shows a 2-panel histogram (pos / neg) with median markers.
+    """
+    if bumps_df is None or bumps_df.empty:
+        print("[ipi] no peaks; skip.")
+        return None
+
+    rows = []
+    for (tid, pol), sub in bumps_df.groupby(["trial_index", "polarity"]):
+        if len(sub) < 2:
+            continue
+        ts = np.sort(sub["t_peak"].values)
+        ipis = np.diff(ts)
+        trial_id = int(sub["trial_id"].iloc[0])
+        for v in ipis:
+            rows.append({
+                "trial_id": trial_id,
+                "trial_index": int(tid),
+                "polarity": pol,
+                "ipi_sec": float(v),
+            })
+    ipi_df = pd.DataFrame(rows)
+    if ipi_df.empty:
+        print("[ipi] no trials with >= 2 peaks of either polarity; skip.")
+        return ipi_df
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.5), sharey=True)
+    for ax, pol, color in zip(axes, ("pos", "neg"), ("C3", "C0")):
+        sub = ipi_df[ipi_df["polarity"] == pol]["ipi_sec"]
+        ax.set_title(f"{pol} IPI (n={len(sub)})")
+        ax.set_xlabel("Inter-peak interval (s)")
+        if sub.empty:
+            ax.text(0.5, 0.5, "no IPIs", ha="center", va="center", transform=ax.transAxes)
+            continue
+        clipped = sub if max_ipi_sec is None else sub[sub <= max_ipi_sec]
+        ax.hist(clipped, bins=bins, color=color, alpha=0.75)
+        med = float(np.median(sub))
+        ax.axvline(med, color="k", lw=1, ls="--", label=f"median={med:.2f}s")
+        ax.legend(fontsize=8)
+    axes[0].set_ylabel("# IPIs")
+    if title:
+        fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.93 if title else 1))
+    plt.show()
+    return ipi_df
+

@@ -1215,7 +1215,7 @@ def plot_cd_session_bumps(
         If True, return ``{class_name: bumps_df}`` (in addition to plotting).
     """
     from ephys_dimension_reduction_CD_bump import (
-        detect_bumps, plot_bumps, summarize_bumps,
+        detect_bumps, plot_bumps, summarize_bumps, plot_inter_peak_intervals,
     )
 
     # ----- Trial selection (mirrors plot_cd_session_heatmap) -----
@@ -1382,6 +1382,10 @@ def plot_cd_session_bumps(
                 f"[{sess.session}] {name} (n={n_trials}) — "
                 f"{split_lbl} bumps{title_suffix}"
             ),
+        )
+        plot_inter_peak_intervals(
+            df,
+            title=f"[{sess.session}] {name} — IPI distribution{title_suffix}",
         )
         results[name] = df
 
