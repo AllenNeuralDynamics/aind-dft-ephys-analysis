@@ -41,7 +41,7 @@ def detect_bumps(
     min_amplitude: Optional[float] = None,
     min_prominence: Optional[float] = None,
     min_width_sec: Optional[float] = None,
-    max_per_trial: int = 1,
+    max_per_trial: int = 5,
 ) -> pd.DataFrame:
     """Detect transient bumps in single-trial projection traces.
 

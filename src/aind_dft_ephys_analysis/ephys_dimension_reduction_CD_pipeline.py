@@ -1177,7 +1177,7 @@ def plot_cd_session_bumps(
     min_amplitude: Optional[float] = None,
     min_prominence: Optional[float] = 1.0,
     min_width_sec: Optional[float] = 0.1,
-    max_per_trial: int = 1,
+    max_per_trial: int = 5,
     random_sample_trial_N: Optional[int] = None,
     random_sample_seed: Optional[int] = 0,
     restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
