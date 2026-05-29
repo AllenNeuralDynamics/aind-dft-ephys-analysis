@@ -873,6 +873,7 @@ def plot_cd_session_heatmap(
     vrange_quantile: float = 0.99,
     symmetric_colorbar: bool = True,
     figsize: Optional[Tuple[float, float]] = None,
+    threshold: Optional[float] = None,
 ) -> None:
     """Single-trial CD-projection heatmap for one session.
 
@@ -882,6 +883,9 @@ def plot_cd_session_heatmap(
     subsampling, but renders per-trial traces as a 2-D heatmap (one row per
     trial). Each class becomes its own panel; rows are sorted within each
     panel according to ``sort_by``.
+
+    ``threshold`` : if given (>0), any sample whose absolute value is below
+    ``threshold`` is set to 0 before plotting (NaNs are preserved).
     """
     # ----- Trial selection (mirrors plot_cd_session) -----
     if trial_types is not None:
@@ -1016,6 +1020,19 @@ def plot_cd_session_heatmap(
             proj_B = proj_B[o]
             ids_B = ids_B[o]
         hm_sort_by = "none"
+
+    # Apply threshold: zero out samples whose |value| < threshold (keep NaNs).
+    if threshold is not None and threshold > 0:
+        def _apply_threshold(arr: np.ndarray) -> np.ndarray:
+            if not isinstance(arr, np.ndarray) or arr.size == 0:
+                return arr
+            out = arr.astype(float, copy=True)
+            mask = np.isfinite(out) & (np.abs(out) < float(threshold))
+            out[mask] = 0.0
+            return out
+
+        proj_A = _apply_threshold(proj_A)
+        proj_B = _apply_threshold(proj_B)
 
     plot_cd_heatmap(
         sess.time,
