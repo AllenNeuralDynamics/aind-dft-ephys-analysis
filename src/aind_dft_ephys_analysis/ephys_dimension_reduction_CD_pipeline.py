@@ -349,6 +349,8 @@ class CDSessionData:
     trial_id_all_trials: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=int))
     # Raw behavior DataFrame (single-row per session) for trial-type lookups
     behavior_df: Optional[pd.DataFrame] = None
+    # Build-time align event (e.g. 'go_cue'); used by heatmap re-alignment.
+    build_align: Optional[str] = None
 
     def counts(self) -> Dict[str, int]:
         """Trial counts for each split × class × switch type."""
@@ -406,6 +408,7 @@ def load_cd_session(
 
     # Try to recover class labels from pipeline attrs written at build time.
     tt: Tuple[str, str] = ("Type A", "Type B")
+    build_align: Optional[str] = None
     pipeline_attrs = ds.attrs.get("pipeline")
     if isinstance(pipeline_attrs, str):
         try:
@@ -416,6 +419,9 @@ def load_cd_session(
         tt_list = pipeline_attrs.get("trial_types")
         if isinstance(tt_list, (list, tuple)) and len(tt_list) >= 2:
             tt = (str(tt_list[0]), str(tt_list[1]))
+        ba = pipeline_attrs.get("align")
+        if isinstance(ba, str):
+            build_align = ba
 
     # All-trials projections (optional; present only in newer zarrs)
     if "projection_trace_all_trials" in ds.data_vars:
@@ -443,6 +449,7 @@ def load_cd_session(
         proj_all_trials=proj_all,
         trial_id_all_trials=trial_id_all,
         behavior_df=df,
+        build_align=build_align,
     )
 
     def _col_ids(col: str) -> np.ndarray:
@@ -601,6 +608,76 @@ def compute_per_trial_event_offsets(
         if np.isfinite(s) and np.isfinite(e):
             out[int(i)] = (float(s), float(e))
     return out
+
+
+def compute_per_trial_align_shifts(
+    session_name: str,
+    *,
+    from_align: str,
+    to_align: str,
+) -> Dict[int, float]:
+    """Per-trial shift (seconds) to re-align data from ``from_align`` to ``to_align``.
+
+    Returns ``{trial_index: t_from_align[i] - t_to_align[i]}`` so that a sample
+    stored at offset ``t`` relative to ``from_align`` corresponds to offset
+    ``t + shift[i]`` relative to ``to_align``. Trials with NaN times are dropped.
+    """
+    from nwb_utils import NWBUtils
+    from behavior_utils import extract_event_timestamps
+
+    nwb_data = NWBUtils.read_ophys_or_behavior_nwb(session_name=session_name)
+    if nwb_data is None:
+        raise FileNotFoundError(f"Could not load NWB for session '{session_name}'.")
+    try:
+        t_from = np.asarray(extract_event_timestamps(nwb_data, from_align), dtype=float)
+        t_to = np.asarray(extract_event_timestamps(nwb_data, to_align), dtype=float)
+    finally:
+        try:
+            nwb_data.io.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    n = min(len(t_from), len(t_to))
+    out: Dict[int, float] = {}
+    for i in range(n):
+        s = t_from[i] - t_to[i]
+        if np.isfinite(s):
+            out[int(i)] = float(s)
+    return out
+
+
+def _realign_traces(
+    trace: np.ndarray,
+    trial_ids: np.ndarray,
+    dt: float,
+    shifts: Dict[int, float],
+) -> np.ndarray:
+    """Per-trial roll of ``trace`` rows by ``round(shift[id]/dt)`` bins.
+
+    Positive shift moves samples to later columns; vacated cells are filled
+    with NaN (no wrap-around). Trials missing from ``shifts`` become all-NaN.
+    """
+    if trace.ndim != 2 or trace.size == 0 or not np.isfinite(dt) or dt <= 0:
+        return trace
+    out = np.full_like(trace, np.nan, dtype=float)
+    n_cols = trace.shape[1]
+    for i, tid in enumerate(trial_ids):
+        s = shifts.get(int(tid))
+        if s is None or not np.isfinite(s):
+            continue
+        k = int(round(s / dt))
+        row = trace[i].astype(float, copy=False)
+        if k == 0:
+            out[i] = row
+        elif k > 0:
+            if k < n_cols:
+                out[i, k:] = row[:n_cols - k]
+        else:  # k < 0
+            kk = -k
+            if kk < n_cols:
+                out[i, :n_cols - kk] = row[kk:]
+    return out
+
 
 
 def _mask_trace_per_trial(
@@ -942,6 +1019,37 @@ def plot_cd_session_heatmap(
     proj_B = raw_B
     title_suffix = ""
 
+    # ----- Per-trial re-alignment from build-time align to restrict_align -----
+    # The CD zarr stores traces with time relative to the build-time `align`
+    # event (e.g. 'go_cue'). When the caller wants to view per-trial windows
+    # relative to a different event (e.g. 'trial_start'), each row must be
+    # shifted by the per-trial offset between the two events. Missing samples
+    # outside the stored PSTH range become NaN (no wrap-around).
+    realigned = False
+    if (
+        restrict_align is not None
+        and sess.build_align is not None
+        and restrict_align != sess.build_align
+    ):
+        try:
+            shifts = compute_per_trial_align_shifts(
+                sess.session,
+                from_align=sess.build_align,
+                to_align=restrict_align,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[warn] could not re-align {sess.session} "
+                f"({sess.build_align}->{restrict_align}): {e}"
+            )
+            shifts = {}
+        if shifts:
+            proj_A = _realign_traces(raw_A, ids_A, sess.dt, shifts) if raw_A.size else raw_A
+            proj_B = _realign_traces(raw_B, ids_B, sess.dt, shifts) if raw_B.size else raw_B
+            raw_A = proj_A
+            raw_B = proj_B
+            realigned = True
+
     if restrict_window_per_trial is None and restrict_events is not None:
         ev_start, ev_end = restrict_events
         restrict_window_per_trial = compute_per_trial_event_offsets(
@@ -964,6 +1072,8 @@ def plot_cd_session_heatmap(
             title_suffix = f" [{restrict_events[0]}\u2192{restrict_events[1]}]"
         else:
             title_suffix = " [per-trial window]"
+    if realigned:
+        title_suffix += f" (re-aligned to {restrict_align})"
 
     # If per-trial restriction handled smoothing, skip it inside the heatmap.
     hm_smooth = None if restrict_window_per_trial is not None else smooth_gauss
