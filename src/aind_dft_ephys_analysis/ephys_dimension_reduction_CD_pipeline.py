@@ -858,7 +858,7 @@ def plot_cd_session_heatmap(
     trial_types: Optional[Sequence[str]] = None,
     smooth_gauss: float = 0.1,
     smooth_mode: Literal["gaussian", "moving"] = "gaussian",
-    sort_by: Optional[Literal["mean", "peak_time", "peak_value", "none"]] = "mean",
+    sort_by: Optional[Literal["mean", "peak_time", "peak_value", "window_length", "none"]] = "mean",
     sort_window: Optional[Tuple[float, float]] = None,
     sort_ascending: bool = False,
     random_sample_trial_N: Optional[int] = None,
@@ -969,18 +969,53 @@ def plot_cd_session_heatmap(
         ends = np.array([w[1] for w in restrict_window_per_trial.values()])
         xlim = (float(np.quantile(starts, 0.025)), float(np.quantile(ends, 0.975)))
 
-    # Optional random subsampling per class
+    # Optional random subsampling per class (keep ids paired with traces).
     if random_sample_trial_N is not None and random_sample_trial_N > 0:
         rng = np.random.default_rng(random_sample_seed)
 
-        def _sample(arr: np.ndarray) -> np.ndarray:
+        def _sample(arr: np.ndarray, ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
             if arr.ndim != 2 or arr.shape[0] <= random_sample_trial_N:
-                return arr
+                return arr, ids
             sel = rng.choice(arr.shape[0], size=random_sample_trial_N, replace=False)
-            return arr[np.sort(sel)]
+            sel = np.sort(sel)
+            return arr[sel], ids[sel]
 
-        proj_A = _sample(proj_A)
-        proj_B = _sample(proj_B)
+        proj_A, ids_A = _sample(proj_A, ids_A)
+        proj_B, ids_B = _sample(proj_B, ids_B)
+
+    # Sort rows by per-trial restrict-window length (descending by default).
+    # When chosen, we reorder here and tell plot_cd_heatmap not to re-sort.
+    hm_sort_by: Optional[str] = sort_by
+    if sort_by == "window_length":
+        if restrict_window_per_trial is None:
+            raise ValueError(
+                "sort_by='window_length' requires restrict_events or "
+                "restrict_window_per_trial."
+            )
+
+        def _len_order(ids: np.ndarray) -> np.ndarray:
+            if ids.size == 0:
+                return np.arange(0, dtype=int)
+            lens = np.array([
+                (restrict_window_per_trial[int(t)][1] - restrict_window_per_trial[int(t)][0])
+                if int(t) in restrict_window_per_trial else np.nan
+                for t in ids
+            ], dtype=float)
+            # Push NaNs to the bottom regardless of direction.
+            order = np.argsort(np.where(np.isnan(lens), -np.inf if sort_ascending else np.inf, lens))
+            if not sort_ascending:
+                order = order[::-1]
+            return order
+
+        if isinstance(proj_A, np.ndarray) and proj_A.ndim == 2 and proj_A.size:
+            o = _len_order(ids_A)
+            proj_A = proj_A[o]
+            ids_A = ids_A[o]
+        if isinstance(proj_B, np.ndarray) and proj_B.ndim == 2 and proj_B.size:
+            o = _len_order(ids_B)
+            proj_B = proj_B[o]
+            ids_B = ids_B[o]
+        hm_sort_by = "none"
 
     plot_cd_heatmap(
         sess.time,
@@ -989,7 +1024,7 @@ def plot_cd_session_heatmap(
         smooth=hm_smooth,
         smooth_mode=smooth_mode,
         dt=sess.dt,
-        sort_by=sort_by,
+        sort_by=hm_sort_by,
         sort_window=sort_window,
         sort_ascending=sort_ascending,
         cmap=cmap,
