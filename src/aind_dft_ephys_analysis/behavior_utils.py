@@ -961,6 +961,12 @@ def find_trials(
         - 'switch_RL'                : switch from right → left
         - 'switch_RL_reward'         : right→left **and** rewarded
         - 'switch_RL_noreward'       : right→left **and not** rewarded
+        - 'L_L'                      : stay trials where previous **and** current choice were both left
+        - 'L_L_reward'               : L_L **and** rewarded
+        - 'L_L_noreward'             : L_L **and not** rewarded
+        - 'R_R'                      : stay trials where previous **and** current choice were both right
+        - 'R_R_reward'               : R_R **and** rewarded
+        - 'R_R_noreward'             : R_R **and not** rewarded
 
     Returns
     -------
@@ -991,6 +997,12 @@ def find_trials(
         'switch_RL',
         'switch_RL_reward',
         'switch_RL_noreward',
+        'L_L',
+        'L_L_reward',
+        'L_L_noreward',
+        'R_R',
+        'R_R_reward',
+        'R_R_noreward',
     }
     if trial_type in switch_types:
         switch_indices: List[int] = []
@@ -1003,6 +1015,8 @@ def find_trials(
             is_switch = (curr != prev)
             is_LR = (prev == 0 and curr == 1)
             is_RL = (prev == 1 and curr == 0)
+            is_LL = (prev == 0 and curr == 0)
+            is_RR = (prev == 1 and curr == 1)
             is_rew = bool(rewarded[idx])
 
             if trial_type == 'switch_trial' and is_switch:
@@ -1022,6 +1036,18 @@ def find_trials(
             elif trial_type == 'switch_RL_reward' and is_RL and is_rew:
                 switch_indices.append(idx)
             elif trial_type == 'switch_RL_noreward' and is_RL and not is_rew:
+                switch_indices.append(idx)
+            elif trial_type == 'L_L' and is_LL:
+                switch_indices.append(idx)
+            elif trial_type == 'L_L_reward' and is_LL and is_rew:
+                switch_indices.append(idx)
+            elif trial_type == 'L_L_noreward' and is_LL and not is_rew:
+                switch_indices.append(idx)
+            elif trial_type == 'R_R' and is_RR:
+                switch_indices.append(idx)
+            elif trial_type == 'R_R_reward' and is_RR and is_rew:
+                switch_indices.append(idx)
+            elif trial_type == 'R_R_noreward' and is_RR and not is_rew:
                 switch_indices.append(idx)
 
         return switch_indices
@@ -1157,6 +1183,12 @@ def generate_behavior_summary(
             'switch_RL',
             'switch_RL_reward',
             'switch_RL_noreward',
+            'L_L',
+            'L_L_reward',
+            'L_L_noreward',
+            'R_R',
+            'R_R_reward',
+            'R_R_noreward',
             'left_choice',
             'right_choice',
         ]
