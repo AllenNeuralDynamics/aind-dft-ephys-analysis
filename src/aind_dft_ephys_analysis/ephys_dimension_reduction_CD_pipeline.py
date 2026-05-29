@@ -1184,6 +1184,8 @@ def plot_cd_session_bumps(
     restrict_events: Optional[Tuple[str, str]] = None,
     restrict_align: Optional[str] = None,
     shape_window: Tuple[float, float] = (-1.0, 2.0),
+    baseline_window: Optional[Tuple[float, float]] = (-1.0, -0.3),
+    baseline_stat: Literal["median", "mean"] = "median",
     xlim: Optional[Tuple[float, float]] = None,
     cmap: str = "RdBu_r",
     vrange_quantile: float = 0.99,
@@ -1374,6 +1376,8 @@ def plot_cd_session_bumps(
             vrange_quantile=vrange_quantile,
             xlim=xlim,
             shape_window=shape_window,
+            baseline_window=baseline_window,
+            baseline_stat=baseline_stat,
             title=(
                 f"[{sess.session}] {name} (n={n_trials}) — "
                 f"{split_lbl} bumps{title_suffix}"

@@ -231,6 +231,8 @@ def plot_bumps(
     vrange_quantile: float = 0.99,
     xlim: Optional[Tuple[float, float]] = None,
     shape_window: Tuple[float, float] = (-1.0, 2.0),
+    baseline_window: Optional[Tuple[float, float]] = (-1.0, -0.3),
+    baseline_stat: Literal["median", "mean"] = "median",
     dt: Optional[float] = None,
 ) -> None:
     """Five-panel bump-detection summary for one trace matrix.
@@ -243,7 +245,11 @@ def plot_bumps(
     3. Histogram of signed peak amplitudes.
     4. Histogram of widths at half prominence (seconds).
     5. Mean ± SEM bump shape, peak-aligned (negative bumps are sign-flipped
-       so both polarities show as positive deflections).
+       so both polarities show as positive deflections). If
+       ``baseline_window`` is given (relative to peak, in shape-window
+       coordinates), each snippet is baseline-subtracted using
+       ``baseline_stat`` over that window before averaging, so both
+       polarities deflect from 0.
     """
     if traces.ndim != 2 or traces.size == 0:
         print("[bumps] empty traces; skip.")
@@ -337,6 +343,16 @@ def plot_bumps(
     pre_pts = int(round(win_pre / dt))   # negative
     post_pts = int(round(win_post / dt))
     rel_t = np.arange(pre_pts, post_pts + 1) * dt
+
+    # Indices within the snippet used for baseline subtraction.
+    bl_idx = None
+    if baseline_window is not None:
+        bl0, bl1 = baseline_window
+        bl_idx = np.where((rel_t >= bl0) & (rel_t <= bl1))[0]
+        if bl_idx.size == 0:
+            bl_idx = None
+    _bl_fn = np.nanmedian if baseline_stat == "median" else np.nanmean
+
     plotted_any = False
     if bumps_df is not None and not bumps_df.empty:
         for pol, color in (("pos", "C3"), ("neg", "C0")):
@@ -353,6 +369,10 @@ def plot_bumps(
                 seg = traces[i, lo:hi].astype(float)
                 if pol == "neg":
                     seg = -seg
+                if bl_idx is not None:
+                    bl_vals = seg[bl_idx]
+                    if np.any(np.isfinite(bl_vals)):
+                        seg = seg - _bl_fn(bl_vals)
                 chunks.append(seg)
             if not chunks:
                 continue
@@ -364,8 +384,15 @@ def plot_bumps(
             ax.fill_between(rel_t, mean - sem, mean + sem, color=color, alpha=0.25)
             plotted_any = True
     ax.axvline(0, color="k", lw=0.6)
+    if baseline_window is not None:
+        ax.axhline(0, color="gray", lw=0.5, ls=":")
+        ax.axvspan(baseline_window[0], baseline_window[1], color="gray", alpha=0.1)
     ax.set_xlabel("Time relative to peak (s)")
-    ax.set_ylabel("Projection (neg flipped)")
+    ylabel = "Projection (neg flipped"
+    if baseline_window is not None:
+        ylabel += f", baseline-subtracted [{baseline_window[0]:.2f},{baseline_window[1]:.2f}]s"
+    ylabel += ")"
+    ax.set_ylabel(ylabel)
     ax.set_title("Mean bump shape (peak-aligned, mean ± SEM)")
     if plotted_any:
         ax.legend(fontsize=8)
