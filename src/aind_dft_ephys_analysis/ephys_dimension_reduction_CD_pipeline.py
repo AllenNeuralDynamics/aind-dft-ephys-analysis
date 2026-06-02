@@ -53,7 +53,10 @@ import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
 
-from ephys_dimension_reduction_CD import coding_direction_from_psth
+from ephys_dimension_reduction_CD import (
+    coding_direction_from_psth,
+    common_action_axis_from_psth,
+)
 from ephys_dimension_reduction_CD_visualization import (
     plot_cd_window_distribution,
     plot_cd_projection,
@@ -87,17 +90,35 @@ def cd_save_path(
     trial_types: Sequence[str],
     time_window: Sequence[float],
     align: Optional[str] = None,
+    *,
+    axis_mode: str = "cd",
+    early_time_window: Optional[Sequence[float]] = None,
+    late_time_window: Optional[Sequence[float]] = None,
 ) -> Path:
     """Return the standard CD zarr path for a session/region/trial-types/window.
 
     If ``align`` is given, ``_ALIGN_{align}`` is appended just before ``.zarr``.
+    For ``axis_mode='common_action'`` (trial-type-agnostic temporal contrast),
+    the early/late windows are encoded in the filename via
+    ``_AXIS_common_action_E_{e0}_{e1}_L_{l0}_{l1}`` so common-action zarrs do
+    not collide with classic CD zarrs.
     The session-extraction regex (``^CD_(?P<session>.+?)_RG_``) is unaffected.
     """
     tw0, tw1 = time_window
     align_suffix = f"_ALIGN_{align}" if align else ""
+    if axis_mode == "common_action":
+        if early_time_window is None or late_time_window is None:
+            raise ValueError(
+                "early_time_window and late_time_window are required for axis_mode='common_action'."
+            )
+        e0, e1 = early_time_window
+        l0, l1 = late_time_window
+        axis_suffix = f"_AXIS_common_action_E_{e0}_{e1}_L_{l0}_{l1}"
+    else:
+        axis_suffix = ""
     return (
         Path(cd_root)
-        / f"CD_{session}_{region_lbl}_{trial_types[0]}_{trial_types[1]}_TW_{tw0}_{tw1}{align_suffix}.zarr"
+        / f"CD_{session}_{region_lbl}_{trial_types[0]}_{trial_types[1]}_TW_{tw0}_{tw1}{align_suffix}{axis_suffix}.zarr"
     )
 
 
@@ -152,19 +173,52 @@ def build_cd_for_session(
     random_state: int = 0,
     overwrite: bool = True,
     verbose: bool = True,
+    # ---- common-action axis options ----
+    axis_mode: Literal["cd", "common_action"] = "cd",
+    early_time_window: Optional[Tuple[float, float]] = None,
+    late_time_window: Optional[Tuple[float, float]] = None,
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
 ) -> List[Tuple[str, str, str, str]]:
     """
-    Build CD zarrs for a single session across every region-group × time-window.
+    Build CD (or common-action) zarrs for one session across every
+    region-group × time-window combo.
 
-    Returns a list of failures: ``[(session, region_label, scope, error_msg)]``.
+    Parameters (axis-related)
+    -------------------------
+    axis_mode : {'cd', 'common_action'}
+        - ``'cd'`` (default): classic class-discriminating coding direction
+          fit on ``time_window`` (uses ``trial_types`` A vs B).
+        - ``'common_action'``: trial-type-agnostic temporal contrast.
+          Axis = unit-norm of ``mean(R_late) - mean(R_early)`` across all
+          eligible trials. ``time_windows`` are still iterated and used only
+          as a bookkeeping/file-naming dimension (set to e.g. ``[(0,0)]`` if
+          you do not care).
+    early_time_window, late_time_window : (float, float)
+        Required when ``axis_mode='common_action'``. Both relative to ``align``.
+    restrict_events : (str, str) or None
+        Optional ``(event_start, event_end)`` pair. When given alongside
+        ``axis_mode='common_action'``, trials whose per-trial
+        ``[event_start, event_end]`` interval (offsets relative to
+        ``restrict_align``) does **not** fully contain both early and late
+        windows are excluded from the axis fit and from projection outputs.
+    restrict_align : str or None
+        Event used as the per-trial zero for ``restrict_events``. Defaults
+        to ``align`` if not given. (Window comparisons are converted to the
+        PSTH ``align`` frame internally.)
 
+    Returns
+    -------
+    list[tuple]
+        Failures ``[(session, region_label, scope, error_msg)]``.
+
+    Notes
+    -----
     ``metadata`` may be ``None`` or empty:
       * If ``None``, every region group is treated as "all units" (no filter
         per region), and the min-units check is skipped.
       * If a DataFrame is provided, it must contain the columns
-        ``sorted_session_name``, ``brain_region``, and ``unit_index``. Empty
-        DataFrames (or sessions absent from the table) yield zero units and
-        each region group is skipped.
+        ``sorted_session_name``, ``brain_region``, and ``unit_index``.
     """
     metadata_empty = metadata is None or len(metadata) == 0
     from create_psth import load_zarr
@@ -176,6 +230,12 @@ def build_cd_for_session(
     cd_root.mkdir(parents=True, exist_ok=True)
 
     failures: List[Tuple[str, str, str, str]] = []
+
+    if axis_mode == "common_action":
+        if early_time_window is None or late_time_window is None:
+            raise ValueError(
+                "axis_mode='common_action' requires early_time_window and late_time_window."
+            )
 
     try:
         psth_path = psth_root / f"{session}_{binsize}s.zarr"
@@ -190,6 +250,36 @@ def build_cd_for_session(
         if verbose:
             print(f"❌ ERROR loading session {session}: {e}")
         return failures
+
+    # Per-trial restrict-events offsets (relative to PSTH ``align``).
+    # Only needed when restrict_events is provided. Computed once per session.
+    eligible_trial_ids: Optional[np.ndarray] = None
+    if axis_mode == "common_action" and restrict_events is not None:
+        try:
+            offsets = compute_per_trial_event_offsets(
+                session,
+                event_start=restrict_events[0],
+                event_end=restrict_events[1],
+                align=align,
+            )
+            need_lo = float(min(early_time_window[0], late_time_window[0]))
+            need_hi = float(max(early_time_window[1], late_time_window[1]))
+            eligible = [
+                tid for tid, (s, e) in offsets.items()
+                if s <= need_lo and e >= need_hi
+            ]
+            eligible_trial_ids = np.asarray(sorted(eligible), dtype=int)
+            if verbose:
+                print(
+                    f"  restrict_events={restrict_events} (align={restrict_align or align}): "
+                    f"{len(eligible_trial_ids)}/{len(offsets)} trials cover "
+                    f"[{need_lo}, {need_hi}]"
+                )
+        except Exception as e:  # noqa: BLE001
+            failures.append((session, "restrict_events", "offset-load", str(e)))
+            if verbose:
+                print(f"❌ ERROR computing restrict_events offsets for {session}: {e}")
+            return failures
 
     for region_group in brain_regions_groups:
         region_lbl, region_print = region_label(region_group)
@@ -220,24 +310,56 @@ def build_cd_for_session(
             tw0, tw1 = time_window
             save_path = cd_save_path(
                 cd_root, session, region_lbl, trial_types, time_window, align=align,
+                axis_mode=axis_mode,
+                early_time_window=early_time_window,
+                late_time_window=late_time_window,
             )
             try:
-                out = coding_direction_from_psth(
-                    psth_da=psth_da,
-                    trial_ids_typeA=typeA_ids,
-                    trial_ids_typeB=typeB_ids,
-                    align=align,
-                    time_window=tuple(time_window),
-                    projection_time_window=projection_time_window,
-                    random_state=random_state,
-                    two_fold_cv=two_fold_cv,
-                    norm_mode=norm_mode,
-                    zscore_units=zscore_units,
-                    save_path=str(save_path),
-                    save_format="zarr",
-                    overwrite=overwrite,
-                    unit_ids=unit_indices,
-                )
+                if axis_mode == "common_action":
+                    out = common_action_axis_from_psth(
+                        psth_da=psth_da,
+                        align=align,
+                        early_time_window=tuple(early_time_window),
+                        late_time_window=tuple(late_time_window),
+                        projection_time_window=projection_time_window,
+                        eligible_trial_ids=eligible_trial_ids,
+                        trial_ids_typeA=typeA_ids,
+                        trial_ids_typeB=typeB_ids,
+                        random_state=random_state,
+                        two_fold_cv=two_fold_cv,
+                        norm_mode=norm_mode,
+                        zscore_units=zscore_units,
+                        save_path=str(save_path),
+                        save_format="zarr",
+                        overwrite=overwrite,
+                        unit_ids=unit_indices,
+                    )
+                    extra_attrs: Dict[str, Any] = dict(
+                        axis_mode="common_action",
+                        early_time_window=list(early_time_window),
+                        late_time_window=list(late_time_window),
+                        restrict_events=(list(restrict_events) if restrict_events else None),
+                        restrict_align=restrict_align,
+                        n_eligible=int(out.get("n_eligible", -1)),
+                    )
+                else:
+                    out = coding_direction_from_psth(
+                        psth_da=psth_da,
+                        trial_ids_typeA=typeA_ids,
+                        trial_ids_typeB=typeB_ids,
+                        align=align,
+                        time_window=tuple(time_window),
+                        projection_time_window=projection_time_window,
+                        random_state=random_state,
+                        two_fold_cv=two_fold_cv,
+                        norm_mode=norm_mode,
+                        zscore_units=zscore_units,
+                        save_path=str(save_path),
+                        save_format="zarr",
+                        overwrite=overwrite,
+                        unit_ids=unit_indices,
+                    )
+                    extra_attrs = dict(axis_mode="cd")
                 _write_pipeline_attrs(
                     save_path,
                     session=session,
@@ -255,6 +377,7 @@ def build_cd_for_session(
                     random_state=int(random_state),
                     n_units=(int(len(unit_indices)) if unit_indices is not None else -1),
                     unit_ids=(unit_indices.tolist() if unit_indices is not None else None),
+                    **extra_attrs,
                 )
                 if verbose:
                     print(

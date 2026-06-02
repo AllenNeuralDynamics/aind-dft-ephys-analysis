@@ -958,3 +958,364 @@ def coding_direction_from_psth(
 
     return out
 
+
+# ---------------------------------------------------------------------------
+# Common-action axis (trial-type-agnostic temporal contrast)
+# ---------------------------------------------------------------------------
+
+def common_action_axis_from_psth(
+    psth_da: xr.Dataset,
+    *,
+    align: str = "go_cue",
+    early_time_window: Tuple[float, float],
+    late_time_window: Tuple[float, float],
+    projection_time_window: Optional[Tuple[float, float]] = None,
+    eligible_trial_ids: Optional[Union[np.ndarray, List[int]]] = None,
+    trial_ids_typeA: Optional[Union[np.ndarray, List[int]]] = None,
+    trial_ids_typeB: Optional[Union[np.ndarray, List[int]]] = None,
+    random_state: int = 0,
+    two_fold_cv: bool = True,
+    norm_mode: str = "divide_sqrtN",
+    unit_ids: Optional[Union[np.ndarray, List[int]]] = None,
+    zscore_units: bool = False,
+    save_path: Optional[Union[str, Path]] = None,
+    save_format: str = "zarr",
+    overwrite: bool = True,
+) -> Dict:
+    """
+    Compute a **common action axis** as ``mean(late_window) - mean(early_window)``
+    per unit, averaged across trials and L2-normalized.
+
+    The axis is trial-type-agnostic: it captures the dominant population-vector
+    change between two epochs of the trial. ``trial_ids_typeA``/``B`` only
+    affect how output projections are *labeled* (for downstream A/B plots);
+    they do **not** restrict the axis fit.
+
+    Parameters
+    ----------
+    psth_da : xr.Dataset
+        PSTH dataset (same schema as :func:`coding_direction_from_psth`).
+    align : str, default 'go_cue'
+        Alignment used to interpret ``early_time_window``/``late_time_window``
+        and to extract the PSTH time cube.
+    early_time_window, late_time_window : (float, float)
+        Epoch boundaries (seconds, relative to ``align``) used to compute the
+        per-unit difference vector.
+    projection_time_window : (float, float) or None
+        Window for the time-resolved projection. ``None`` uses full time axis.
+    eligible_trial_ids : array-like of int or None
+        Restrict axis fit and projections to these trial IDs (typically the
+        trials whose ``restrict_events`` interval fully covers both windows;
+        computed upstream in the pipeline). ``None`` means use all trials.
+    trial_ids_typeA, trial_ids_typeB : array-like of int or None
+        Optional class labels for downstream A/B splits. Ignored for the axis.
+    random_state, two_fold_cv : as in :func:`coding_direction_from_psth`.
+    norm_mode, unit_ids, zscore_units : as in :func:`coding_direction_from_psth`.
+    save_path, save_format, overwrite : as in :func:`coding_direction_from_psth`.
+
+    Returns
+    -------
+    dict
+        Same key schema as :func:`coding_direction_from_psth` so downstream
+        loaders work unchanged. Notable: ``axis_w`` is the first-fold axis,
+        ``final_all['axis_w']`` is the all-eligible-trials axis; A/B splits
+        are derived by intersecting with ``trial_ids_typeA/B`` (empty if
+        those are not provided).
+    """
+    if early_time_window is None or late_time_window is None:
+        raise ValueError("early_time_window and late_time_window are required.")
+
+    # 1) Per-trial unit rates in each epoch (no z-score yet) + full time cube
+    early_ext = extract_trial_unit_rates(
+        psth_da, align=align, time_window=early_time_window,
+        zscore_units=False, unit_ids=unit_ids,
+    )
+    late_ext = extract_trial_unit_rates(
+        psth_da, align=align, time_window=late_time_window,
+        zscore_units=False, unit_ids=unit_ids,
+    )
+    R_early = early_ext["R"]               # (T_full, N)
+    R_late = late_ext["R"]                 # (T_full, N)
+    trial_ids_full = early_ext["trial_ids"]
+    unit_ids_selected = early_ext["unit_ids"]
+
+    cube_ext = extract_trial_unit_timecube(
+        psth_da, align=align, time_window=projection_time_window, unit_ids=unit_ids,
+    )
+    cube_full = cube_ext["cube"]           # (T_full, N, Tt)
+    time_vec = cube_ext["time"]
+
+    # 2) Eligible-trial mask
+    if eligible_trial_ids is None:
+        idx_eligible = np.arange(len(trial_ids_full))
+    else:
+        idx_eligible = _ids_to_indices(
+            trial_ids_full, np.asarray(eligible_trial_ids), require_all=False,
+        )
+        idx_eligible = np.sort(idx_eligible)
+    if idx_eligible.size < 2:
+        raise ValueError(
+            f"Need >=2 eligible trials for common-action axis; got {idx_eligible.size}."
+        )
+
+    # 3) Two-fold split of eligible trials (random halves)
+    rng = np.random.default_rng(random_state)
+    perm = rng.permutation(idx_eligible)
+    half = len(perm) // 2
+    fold_train_test = [(perm[:half], perm[half:])]
+    if two_fold_cv:
+        fold_train_test.append((perm[half:], perm[:half]))
+
+    def _fit_axis(idx_fit: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (w, mu, sigma) for the supplied trial-index set."""
+        R_e = R_early[idx_fit]
+        R_l = R_late[idx_fit]
+        if zscore_units:
+            R_pool = np.concatenate([R_e, R_l], axis=0)
+            mu = R_pool.mean(axis=0, keepdims=True)
+            sigma = R_pool.std(axis=0, keepdims=True) + 1e-9
+        else:
+            mu = np.zeros((1, R_e.shape[1]), dtype=R_e.dtype)
+            sigma = np.ones((1, R_e.shape[1]), dtype=R_e.dtype)
+        diff = ((R_l - mu) / sigma).mean(axis=0) - ((R_e - mu) / sigma).mean(axis=0)
+        return _unit_norm(diff), mu, sigma
+
+    # 4) Per-fold projections of held-out half
+    y_test_all, id_test_all, Yt_test_all = [], [], []
+    y_train_all, id_train_all, Yt_train_all = [], [], []
+    w_first_fold: Optional[np.ndarray] = None
+    for tr_idx, te_idx in fold_train_test:
+        if tr_idx.size == 0 or te_idx.size == 0:
+            continue
+        tr_idx = np.sort(tr_idx)
+        te_idx = np.sort(te_idx)
+        w, mu, sigma = _fit_axis(tr_idx)
+        if w_first_fold is None:
+            w_first_fold = w.copy()
+        # scalar fit-window projection = mean of (late-early) projections
+        proj_diff_tr = ((R_late[tr_idx] - mu) / sigma) @ w - ((R_early[tr_idx] - mu) / sigma) @ w
+        proj_diff_te = ((R_late[te_idx] - mu) / sigma) @ w - ((R_early[te_idx] - mu) / sigma) @ w
+        Yt_tr = np.tensordot((cube_full[tr_idx] - mu[:, :, None]) / sigma[:, :, None], w, axes=([1], [0]))
+        Yt_te = np.tensordot((cube_full[te_idx] - mu[:, :, None]) / sigma[:, :, None], w, axes=([1], [0]))
+        y_train_all.append(proj_diff_tr); id_train_all.append(trial_ids_full[tr_idx]); Yt_train_all.append(Yt_tr)
+        y_test_all.append(proj_diff_te);  id_test_all.append(trial_ids_full[te_idx]);  Yt_test_all.append(Yt_te)
+
+    y_train_all = np.concatenate(y_train_all) if y_train_all else np.zeros(0)
+    y_test_all  = np.concatenate(y_test_all)  if y_test_all  else np.zeros(0)
+    id_train_all = np.concatenate(id_train_all).astype(int) if id_train_all else np.zeros(0, dtype=int)
+    id_test_all  = np.concatenate(id_test_all).astype(int)  if id_test_all  else np.zeros(0, dtype=int)
+    Yt_train_all = np.concatenate(Yt_train_all, axis=0) if Yt_train_all else np.zeros((0, cube_full.shape[2]))
+    Yt_test_all  = np.concatenate(Yt_test_all,  axis=0) if Yt_test_all  else np.zeros((0, cube_full.shape[2]))
+
+    # 5) Post-hoc normalization (use TEST stats; mirror coding_direction_from_psth)
+    y_test_norm, Yt_test_norm, norm_mode_used, norm_factor, y_mean, y_std = _apply_norm(
+        y_test_all if y_test_all.size else y_train_all,
+        Yt_test_all if Yt_test_all.size else Yt_train_all,
+        norm_mode, N_units=len(unit_ids_selected),
+    )
+    if norm_mode_used in ("divide_sqrtN", "unit_variance_fit"):
+        y_tr_norm = y_train_all / norm_factor
+        Yt_tr_norm = Yt_train_all / norm_factor
+    elif norm_mode_used == "zscore_fit":
+        y_tr_norm = (y_train_all - y_mean) / norm_factor
+        Yt_tr_norm = (Yt_train_all - y_mean) / norm_factor
+    else:
+        y_tr_norm = y_train_all.copy(); Yt_tr_norm = Yt_train_all.copy()
+
+    # 6) Final axis fit on ALL eligible trials → project every trial in session
+    w_final_all, mu_all, sigma_all = _fit_axis(idx_eligible)
+    cube_full_z_all = (cube_full - mu_all[:, :, None]) / sigma_all[:, :, None]
+    Yt_full_raw = np.tensordot(cube_full_z_all, w_final_all, axes=([1], [0]))
+    y_full_raw = (
+        ((R_late - mu_all) / sigma_all) @ w_final_all
+        - ((R_early - mu_all) / sigma_all) @ w_final_all
+    )
+    if norm_mode_used in ("divide_sqrtN", "unit_variance_fit"):
+        projection_all_trials = y_full_raw / norm_factor
+        projection_trace_all_trials = Yt_full_raw / norm_factor
+    elif norm_mode_used == "zscore_fit":
+        projection_all_trials = (y_full_raw - y_mean) / norm_factor
+        projection_trace_all_trials = (Yt_full_raw - y_mean) / norm_factor
+    else:
+        projection_all_trials = y_full_raw.copy()
+        projection_trace_all_trials = Yt_full_raw.copy()
+    trial_ids_all_trials = trial_ids_full.astype(int)
+
+    # 7) Per-class slicing of train/test projections (for downstream A/B plots).
+    def _split_by_ids(y, Yt, ids, target):
+        if target is None or len(target) == 0 or len(ids) == 0:
+            return np.zeros(0, dtype=y.dtype), np.zeros((0, Yt.shape[1]), dtype=Yt.dtype), np.zeros(0, dtype=int)
+        mask = np.isin(ids, np.asarray(target, dtype=int))
+        return y[mask], Yt[mask], ids[mask].astype(int)
+
+    projection_train_A, projection_trace_train_A, trial_ids_train_A = _split_by_ids(
+        y_tr_norm, Yt_tr_norm, id_train_all, trial_ids_typeA,
+    )
+    projection_train_B, projection_trace_train_B, trial_ids_train_B = _split_by_ids(
+        y_tr_norm, Yt_tr_norm, id_train_all, trial_ids_typeB,
+    )
+    projection_test_A, projection_trace_test_A, trial_ids_test_A = _split_by_ids(
+        y_test_norm, Yt_test_norm, id_test_all, trial_ids_typeA,
+    )
+    projection_test_B, projection_trace_test_B, trial_ids_test_B = _split_by_ids(
+        y_test_norm, Yt_test_norm, id_test_all, trial_ids_typeB,
+    )
+
+    # Labels: +1 for typeA, -1 for typeB, 0 otherwise (for compatibility)
+    def _labels(ids):
+        lab = np.zeros(len(ids), dtype=float)
+        if trial_ids_typeA is not None:
+            lab[np.isin(ids, np.asarray(trial_ids_typeA, dtype=int))] = +1.0
+        if trial_ids_typeB is not None:
+            lab[np.isin(ids, np.asarray(trial_ids_typeB, dtype=int))] = -1.0
+        return lab
+    lab_train_all = _labels(id_train_all)
+    lab_test_all = _labels(id_test_all)
+
+    out = {
+        "axis_w": w_first_fold if w_first_fold is not None else w_final_all,
+        "axis_mode": "common_action",
+        "projection_test": y_test_norm,
+        "projection_trace_test": Yt_test_norm,
+        "labels_test": lab_test_all,
+        "trial_ids_test": id_test_all,
+        "projection_train": y_tr_norm,
+        "projection_trace_train": Yt_tr_norm,
+        "labels_train": lab_train_all,
+        "trial_ids_train": id_train_all,
+        "projection_train_A": projection_train_A,
+        "projection_trace_train_A": projection_trace_train_A,
+        "trial_ids_train_A": trial_ids_train_A,
+        "projection_train_B": projection_train_B,
+        "projection_trace_train_B": projection_trace_train_B,
+        "trial_ids_train_B": trial_ids_train_B,
+        "projection_test_A": projection_test_A,
+        "projection_trace_test_A": projection_trace_test_A,
+        "trial_ids_test_A": trial_ids_test_A,
+        "projection_test_B": projection_test_B,
+        "projection_trace_test_B": projection_trace_test_B,
+        "trial_ids_test_B": trial_ids_test_B,
+        "projection_all_trials": projection_all_trials,
+        "projection_trace_all_trials": projection_trace_all_trials,
+        "trial_ids_all_trials": trial_ids_all_trials,
+        "time_for_projection": time_vec,
+        "final_all": {
+            "axis_w": w_final_all,
+            "mu": mu_all,
+            "sigma": sigma_all,
+            "idx_all": idx_eligible,
+        },
+        "norm_mode": norm_mode_used,
+        "norm_factor": float(norm_factor),
+        "y_fit_mean": float(y_mean),
+        "y_fit_std": float(y_std),
+        "unit_ids": unit_ids_selected,
+        "align": align,
+        "early_time_window": early_time_window,
+        "late_time_window": late_time_window,
+        "projection_time_window": projection_time_window,
+        "n_eligible": int(len(idx_eligible)),
+    }
+
+    # 8) Optional save (zarr/nc/npz) — mirrors coding_direction_from_psth schema
+    if save_path is not None:
+        path = Path(save_path)
+        fmt = str(save_format).lower()
+        if fmt not in {"npz", "nc", "zarr"}:
+            raise ValueError("save_format must be one of {'npz','nc','zarr'}")
+
+        attrs_payload = {
+            "axis_mode": "common_action",
+            "align": align,
+            "early_time_window": list(early_time_window),
+            "late_time_window": list(late_time_window),
+            "projection_time_window": projection_time_window,
+            "two_fold_cv": bool(two_fold_cv),
+            "norm_mode": norm_mode_used,
+            "norm_factor": float(norm_factor),
+            "y_fit_mean": float(y_mean),
+            "y_fit_std": float(y_std),
+            "n_eligible": int(len(idx_eligible)),
+        }
+
+        if fmt == "npz":
+            np.savez_compressed(
+                path,
+                projection_test=y_test_norm,
+                projection_trace_test=Yt_test_norm,
+                projection_train=y_tr_norm,
+                projection_trace_train=Yt_tr_norm,
+                projection_train_A=projection_train_A,
+                projection_trace_train_A=projection_trace_train_A,
+                trial_ids_train_A=trial_ids_train_A,
+                projection_train_B=projection_train_B,
+                projection_trace_train_B=projection_trace_train_B,
+                trial_ids_train_B=trial_ids_train_B,
+                projection_test_A=projection_test_A,
+                projection_trace_test_A=projection_trace_test_A,
+                trial_ids_test_A=trial_ids_test_A,
+                projection_test_B=projection_test_B,
+                projection_trace_test_B=projection_trace_test_B,
+                trial_ids_test_B=trial_ids_test_B,
+                projection_all_trials=projection_all_trials,
+                projection_trace_all_trials=projection_trace_all_trials,
+                trial_ids_all_trials=trial_ids_all_trials,
+                labels_test=lab_test_all,
+                trial_ids_test=id_test_all,
+                labels_train=lab_train_all,
+                trial_ids_train=id_train_all,
+                time=time_vec,
+                axis_w_first_fold=out["axis_w"],
+                axis_w_all=w_final_all,
+                unit_ids=unit_ids_selected,
+                attrs_str=json.dumps(attrs_payload),
+            )
+        else:
+            ds = xr.Dataset(
+                data_vars={
+                    "projection_test": (("trial_test",), y_test_norm),
+                    "projection_trace_test": (("trial_test", "time"), Yt_test_norm),
+                    "labels_test": (("trial_test",), lab_test_all),
+                    "projection_train": (("trial_train",), y_tr_norm),
+                    "projection_trace_train": (("trial_train", "time"), Yt_tr_norm),
+                    "labels_train": (("trial_train",), lab_train_all),
+                    "projection_test_A": (("trial_test_A",), projection_test_A),
+                    "projection_trace_test_A": (("trial_test_A", "time"), projection_trace_test_A),
+                    "projection_test_B": (("trial_test_B",), projection_test_B),
+                    "projection_trace_test_B": (("trial_test_B", "time"), projection_trace_test_B),
+                    "projection_train_A": (("trial_train_A",), projection_train_A),
+                    "projection_trace_train_A": (("trial_train_A", "time"), projection_trace_train_A),
+                    "projection_train_B": (("trial_train_B",), projection_train_B),
+                    "projection_trace_train_B": (("trial_train_B", "time"), projection_trace_train_B),
+                    "projection_all_trials": (("trial_all",), projection_all_trials),
+                    "projection_trace_all_trials": (("trial_all", "time"), projection_trace_all_trials),
+                    "axis_w": (("unit",), out["axis_w"]),
+                    "axis_w_all": (("unit",), w_final_all),
+                },
+                coords={
+                    "trial_id_test": ("trial_test", id_test_all),
+                    "trial_id_train": ("trial_train", id_train_all),
+                    "trial_id_test_A": ("trial_test_A", trial_ids_test_A),
+                    "trial_id_test_B": ("trial_test_B", trial_ids_test_B),
+                    "trial_id_train_A": ("trial_train_A", trial_ids_train_A),
+                    "trial_id_train_B": ("trial_train_B", trial_ids_train_B),
+                    "trial_id_all": ("trial_all", trial_ids_all_trials),
+                    "time": ("time", np.asarray(time_vec, dtype=float)),
+                    "unit_id": ("unit", np.asarray(unit_ids_selected, dtype=int)),
+                },
+                attrs=attrs_payload,
+            )
+            if fmt == "nc":
+                ds.to_netcdf(path)
+            elif fmt == "zarr":
+                import shutil
+
+                if path.exists() and overwrite:
+                    shutil.rmtree(path)
+                ds.to_zarr(path, mode="w")
+
+        out["saved_to"] = str(path)
+        out["saved_format"] = fmt
+
+    return out
+
