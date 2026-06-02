@@ -463,3 +463,126 @@ def plot_inter_peak_intervals(
     plt.show()
     return ipi_df
 
+
+def plot_bump_density(
+    traces: np.ndarray,
+    time: np.ndarray,
+    bumps_df: pd.DataFrame,
+    *,
+    bin_width_sec: float = 0.25,
+    title: str = "",
+    xlim: Optional[Tuple[float, float]] = None,
+) -> Optional[pd.DataFrame]:
+    """Bump density (bumps / trial / second) over time, per polarity.
+
+    For each time bin of width ``bin_width_sec``:
+      - **numerator**   = number of detected bumps (from ``bumps_df``) whose
+        ``t_peak`` falls in that bin, per polarity.
+      - **denominator** = number of trials with valid (finite) data anywhere
+        in that bin, after restrict_events masking (NaN samples don't count).
+
+    Density is then ``numerator / (denominator * bin_width_sec)`` so units
+    are bumps per trial per second.
+
+    Returns a DataFrame with columns
+    ``bin_center, bin_left, bin_right, n_valid_trials, count_pos, count_neg,
+    density_pos, density_neg``.
+    """
+    if traces is None or traces.ndim != 2 or traces.size == 0:
+        print("[density] empty traces; skip.")
+        return None
+    if time.size < 2:
+        print("[density] time axis too short; skip.")
+        return None
+
+    t0 = float(time[0])
+    t1 = float(time[-1])
+    if xlim is not None:
+        t0 = max(t0, float(xlim[0]))
+        t1 = min(t1, float(xlim[1]))
+    if t1 <= t0:
+        print("[density] empty time range; skip.")
+        return None
+
+    edges = np.arange(t0, t1 + bin_width_sec, bin_width_sec)
+    if edges.size < 2:
+        print("[density] bin_width too large; skip.")
+        return None
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    n_bins = centers.size
+
+    # Per-bin denominator: count trials with ANY finite sample in the bin.
+    valid_mask = np.isfinite(traces)
+    n_valid_per_bin = np.zeros(n_bins, dtype=int)
+    for b in range(n_bins):
+        col_mask = (time >= edges[b]) & (time < edges[b + 1])
+        if not np.any(col_mask):
+            continue
+        # trial is "valid in bin" if any sample within the bin is finite
+        n_valid_per_bin[b] = int(np.sum(np.any(valid_mask[:, col_mask], axis=1)))
+
+    # Per-bin numerator: # bumps per polarity whose t_peak falls in bin.
+    count_pos = np.zeros(n_bins, dtype=int)
+    count_neg = np.zeros(n_bins, dtype=int)
+    if bumps_df is not None and not bumps_df.empty:
+        for pol, arr in (("pos", count_pos), ("neg", count_neg)):
+            sub = bumps_df[bumps_df["polarity"] == pol]
+            if sub.empty:
+                continue
+            t_peaks = sub["t_peak"].values
+            in_range = (t_peaks >= edges[0]) & (t_peaks < edges[-1])
+            if not np.any(in_range):
+                continue
+            idx = np.digitize(t_peaks[in_range], edges, right=False) - 1
+            idx = np.clip(idx, 0, n_bins - 1)
+            np.add.at(arr, idx, 1)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        density_pos = np.where(n_valid_per_bin > 0,
+                               count_pos / (n_valid_per_bin * bin_width_sec), np.nan)
+        density_neg = np.where(n_valid_per_bin > 0,
+                               count_neg / (n_valid_per_bin * bin_width_sec), np.nan)
+
+    df = pd.DataFrame({
+        "bin_center": centers,
+        "bin_left": edges[:-1],
+        "bin_right": edges[1:],
+        "n_valid_trials": n_valid_per_bin,
+        "count_pos": count_pos,
+        "count_neg": count_neg,
+        "density_pos": density_pos,
+        "density_neg": density_neg,
+    })
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(10, 5), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+
+    plotted = False
+    if np.any(count_pos > 0):
+        ax1.step(centers, density_pos, where="mid", color="C3", label="pos")
+        plotted = True
+    if np.any(count_neg > 0):
+        ax1.step(centers, density_neg, where="mid", color="C0", label="neg")
+        plotted = True
+    ax1.axvline(0, color="k", lw=0.6)
+    ax1.set_ylabel("Bump density (bumps / trial / s)")
+    ax1.set_title("Bump density vs time")
+    if plotted:
+        ax1.legend(fontsize=8)
+
+    ax2.fill_between(centers, 0, n_valid_per_bin, step="mid",
+                     color="gray", alpha=0.5)
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("# trials\nwith data")
+    if xlim is not None:
+        ax2.set_xlim(*xlim)
+
+    if title:
+        fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.94 if title else 1))
+    plt.show()
+    return df
+
+

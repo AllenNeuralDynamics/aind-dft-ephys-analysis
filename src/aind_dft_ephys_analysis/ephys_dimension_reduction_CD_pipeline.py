@@ -1186,6 +1186,7 @@ def plot_cd_session_bumps(
     shape_window: Tuple[float, float] = (-1.0, 2.0),
     baseline_window: Optional[Tuple[float, float]] = (-1.0, -0.3),
     baseline_stat: Literal["median", "mean"] = "median",
+    density_bin_width_sec: Optional[float] = 0.25,
     xlim: Optional[Tuple[float, float]] = None,
     cmap: str = "RdBu_r",
     vrange_quantile: float = 0.99,
@@ -1216,6 +1217,7 @@ def plot_cd_session_bumps(
     """
     from ephys_dimension_reduction_CD_bump import (
         detect_bumps, plot_bumps, summarize_bumps, plot_inter_peak_intervals,
+        plot_bump_density,
     )
 
     # ----- Trial selection (mirrors plot_cd_session_heatmap) -----
@@ -1387,6 +1389,13 @@ def plot_cd_session_bumps(
             df,
             title=f"[{sess.session}] {name} — IPI distribution{title_suffix}",
         )
+        if density_bin_width_sec is not None and density_bin_width_sec > 0:
+            plot_bump_density(
+                proj, sess.time, df,
+                bin_width_sec=density_bin_width_sec,
+                xlim=xlim,
+                title=f"[{sess.session}] {name} — bump density{title_suffix}",
+            )
         results[name] = df
 
     return results if return_df else None
