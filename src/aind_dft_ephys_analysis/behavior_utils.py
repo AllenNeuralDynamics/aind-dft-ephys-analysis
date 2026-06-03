@@ -1253,8 +1253,8 @@ def generate_behavior_summary(
         # naming convention parsed by `find_trials`:
         #   '{right|left}_choice_probability_{bigger|smaller}_{thr}_windowsize_{N}'
         cp_windows = [5, 10, 15, 20, 30]
-        cp_thresholds = [0.1,0.2,0.3,0.4,0.5, 0.6, 0.7, 0.8, 0.9]
-        for side in ('right'):
+        cp_thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+        for side in ('right', 'left'):
             for w in cp_windows:
                 for thr in cp_thresholds:
                     trial_types.append(
