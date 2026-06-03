@@ -1793,14 +1793,13 @@ def plot_cd_projection_box_by_choice_probability(
     highlight_trial_types: Sequence[str] = (),
     highlight_colors: Optional[Sequence[str]] = None,
     highlight_point_size: float = 36.0,
-    highlight_alpha: float = 0.9,
+    highlight_alpha: float = 0.45,
     restrict_events: Optional[Tuple[str, str]] = None,
     restrict_align: Optional[str] = None,
     ax: Optional[plt.Axes] = None,
     figsize: Tuple[float, float] = (7.0, 4.5),
     box_color: str = "#4C72B0",
-    line_color: str = "#C44E52",
-    point_size: float = 12.0,
+    line_color: Optional[str] = None,    point_size: float = 12.0,
     point_alpha: float = 0.35,
     title: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -1941,9 +1940,10 @@ def plot_cd_projection_box_by_choice_probability(
             else np.array([np.mean(v) for v in data])
         )
         order = np.argsort(positions)
+        line_c = line_color if line_color is not None else box_color
         ax.plot(
             positions[order], stats[order],
-            color=line_color, lw=1.8, marker="o", ms=4, zorder=3,
+            color=line_c, lw=1.8, marker="o", ms=4, zorder=3,
             label=f"{connect} per bin",
         )
 
