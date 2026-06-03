@@ -968,6 +968,19 @@ def find_trials(
         - 'R_R_reward'               : R_R **and** rewarded
         - 'R_R_noreward'             : R_R **and not** rewarded
 
+        **Sliding choice-probability thresholds** (parsed by pattern)
+        - 'choice_probability_bigger_{thr}_windowsize_{N}'
+        - 'choice_probability_smaller_{thr}_windowsize_{N}'
+        - 'right_choice_probability_{bigger|smaller}_{thr}_windowsize_{N}'
+        - 'left_choice_probability_{bigger|smaller}_{thr}_windowsize_{N}'
+
+            Returns trials whose causal sliding-window P(side) (window={N},
+            min_periods=1, no-response trials excluded from numerator and
+            denominator) is strictly bigger/smaller than {thr}.
+            Without a side prefix, defaults to P(right).
+            Example: 'choice_probability_bigger_0.7_windowsize_10' →
+            trials where P(right) over the last 10 responded trials is > 0.7.
+
     Returns
     -------
     List[int]
@@ -1076,8 +1089,50 @@ def find_trials(
     elif trial_type == 'right_unrewarded':
         mask = np.logical_and(resp == 1, ~rewarded)
         return np.where(mask)[0].tolist()
-    else:
-        raise ValueError(f"Unsupported trial_type '{trial_type}'")
+
+    # ----------------------------------------------------------------
+    # Sliding-window choice-probability thresholds, e.g.
+    #   'choice_probability_bigger_0.7_windowsize_10'
+    #   'right_choice_probability_smaller_0.3_windowsize_20'
+    #   'left_choice_probability_bigger_0.6_windowsize_5'
+    #
+    # P(side) is the per-trial sliding-window probability (causal window,
+    # min_periods=1, no-response trials excluded from both numerator and
+    # denominator). 'choice_probability_*' without a side prefix defaults
+    # to P(right).
+    # ----------------------------------------------------------------
+    import re as _re
+    m = _re.match(
+        r"^(?:(right|left)_)?choice_probability_(bigger|smaller)_"
+        r"([0-9]*\.?[0-9]+)_windowsize_(\d+)$",
+        trial_type,
+    )
+    if m:
+        side = m.group(1) or "right"
+        op = m.group(2)
+        thr = float(m.group(3))
+        win = int(m.group(4))
+        if win < 1:
+            raise ValueError(f"window size must be >= 1 in '{trial_type}'")
+        cp = compute_sliding_choice_probability(
+            resp,
+            window=win,
+            step=1,
+            min_periods=1,   # allow partial windows so every trial gets a value
+            causal=True,     # P(side) uses only past + current trials
+            side=side,
+            exclude_value=2,
+        )["choice_prob"]
+        if op == "bigger":
+            mask = cp > thr
+        else:  # smaller
+            mask = cp < thr
+        # Only emit indices for finite probabilities (windows with at least one
+        # responded trial). NaN means denominator was zero -> excluded.
+        mask = mask & np.isfinite(cp)
+        return np.where(mask)[0].tolist()
+
+    raise ValueError(f"Unsupported trial_type '{trial_type}'")
 
 
 def generate_behavior_summary(
@@ -1192,6 +1247,22 @@ def generate_behavior_summary(
             'left_choice',
             'right_choice',
         ]
+
+        # Sliding-window choice-probability threshold trial types.
+        # Built programmatically across thresholds and window sizes;
+        # naming convention parsed by `find_trials`:
+        #   '{right|left}_choice_probability_{bigger|smaller}_{thr}_windowsize_{N}'
+        cp_windows = [5, 10, 15, 20, 30]
+        cp_thresholds = [0.1,0.2,0.3,0.4,0.5, 0.6, 0.7, 0.8, 0.9]
+        for side in ('right'):
+            for w in cp_windows:
+                for thr in cp_thresholds:
+                    trial_types.append(
+                        f"{side}_choice_probability_bigger_{thr}_windowsize_{w}"
+                    )
+                    trial_types.append(
+                        f"{side}_choice_probability_smaller_{thr}_windowsize_{w}"
+                    )
 
     # ------------------------------------------------------------------
     # 2. Caches
