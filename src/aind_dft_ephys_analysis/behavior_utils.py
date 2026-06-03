@@ -2601,3 +2601,152 @@ def plot_reward_rates_vs_value_all_models(
 
             plt.tight_layout()
             plt.show()
+
+
+# ============================================================
+# Sliding-window reward rate
+# ============================================================
+
+def compute_sliding_reward_rate(
+    rewarded: Sequence[bool],
+    *,
+    window: int = 20,
+    step: int = 1,
+    min_periods: Optional[int] = None,
+    causal: bool = False,
+    responded: Optional[Sequence[bool]] = None,
+    denominator: str = "window",
+) -> Dict[str, np.ndarray]:
+    """
+    Compute a sliding-window average reward rate over a trial sequence.
+
+    Parameters
+    ----------
+    rewarded : array-like of bool/int (n_trials,)
+        Per-trial reward indicator (1 = rewarded, 0 = not).
+    window : int, default 20
+        Window length in trials.
+    step : int, default 1
+        Stride between successive window centers. ``step=1`` returns a value
+        for every trial; larger steps subsample.
+    min_periods : int or None, default None
+        Minimum number of trials inside a window required to emit a value.
+        ``None`` defaults to ``window`` (no partial-window edge values).
+        Use ``1`` to include partial windows at the start/end.
+    causal : bool, default False
+        If True, the window for trial ``i`` covers ``[i-window+1, i]``
+        (right-aligned / strictly past). If False (default), the window is
+        centered on trial ``i`` (``[i-window//2, i-window//2+window-1]``).
+    responded : array-like of bool/int (n_trials,) or None
+        Optional per-trial response mask. Only used when
+        ``denominator="responded"`` to exclude no-response (ignored) trials
+        from the denominator (numerator still counts only rewarded trials).
+    denominator : {"window", "responded"}, default "window"
+        - ``"window"``: rate = #rewards in window / #trials in window.
+        - ``"responded"``: rate = #rewards in window / #responded trials in
+          window. Returns NaN if no responded trials fall in the window.
+
+    Returns
+    -------
+    dict
+        ``trial_index`` : np.ndarray (n_out,)
+            Trial indices (0-based) at which each rate value is anchored.
+        ``reward_rate`` : np.ndarray (n_out,)
+            Reward rate per window (NaN where ``min_periods`` not met or
+            denominator is zero).
+        ``n_in_window`` : np.ndarray (n_out,) int
+            Number of trials contributing to the denominator at each output.
+    """
+    r = np.asarray(rewarded, dtype=float).ravel()
+    n = r.size
+    if window < 1:
+        raise ValueError("window must be >= 1")
+    if step < 1:
+        raise ValueError("step must be >= 1")
+    if denominator not in {"window", "responded"}:
+        raise ValueError("denominator must be 'window' or 'responded'")
+    if min_periods is None:
+        min_periods = window
+
+    if denominator == "responded":
+        if responded is None:
+            raise ValueError("responded array is required when denominator='responded'.")
+        mask_resp = np.asarray(responded, dtype=float).ravel()
+        if mask_resp.shape != r.shape:
+            raise ValueError("responded must have the same length as rewarded.")
+        num = r * mask_resp
+        den_per_trial = mask_resp
+    else:
+        num = r
+        den_per_trial = np.ones_like(r)
+
+    # Anchor trial indices
+    anchors = np.arange(0, n, step, dtype=int)
+    out_rate = np.full(anchors.size, np.nan, dtype=float)
+    out_n = np.zeros(anchors.size, dtype=int)
+
+    half = window // 2
+    for k, i in enumerate(anchors):
+        if causal:
+            lo = max(0, i - window + 1)
+            hi = i + 1
+        else:
+            lo = max(0, i - half)
+            hi = min(n, lo + window)
+            lo = max(0, hi - window)  # right-clip correction near end
+        n_in = hi - lo
+        if n_in < min_periods:
+            continue
+        denom = den_per_trial[lo:hi].sum()
+        out_n[k] = int(denom) if denominator == "responded" else int(n_in)
+        if denom <= 0:
+            continue
+        out_rate[k] = float(num[lo:hi].sum() / denom)
+
+    return {
+        "trial_index": anchors,
+        "reward_rate": out_rate,
+        "n_in_window": out_n,
+    }
+
+
+def compute_sliding_reward_rate_from_nwb(
+    nwb_data: Any,
+    *,
+    window: int = 20,
+    step: int = 1,
+    min_periods: Optional[int] = None,
+    causal: bool = False,
+    denominator: str = "window",
+) -> Dict[str, np.ndarray]:
+    """
+    Convenience wrapper around :func:`compute_sliding_reward_rate` that pulls
+    ``rewarded_historyL/R`` and ``animal_response`` from an NWB session.
+
+    Returns the same dict plus ``trial_start_time`` (seconds, from NWB
+    ``trials['start_time']``) at each anchor so you can plot reward rate vs
+    time as well as vs trial index.
+    """
+    trials = nwb_data.trials
+    rewardedL = np.asarray(trials['rewarded_historyL'][:], dtype=bool)
+    rewardedR = np.asarray(trials['rewarded_historyR'][:], dtype=bool)
+    rewarded = np.logical_or(rewardedL, rewardedR)
+    responses = np.asarray(trials['animal_response'][:])
+    responded = responses != 2  # 2 == no response (ignored) in the AIND task schema
+
+    out = compute_sliding_reward_rate(
+        rewarded,
+        window=window,
+        step=step,
+        min_periods=min_periods,
+        causal=causal,
+        responded=responded,
+        denominator=denominator,
+    )
+
+    try:
+        t_start = np.asarray(trials['start_time'][:], dtype=float)
+        out["trial_start_time"] = t_start[out["trial_index"]]
+    except Exception:  # noqa: BLE001
+        out["trial_start_time"] = np.full(out["trial_index"].shape, np.nan)
+    return out
