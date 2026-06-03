@@ -1790,6 +1790,10 @@ def plot_cd_projection_box_by_choice_probability(
     connect: Literal["median", "mean", "none"] = "median",
     show_scatter: bool = True,
     scatter_jitter: float = 0.015,
+    highlight_trial_types: Sequence[str] = (),
+    highlight_colors: Optional[Sequence[str]] = None,
+    highlight_point_size: float = 36.0,
+    highlight_alpha: float = 0.9,
     restrict_events: Optional[Tuple[str, str]] = None,
     restrict_align: Optional[str] = None,
     ax: Optional[plt.Axes] = None,
@@ -1829,7 +1833,7 @@ def plot_cd_projection_box_by_choice_probability(
         p_right=p_right,
         p_right_window=p_right_window,
         p_right_column=p_right_column,
-        highlight_trial_types=(),
+        highlight_trial_types=tuple(highlight_trial_types),
         restrict_events=restrict_events,
         restrict_align=restrict_align,
         ax=_ax_tmp,
@@ -1839,8 +1843,10 @@ def plot_cd_projection_box_by_choice_probability(
 
     p = np.asarray(res["p_right"], dtype=float)
     y = np.asarray(res["proj_mean"], dtype=float)
+    hl_masks_full = res.get("highlight_masks", {}) or {}
     finite = np.isfinite(p) & np.isfinite(y)
     p, y = p[finite], y[finite]
+    hl_masks = {name: np.asarray(m, dtype=bool)[finite] for name, m in hl_masks_full.items()}
     if p.size == 0:
         raise ValueError(f"[{sess.session}] no finite (P(right), projection) pairs to plot.")
 
@@ -1941,6 +1947,48 @@ def plot_cd_projection_box_by_choice_probability(
             label=f"{connect} per bin",
         )
 
+    # Highlighted trial-type overlays (use the same per-trial values, plotted
+    # on top of boxes with distinct colors and a small x-jitter).
+    if hl_masks:
+        default_palette = ["#C44E52", "#55A868", "#8172B3", "#CCB974", "#64B5CD", "#E377C2"]
+        palette = list(highlight_colors) if highlight_colors is not None else default_palette
+        rng_hl = np.random.default_rng(1)
+        # For each highlighted trial, locate its bin position to jitter around.
+        if bins is None:
+            keys_round_all = np.round(p, 6)
+            pos_lookup = {k: pos for k, pos in zip(np.unique(keys_round_all), np.sort(np.unique(keys_round_all)))}
+            # positions are the unique values themselves
+            def _bin_pos(pv: float) -> Optional[float]:
+                k = float(np.round(pv, 6))
+                return float(k) if k in pos_lookup else None
+        else:
+            edges = np.asarray(bins, dtype=float)
+            centers = 0.5 * (edges[:-1] + edges[1:])
+            kept_pos_set = set(np.round(positions, 6).tolist())
+            def _bin_pos(pv: float) -> Optional[float]:
+                i = int(np.clip(np.digitize([pv], edges, right=False)[0], 1, len(edges) - 1))
+                c = float(centers[i - 1])
+                return c if round(c, 6) in kept_pos_set else None
+
+        for j, (name, mask) in enumerate(hl_masks.items()):
+            if not mask.any():
+                continue
+            color = palette[j % len(palette)]
+            xs, ys = [], []
+            for pv, yv in zip(p[mask], y[mask]):
+                bp_pos = _bin_pos(float(pv))
+                if bp_pos is None:
+                    continue
+                xs.append(bp_pos + rng_hl.uniform(-scatter_jitter, scatter_jitter))
+                ys.append(yv)
+            if xs:
+                ax.scatter(
+                    xs, ys,
+                    s=highlight_point_size, c=color, alpha=highlight_alpha,
+                    edgecolors="white", linewidths=0.5, zorder=4,
+                    label=f"{name} (n={int(mask.sum())})",
+                )
+
     # Count annotations above the top whisker of each box
     y_top = ax.get_ylim()[1]
     for pos, vals in zip(positions, data):
@@ -1961,7 +2009,7 @@ def plot_cd_projection_box_by_choice_probability(
             + (f"  (window {p_right_window})" if p_right is None and p_right_column is None else "")
         )
     ax.set_title(title)
-    if connect != "none":
+    if connect != "none" or hl_masks:
         ax.legend(loc="best", fontsize=8, frameon=False)
     ax.grid(True, axis="y", alpha=0.25)
     plt.tight_layout()
@@ -1971,6 +2019,7 @@ def plot_cd_projection_box_by_choice_probability(
         "data": data,
         "counts": counts,
         "labels": labels,
+        "highlight_masks": hl_masks,
     }
 
 
