@@ -1778,6 +1778,202 @@ def plot_cd_projection_vs_choice_probability(
     }
 
 
+def plot_cd_projection_box_by_choice_probability(
+    sess: CDSessionData,
+    *,
+    window: Tuple[float, float],
+    p_right: Optional[np.ndarray] = None,
+    p_right_window: int = 10,
+    p_right_column: Optional[str] = None,
+    bins: Optional[Sequence[float]] = None,
+    min_count: int = 1,
+    connect: Literal["median", "mean", "none"] = "median",
+    show_scatter: bool = True,
+    scatter_jitter: float = 0.015,
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
+    ax: Optional[plt.Axes] = None,
+    figsize: Tuple[float, float] = (7.0, 4.5),
+    box_color: str = "#4C72B0",
+    line_color: str = "#C44E52",
+    point_size: float = 12.0,
+    point_alpha: float = 0.35,
+    title: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Box-plot of per-trial CD projection (averaged over ``window``) grouped
+    by P(right), with a line connecting the per-bin median/mean.
+
+    Parameters
+    ----------
+    bins : sequence of float, optional
+        Bin **edges** for grouping P(right). If ``None`` (default), the
+        function groups by the discrete unique values of P(right) — appropriate
+        because causal sliding windows produce values on a ``k / window`` grid.
+    min_count : int, default 1
+        Bins/values with fewer than this many trials are dropped.
+    connect : {'median', 'mean', 'none'}
+        Statistic plotted as a connecting line across boxes. ``'none'`` shows
+        boxes only.
+    show_scatter : bool, default True
+        Overlay individual trial dots (small, jittered along x).
+
+    All other parameters mirror
+    :func:`plot_cd_projection_vs_choice_probability`.
+    """
+    # Reuse the scatter helper to compute proj_mean and p_right per trial,
+    # but suppress its figure by passing a throwaway axes.
+    _fig_tmp, _ax_tmp = plt.subplots(figsize=(1, 1))
+    res = plot_cd_projection_vs_choice_probability(
+        sess,
+        window=window,
+        p_right=p_right,
+        p_right_window=p_right_window,
+        p_right_column=p_right_column,
+        highlight_trial_types=(),
+        restrict_events=restrict_events,
+        restrict_align=restrict_align,
+        ax=_ax_tmp,
+        show_correlation=False,
+    )
+    plt.close(_fig_tmp)
+
+    p = np.asarray(res["p_right"], dtype=float)
+    y = np.asarray(res["proj_mean"], dtype=float)
+    finite = np.isfinite(p) & np.isfinite(y)
+    p, y = p[finite], y[finite]
+    if p.size == 0:
+        raise ValueError(f"[{sess.session}] no finite (P(right), projection) pairs to plot.")
+
+    # ----- Group trials -----
+    if bins is None:
+        # Use discrete grid k/p_right_window. Round to 6 decimals to suppress
+        # floating-point artefacts in the unique() call.
+        keys_round = np.round(p, 6)
+        unique_keys = np.unique(keys_round)
+        groups = [(k, y[keys_round == k]) for k in unique_keys]
+        # x-position is the value itself; label too.
+        positions = np.array([k for k, _ in groups], dtype=float)
+        labels = [f"{k:.2f}" for k in positions]
+    else:
+        edges = np.asarray(bins, dtype=float)
+        # np.digitize: 1..len(edges)-1 means bin i covers [edges[i-1], edges[i])
+        idx = np.digitize(p, edges, right=False)
+        idx = np.clip(idx, 1, len(edges) - 1)
+        groups = []
+        positions = []
+        labels = []
+        for i in range(1, len(edges)):
+            sel = (idx == i)
+            if sel.sum() == 0:
+                continue
+            center = 0.5 * (edges[i - 1] + edges[i])
+            groups.append((center, y[sel]))
+            positions.append(center)
+            labels.append(f"[{edges[i-1]:.2f},{edges[i]:.2f})")
+        positions = np.asarray(positions, dtype=float)
+
+    # Drop sparse groups
+    kept = [(pos, vals, lbl)
+            for (pos, (_, vals)), lbl in zip(zip(positions, groups), labels)
+            if vals.size >= min_count]
+    if not kept:
+        raise ValueError(
+            f"[{sess.session}] no P(right) groups have >= {min_count} trials."
+        )
+    positions = np.array([k[0] for k in kept], dtype=float)
+    data = [k[1] for k in kept]
+    labels = [k[2] for k in kept]
+    counts = [v.size for v in data]
+
+    # Auto box width: a fraction of the smallest neighbor gap, capped.
+    if positions.size > 1:
+        gaps = np.diff(np.sort(positions))
+        gap = float(np.min(gaps[gaps > 0])) if np.any(gaps > 0) else 0.05
+    else:
+        gap = 0.05
+    box_width = max(min(0.6 * gap, 0.06), 0.01)
+
+    # ----- Plot -----
+    if ax is None:
+        _, ax = plt.subplots(figsize=figsize)
+
+    if show_scatter:
+        rng = np.random.default_rng(0)
+        for pos, vals in zip(positions, data):
+            jit = rng.uniform(-scatter_jitter, scatter_jitter, size=vals.size)
+            ax.scatter(
+                pos + jit, vals,
+                s=point_size, c=box_color, alpha=point_alpha,
+                edgecolors="none", zorder=1,
+            )
+
+    bp = ax.boxplot(
+        data,
+        positions=positions,
+        widths=box_width,
+        patch_artist=True,
+        showfliers=False,
+        manage_ticks=False,
+        zorder=2,
+    )
+    for patch in bp["boxes"]:
+        patch.set_facecolor(box_color)
+        patch.set_alpha(0.4)
+        patch.set_edgecolor("black")
+    for median in bp["medians"]:
+        median.set_color("black")
+        median.set_linewidth(1.4)
+    for whisker in bp["whiskers"]:
+        whisker.set_color("black")
+    for cap in bp["caps"]:
+        cap.set_color("black")
+
+    # Connecting line
+    if connect != "none":
+        stats = (
+            np.array([np.median(v) for v in data]) if connect == "median"
+            else np.array([np.mean(v) for v in data])
+        )
+        order = np.argsort(positions)
+        ax.plot(
+            positions[order], stats[order],
+            color=line_color, lw=1.8, marker="o", ms=4, zorder=3,
+            label=f"{connect} per bin",
+        )
+
+    # Count annotations above the top whisker of each box
+    y_top = ax.get_ylim()[1]
+    for pos, vals in zip(positions, data):
+        ax.text(
+            pos, y_top, f"n={vals.size}",
+            ha="center", va="bottom", fontsize=7, color="0.3",
+        )
+
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_xlabel(
+        "P(right) (sliding, causal)" if p_right_column is None and p_right is None
+        else (p_right_column or "P(right)")
+    )
+    ax.set_ylabel(f"mean CD projection in [{window[0]:g}, {window[1]:g}] s")
+    if title is None:
+        title = (
+            f"[{sess.session}] CD projection by P(right)"
+            + (f"  (window {p_right_window})" if p_right is None and p_right_column is None else "")
+        )
+    ax.set_title(title)
+    if connect != "none":
+        ax.legend(loc="best", fontsize=8, frameon=False)
+    ax.grid(True, axis="y", alpha=0.25)
+    plt.tight_layout()
+
+    return {
+        "positions": positions,
+        "data": data,
+        "counts": counts,
+        "labels": labels,
+    }
+
+
 def _plot_pair(
     time: np.ndarray, dt: float, A: Optional[np.ndarray], B: Optional[np.ndarray],
     *, title_prefix: str, distribution_window: Tuple[float, float],
