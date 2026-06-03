@@ -2750,3 +2750,113 @@ def compute_sliding_reward_rate_from_nwb(
     except Exception:  # noqa: BLE001
         out["trial_start_time"] = np.full(out["trial_index"].shape, np.nan)
     return out
+
+
+# ============================================================
+# Sliding-window choice probability (right-choice probability)
+# ============================================================
+
+def compute_sliding_choice_probability(
+    choices: Sequence[int],
+    *,
+    window: int = 20,
+    step: int = 1,
+    min_periods: Optional[int] = None,
+    causal: bool = False,
+    side: str = "right",
+    exclude_value: Optional[int] = 2,
+) -> Dict[str, np.ndarray]:
+    """
+    Compute a sliding-window choice probability over a trial sequence.
+
+    Encoding (matches the AIND ``animal_response`` convention):
+      * 0 = left choice
+      * 1 = right choice
+      * 2 = no response (excluded by default)
+
+    The mean of these 0/1 values inside a window equals the probability of
+    the "1" side. With ``side="right"`` (default) right choices are mapped
+    to 1; with ``side="left"`` left choices are mapped to 1.
+
+    Parameters
+    ----------
+    choices : array-like of int (n_trials,)
+        Per-trial choice in {0=left, 1=right, ``exclude_value``=ignore}.
+    window, step, min_periods, causal :
+        See :func:`compute_sliding_reward_rate` — same semantics.
+    side : {"right", "left"}, default "right"
+        Which choice is mapped to 1 (so the returned value is its probability).
+    exclude_value : int or None, default 2
+        Trial values to exclude from both numerator and denominator (i.e. they
+        do not count as either side). Set to ``None`` to keep all trials.
+
+    Returns
+    -------
+    dict
+        ``trial_index`` : np.ndarray (n_out,)
+            Trial indices at which each probability is anchored.
+        ``choice_prob`` : np.ndarray (n_out,)
+            P(side) per window; NaN where ``min_periods`` not met or no
+            responded trials fall in the window.
+        ``n_in_window`` : np.ndarray (n_out,) int
+            Number of responded trials in each window denominator.
+    """
+    if side not in {"right", "left"}:
+        raise ValueError("side must be 'right' or 'left'")
+    c = np.asarray(choices).ravel()
+    if exclude_value is not None:
+        responded = (c != exclude_value)
+    else:
+        responded = np.ones_like(c, dtype=bool)
+    # Per-trial "is side" indicator. Use float so masked entries can be 0.
+    target_val = 1 if side == "right" else 0
+    is_side = (c == target_val).astype(float)
+    # Reuse the reward-rate sliding helper for consistent windowing semantics.
+    out = compute_sliding_reward_rate(
+        is_side,
+        window=window,
+        step=step,
+        min_periods=min_periods,
+        causal=causal,
+        responded=responded,
+        denominator="responded",
+    )
+    return {
+        "trial_index": out["trial_index"],
+        "choice_prob": out["reward_rate"],
+        "n_in_window": out["n_in_window"],
+    }
+
+
+def compute_sliding_choice_probability_from_nwb(
+    nwb_data: Any,
+    *,
+    window: int = 20,
+    step: int = 1,
+    min_periods: Optional[int] = None,
+    causal: bool = False,
+    side: str = "right",
+) -> Dict[str, np.ndarray]:
+    """
+    Convenience wrapper that pulls ``animal_response`` from an NWB session
+    and computes :func:`compute_sliding_choice_probability`. No-response
+    trials (``animal_response == 2``) are excluded from both numerator and
+    denominator. Also returns ``trial_start_time`` at each anchor.
+    """
+    trials = nwb_data.trials
+    responses = np.asarray(trials['animal_response'][:])
+    out = compute_sliding_choice_probability(
+        responses,
+        window=window,
+        step=step,
+        min_periods=min_periods,
+        causal=causal,
+        side=side,
+        exclude_value=2,
+    )
+    try:
+        t_start = np.asarray(trials['start_time'][:], dtype=float)
+        out["trial_start_time"] = t_start[out["trial_index"]]
+    except Exception:  # noqa: BLE001
+        out["trial_start_time"] = np.full(out["trial_index"].shape, np.nan)
+    return out
