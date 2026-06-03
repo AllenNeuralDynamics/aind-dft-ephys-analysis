@@ -1524,6 +1524,260 @@ def plot_cd_session_bumps(
     return results if return_df else None
 
 
+# ---------------------------------------------------------------------------
+# Scatter: average CD projection vs P(right) per trial
+# ---------------------------------------------------------------------------
+
+def _reconstruct_animal_response_from_df(
+    df: pd.DataFrame, n_trials: int
+) -> np.ndarray:
+    """Build an animal_response vector (0=left, 1=right, 2=no-response) of
+    length ``n_trials`` from the trial-type columns stored by
+    ``generate_behavior_summary``.
+
+    Trials not appearing in any of the three columns default to 2 (no
+    response), which is the safe choice for sliding-window P(right).
+    """
+    resp = np.full(int(n_trials), 2, dtype=int)
+
+    def _ids(col: str) -> np.ndarray:
+        if col not in df.columns:
+            return np.empty(0, dtype=int)
+        try:
+            return np.asarray(df[col].iloc[0], dtype=int).ravel()
+        except Exception:  # noqa: BLE001
+            return np.empty(0, dtype=int)
+
+    left_ids = _ids("left_choice_trials")
+    right_ids = _ids("right_choice_trials")
+    if left_ids.size:
+        left_ids = left_ids[(left_ids >= 0) & (left_ids < n_trials)]
+        resp[left_ids] = 0
+    if right_ids.size:
+        right_ids = right_ids[(right_ids >= 0) & (right_ids < n_trials)]
+        resp[right_ids] = 1
+    return resp
+
+
+def plot_cd_projection_vs_choice_probability(
+    sess: CDSessionData,
+    *,
+    window: Tuple[float, float],
+    p_right: Optional[np.ndarray] = None,
+    p_right_window: int = 10,
+    p_right_column: Optional[str] = None,
+    highlight_trial_types: Sequence[str] = (),
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
+    ax: Optional[plt.Axes] = None,
+    figsize: Tuple[float, float] = (6.0, 4.5),
+    base_color: str = "0.6",
+    base_alpha: float = 0.45,
+    highlight_alpha: float = 0.9,
+    point_size: float = 28.0,
+    show_correlation: bool = True,
+    title: Optional[str] = None,
+) -> Dict[str, np.ndarray]:
+    """Per-trial scatter of CD projection (averaged over ``window``) vs P(right).
+
+    Each dot is one trial taken from ``sess.proj_all_trials``. By default the
+    x-axis (P(right)) is computed on the fly via
+    :func:`compute_sliding_choice_probability` (causal window of length
+    ``p_right_window``, no-response trials excluded) using ``animal_response``
+    reconstructed from ``sess.behavior_df``. Override by passing either:
+
+    - ``p_right`` : 1-D array indexed by absolute trial id (same convention as
+      the ids stored in ``sess.trial_id_all_trials``), or
+    - ``p_right_column`` : a column name in ``sess.behavior_df`` whose value
+      is such an array (e.g. a model-fitted ``right_choice_probability``).
+      If the column holds a responded-trial-only array, its values are
+      remapped onto absolute trial ids using ``right_choice_trials`` +
+      ``left_choice_trials``.
+
+    Trials whose ids appear in any column listed in ``highlight_trial_types``
+    are re-drawn on top with a distinct color per type.
+
+    Parameters
+    ----------
+    window : (t0, t1)
+        Time window (seconds, in the projection's align frame) over which the
+        per-trial projection is averaged. Set ``restrict_events`` to mask out
+        samples outside each trial's event interval before averaging.
+    p_right_window : int, default 10
+        Window length used when computing P(right) on the fly.
+    restrict_events : (event_start, event_end), optional
+        Per-trial masking via :func:`compute_per_trial_event_offsets`.
+    restrict_align : str, optional
+        Forwarded to :func:`compute_per_trial_event_offsets`.
+
+    Returns
+    -------
+    dict
+        ``{'trial_id', 'p_right', 'proj_mean', 'highlight_masks'}``.
+    """
+    if sess.proj_all_trials.size == 0:
+        raise ValueError(
+            f"[{sess.session}] proj_all_trials is empty; rebuild CD zarr to "
+            "include projection_trace_all_trials."
+        )
+    if sess.behavior_df is None:
+        raise ValueError(f"[{sess.session}] behavior_df missing.")
+
+    proj_all = sess.proj_all_trials
+    ids_all = np.asarray(sess.trial_id_all_trials, dtype=int)
+    time = sess.time
+    df = sess.behavior_df
+
+    # ----- Per-trial event masking (optional) -----
+    if restrict_events is not None:
+        ev_start, ev_end = restrict_events
+        per_trial_win = compute_per_trial_event_offsets(
+            sess.session,
+            event_start=ev_start,
+            event_end=ev_end,
+            align=restrict_align,
+        )
+        proj_masked = _mask_trace_per_trial(
+            proj_all, ids_all, time, per_trial_win,
+            smooth_seconds=0.0, dt=sess.dt, smooth_mode="gaussian",
+        )
+    else:
+        proj_masked = proj_all
+
+    # ----- Per-trial projection mean over `window` -----
+    t0, t1 = float(window[0]), float(window[1])
+    time_mask = (time >= t0) & (time <= t1)
+    if not time_mask.any():
+        raise ValueError(f"window {window} does not overlap session time axis.")
+    sub = proj_masked[:, time_mask]
+    with np.errstate(all="ignore"):
+        proj_mean = np.nanmean(sub, axis=1)
+
+    # ----- Build P(right) aligned to absolute trial ids -----
+    # Determine session-wide n_trials from behavior_df: the maximum id across
+    # the trial-type columns + 1 (plus any id we see in proj ids).
+    def _col_ids(col: str) -> np.ndarray:
+        if col not in df.columns:
+            return np.empty(0, dtype=int)
+        try:
+            return np.asarray(df[col].iloc[0], dtype=int).ravel()
+        except Exception:  # noqa: BLE001
+            return np.empty(0, dtype=int)
+
+    all_known_ids = [ids_all]
+    for c in ("left_choice_trials", "right_choice_trials", "no_response_trials"):
+        all_known_ids.append(_col_ids(c))
+    n_trials = int(max(int(arr.max()) for arr in all_known_ids if arr.size) + 1)
+
+    if p_right is not None:
+        p_arr = np.asarray(p_right, dtype=float).ravel()
+        if p_arr.size < n_trials:
+            p_arr = np.concatenate([p_arr, np.full(n_trials - p_arr.size, np.nan)])
+    elif p_right_column is not None:
+        if p_right_column not in df.columns:
+            raise KeyError(
+                f"[{sess.session}] column {p_right_column!r} not in behavior_df."
+            )
+        raw = np.asarray(df[p_right_column].iloc[0], dtype=float).ravel()
+        if raw.size == n_trials:
+            p_arr = raw
+        else:
+            # Treat as responded-trial-only series. Map by sorted union of
+            # left+right choice ids (the temporal order of responded trials).
+            responded_ids = np.sort(
+                np.concatenate([_col_ids("left_choice_trials"),
+                                _col_ids("right_choice_trials")])
+            )
+            p_arr = np.full(n_trials, np.nan, dtype=float)
+            n = min(raw.size, responded_ids.size)
+            p_arr[responded_ids[:n]] = raw[:n]
+    else:
+        # Reconstruct animal_response and compute sliding P(right) ourselves.
+        # Lazy import to avoid circular module loads at top of file.
+        from behavior_utils import compute_sliding_choice_probability
+
+        resp_vec = _reconstruct_animal_response_from_df(df, n_trials)
+        out = compute_sliding_choice_probability(
+            resp_vec,
+            window=int(p_right_window),
+            step=1,
+            min_periods=1,
+            causal=True,
+            side="right",
+            exclude_value=2,
+        )
+        p_arr = np.asarray(out["choice_prob"], dtype=float)
+
+    # Look up P(right) for each plotted trial id
+    valid_id_mask = (ids_all >= 0) & (ids_all < n_trials)
+    p_per_trial = np.full(ids_all.shape, np.nan, dtype=float)
+    p_per_trial[valid_id_mask] = p_arr[ids_all[valid_id_mask]]
+
+    # ----- Plot -----
+    if ax is None:
+        _, ax = plt.subplots(figsize=figsize)
+
+    finite = np.isfinite(p_per_trial) & np.isfinite(proj_mean)
+    ax.scatter(
+        p_per_trial[finite], proj_mean[finite],
+        s=point_size, c=base_color, alpha=base_alpha,
+        edgecolors="none", label=f"all trials (n={int(finite.sum())})",
+    )
+
+    # Highlight overlays
+    highlight_masks: Dict[str, np.ndarray] = {}
+    if highlight_trial_types:
+        cmap = plt.get_cmap("tab10")
+        for i, tt in enumerate(highlight_trial_types):
+            hl_ids = _col_ids(tt)
+            if hl_ids.size == 0:
+                print(f"[{sess.session}] highlight {tt!r}: no trials / column missing.")
+                highlight_masks[tt] = np.zeros(ids_all.shape, dtype=bool)
+                continue
+            mask = np.isin(ids_all, hl_ids) & finite
+            highlight_masks[tt] = mask
+            if not mask.any():
+                continue
+            color = cmap(i % 10)
+            ax.scatter(
+                p_per_trial[mask], proj_mean[mask],
+                s=point_size * 1.4, c=[color], alpha=highlight_alpha,
+                edgecolors="black", linewidths=0.6,
+                label=f"{tt} (n={int(mask.sum())})",
+            )
+
+    # Optional correlation annotation
+    if show_correlation and finite.sum() >= 3:
+        r = float(np.corrcoef(p_per_trial[finite], proj_mean[finite])[0, 1])
+        ax.text(
+            0.02, 0.98, f"r = {r:.2f}",
+            transform=ax.transAxes, ha="left", va="top",
+            fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.6", alpha=0.8),
+        )
+
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_xlabel("P(right) (sliding, causal)" if p_right_column is None and p_right is None
+                  else (p_right_column or "P(right)"))
+    ax.set_ylabel(f"mean CD projection in [{t0:g}, {t1:g}] s")
+    if title is None:
+        title = (
+            f"[{sess.session}] CD projection vs P(right)"
+            + (f"  (window {p_right_window})" if p_right is None and p_right_column is None else "")
+        )
+    ax.set_title(title)
+    ax.legend(loc="best", fontsize=8, frameon=False)
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+
+    return {
+        "trial_id": ids_all,
+        "p_right": p_per_trial,
+        "proj_mean": proj_mean,
+        "highlight_masks": highlight_masks,
+    }
+
+
 def _plot_pair(
     time: np.ndarray, dt: float, A: Optional[np.ndarray], B: Optional[np.ndarray],
     *, title_prefix: str, distribution_window: Tuple[float, float],
