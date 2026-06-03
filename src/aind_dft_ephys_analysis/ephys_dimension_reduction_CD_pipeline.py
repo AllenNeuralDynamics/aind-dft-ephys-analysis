@@ -470,6 +470,9 @@ class CDSessionData:
     # ALL-trials projections onto the final CD axis (may be empty for old zarrs)
     proj_all_trials: np.ndarray = field(default_factory=lambda: np.empty((0, 0)))
     trial_id_all_trials: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=int))
+    # Unbiased version: A/B entries replaced with their test-fold projection.
+    # Falls back to proj_all_trials when the zarr predates this field.
+    proj_unbiased_all_trials: np.ndarray = field(default_factory=lambda: np.empty((0, 0)))
     # Raw behavior DataFrame (single-row per session) for trial-type lookups
     behavior_df: Optional[pd.DataFrame] = None
     # Build-time align event (e.g. 'go_cue'); used by heatmap re-alignment.
@@ -556,6 +559,13 @@ def load_cd_session(
         proj_all = np.empty((0, len(time)))
         trial_id_all = np.empty(0, dtype=int)
 
+    # Unbiased all-trials projections (A/B replaced by test-fold). Older zarrs
+    # may lack this var — fall back to the in-sample all-trials projection.
+    if "projection_trace_unbiased_all_trials" in ds.data_vars:
+        proj_unbiased = _trace("projection_trace_unbiased_all_trials")
+    else:
+        proj_unbiased = proj_all
+
     sess = CDSessionData(
         session=session,
         time=time,
@@ -571,6 +581,7 @@ def load_cd_session(
         trial_types=tt,
         proj_all_trials=proj_all,
         trial_id_all_trials=trial_id_all,
+        proj_unbiased_all_trials=proj_unbiased,
         behavior_df=df,
         build_align=build_align,
     )
@@ -850,6 +861,29 @@ def _mask_trace_per_trial(
     return out
 
 
+def _pick_proj_all(
+    sess: CDSessionData,
+    projection_source: Literal["unbiased", "all"] = "unbiased",
+) -> np.ndarray:
+    """Return the all-trials projection trace selected by ``projection_source``.
+
+    - ``'unbiased'`` (default) returns ``sess.proj_unbiased_all_trials`` when
+      available (A/B entries replaced by their test-fold projection),
+      otherwise falls back to ``sess.proj_all_trials``.
+    - ``'all'`` returns the in-sample ``sess.proj_all_trials`` (final CD axis
+      fit on all A∪B trials; A/B entries are biased toward separation).
+    """
+    if projection_source not in ("unbiased", "all"):
+        raise ValueError(
+            f"projection_source must be 'unbiased' or 'all', got {projection_source!r}."
+        )
+    if projection_source == "unbiased":
+        pu = getattr(sess, "proj_unbiased_all_trials", None)
+        if pu is not None and pu.size > 0:
+            return pu
+    return sess.proj_all_trials
+
+
 def plot_cd_session(
     sess: CDSessionData,
     *,
@@ -866,6 +900,7 @@ def plot_cd_session(
     restrict_events: Optional[Tuple[str, str]] = None,
     restrict_align: Optional[str] = None,
     xlim: Optional[Tuple[float, float]] = None,
+    projection_source: Literal["unbiased", "all"] = "unbiased",
 ) -> None:
     """Run the standard 3-panel CD plot for a single session.
 
@@ -907,7 +942,8 @@ def plot_cd_session(
     """
     # ----- Build (raw_A, raw_B, ids_A, ids_B, split_lbl, name_A, name_B) -----
     if trial_types is not None:
-        if sess.proj_all_trials.size == 0:
+        proj_all_arr = _pick_proj_all(sess, projection_source)
+        if proj_all_arr.size == 0:
             raise ValueError(
                 f"[{sess.session}] proj_all_trials is empty; rebuild CD zarr "
                 "to include projection_trace_all_trials."
@@ -931,7 +967,7 @@ def plot_cd_session(
         def _select(col: str) -> Tuple[np.ndarray, np.ndarray]:
             tids = _ids_from_df(col)
             mask = np.isin(sess.trial_id_all_trials, tids)
-            return sess.proj_all_trials[mask], sess.trial_id_all_trials[mask]
+            return proj_all_arr[mask], sess.trial_id_all_trials[mask]
 
         raw_A, ids_A = _select(tt_list[0])
         name_A = tt_list[0]
@@ -939,10 +975,10 @@ def plot_cd_session(
             raw_B, ids_B = _select(tt_list[1])
             name_B = tt_list[1]
         else:
-            raw_B = np.empty((0, sess.proj_all_trials.shape[1]), dtype=sess.proj_all_trials.dtype)
+            raw_B = np.empty((0, proj_all_arr.shape[1]), dtype=proj_all_arr.dtype)
             ids_B = np.empty(0, dtype=int)
             name_B = ""
-        split_lbl = "All-trials CD"
+        split_lbl = f"All-trials CD ({projection_source})"
     else:
         if split == "train":
             raw_A, raw_B = sess.proj_train_A, sess.proj_train_B
@@ -1577,6 +1613,7 @@ def plot_cd_projection_vs_choice_probability(
     point_size: float = 28.0,
     show_correlation: bool = True,
     title: Optional[str] = None,
+    projection_source: Literal["unbiased", "all"] = "unbiased",
 ) -> Dict[str, np.ndarray]:
     """Per-trial scatter of CD projection (averaged over ``window``) vs P(right).
 
@@ -1623,7 +1660,7 @@ def plot_cd_projection_vs_choice_probability(
     if sess.behavior_df is None:
         raise ValueError(f"[{sess.session}] behavior_df missing.")
 
-    proj_all = sess.proj_all_trials
+    proj_all = _pick_proj_all(sess, projection_source)
     ids_all = np.asarray(sess.trial_id_all_trials, dtype=int)
     time = sess.time
     df = sess.behavior_df
@@ -1799,9 +1836,11 @@ def plot_cd_projection_box_by_choice_probability(
     ax: Optional[plt.Axes] = None,
     figsize: Tuple[float, float] = (7.0, 4.5),
     box_color: str = "#4C72B0",
-    line_color: Optional[str] = None,    point_size: float = 12.0,
+    line_color: Optional[str] = None,
+    point_size: float = 12.0,
     point_alpha: float = 0.35,
     title: Optional[str] = None,
+    projection_source: Literal["unbiased", "all"] = "unbiased",
 ) -> Dict[str, Any]:
     """Box-plot of per-trial CD projection (averaged over ``window``) grouped
     by P(right), with a line connecting the per-bin median/mean.
@@ -1837,6 +1876,7 @@ def plot_cd_projection_box_by_choice_probability(
         restrict_align=restrict_align,
         ax=_ax_tmp,
         show_correlation=False,
+        projection_source=projection_source,
     )
     plt.close(_fig_tmp)
 

@@ -769,6 +769,24 @@ def coding_direction_from_psth(
 
     trial_ids_all_trials = trial_ids_full.astype(int)
 
+    # ---- NEW: unbiased all-trials projections ----
+    # Same shape as projection_*_all_trials, but A/B trials are replaced by
+    # their TEST-fold projections (y_test_norm / Yt_test_norm). "Other"
+    # trials (not in A∪B) keep their in-sample value from the final-axis
+    # projection above. With two_fold_cv=True every A/B trial appears in some
+    # test fold so every A/B entry is replaced; otherwise the trials in the
+    # held-in fold remain in-sample.
+    projection_unbiased_all_trials = projection_all_trials.copy()
+    projection_trace_unbiased_all_trials = projection_trace_all_trials.copy()
+    if id_test_all.size > 0:
+        pos_map = {int(tid): pos for pos, tid in enumerate(trial_ids_all_trials)}
+        for j, tid in enumerate(id_test_all):
+            pos = pos_map.get(int(tid))
+            if pos is None:
+                continue
+            projection_unbiased_all_trials[pos] = y_test_norm[j]
+            projection_trace_unbiased_all_trials[pos] = Yt_test_norm[j]
+
     out = {
         # Axes & combined (normalized) outputs
         "axis_w": w_first_fold,
@@ -797,6 +815,9 @@ def coding_direction_from_psth(
         "projection_all_trials": projection_all_trials,
         "projection_trace_all_trials": projection_trace_all_trials,
         "trial_ids_all_trials": trial_ids_all_trials,
+        # ---- NEW: unbiased version (A/B replaced by test-fold) ----
+        "projection_unbiased_all_trials": projection_unbiased_all_trials,
+        "projection_trace_unbiased_all_trials": projection_trace_unbiased_all_trials,
         # Time & metrics
         "time_for_projection": time_vec,
         "metrics": {
@@ -894,6 +915,9 @@ def coding_direction_from_psth(
                 projection_all_trials=projection_all_trials,
                 projection_trace_all_trials=projection_trace_all_trials,
                 trial_ids_all_trials=trial_ids_all_trials,
+                # ---- NEW: unbiased version (A/B replaced by test-fold) ----
+                projection_unbiased_all_trials=projection_unbiased_all_trials,
+                projection_trace_unbiased_all_trials=projection_trace_unbiased_all_trials,
                 # meta
                 labels_test=lab_test_all,
                 trial_ids_test=id_test_all,
@@ -927,6 +951,9 @@ def coding_direction_from_psth(
                     # all trials (final CD axis fit on all A∪B)
                     "projection_all_trials": (("trial_all",), projection_all_trials),
                     "projection_trace_all_trials": (("trial_all", "time"), projection_trace_all_trials),
+                    # unbiased version (A/B entries replaced by test-fold projection)
+                    "projection_unbiased_all_trials": (("trial_all",), projection_unbiased_all_trials),
+                    "projection_trace_unbiased_all_trials": (("trial_all", "time"), projection_trace_unbiased_all_trials),
                     # axes
                     "axis_w": (("unit",), w_first_fold),
                     "axis_w_all": (("unit",), w_final_all),
@@ -1141,6 +1168,18 @@ def common_action_axis_from_psth(
         projection_trace_all_trials = Yt_full_raw.copy()
     trial_ids_all_trials = trial_ids_full.astype(int)
 
+    # ---- NEW: unbiased all-trials projections (replace A/B with test-fold) ----
+    projection_unbiased_all_trials = projection_all_trials.copy()
+    projection_trace_unbiased_all_trials = projection_trace_all_trials.copy()
+    if id_test_all.size > 0:
+        pos_map_ca = {int(tid): pos for pos, tid in enumerate(trial_ids_all_trials)}
+        for j, tid in enumerate(id_test_all):
+            pos = pos_map_ca.get(int(tid))
+            if pos is None:
+                continue
+            projection_unbiased_all_trials[pos] = y_test_norm[j]
+            projection_trace_unbiased_all_trials[pos] = Yt_test_norm[j]
+
     # 7) Per-class slicing of train/test projections (for downstream A/B plots).
     def _split_by_ids(y, Yt, ids, target):
         if target is None or len(target) == 0 or len(ids) == 0:
@@ -1198,6 +1237,8 @@ def common_action_axis_from_psth(
         "projection_all_trials": projection_all_trials,
         "projection_trace_all_trials": projection_trace_all_trials,
         "trial_ids_all_trials": trial_ids_all_trials,
+        "projection_unbiased_all_trials": projection_unbiased_all_trials,
+        "projection_trace_unbiased_all_trials": projection_trace_unbiased_all_trials,
         "time_for_projection": time_vec,
         "final_all": {
             "axis_w": w_final_all,
@@ -1260,6 +1301,8 @@ def common_action_axis_from_psth(
                 projection_all_trials=projection_all_trials,
                 projection_trace_all_trials=projection_trace_all_trials,
                 trial_ids_all_trials=trial_ids_all_trials,
+                projection_unbiased_all_trials=projection_unbiased_all_trials,
+                projection_trace_unbiased_all_trials=projection_trace_unbiased_all_trials,
                 labels_test=lab_test_all,
                 trial_ids_test=id_test_all,
                 labels_train=lab_train_all,
@@ -1289,6 +1332,8 @@ def common_action_axis_from_psth(
                     "projection_trace_train_B": (("trial_train_B", "time"), projection_trace_train_B),
                     "projection_all_trials": (("trial_all",), projection_all_trials),
                     "projection_trace_all_trials": (("trial_all", "time"), projection_trace_all_trials),
+                    "projection_unbiased_all_trials": (("trial_all",), projection_unbiased_all_trials),
+                    "projection_trace_unbiased_all_trials": (("trial_all", "time"), projection_trace_unbiased_all_trials),
                     "axis_w": (("unit",), out["axis_w"]),
                     "axis_w_all": (("unit",), w_final_all),
                 },
