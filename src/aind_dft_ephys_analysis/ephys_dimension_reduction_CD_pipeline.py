@@ -2134,6 +2134,7 @@ def plot_cd_projection_box_by_choice_probability_combined(
     restrict_align: Optional[str] = None,
     per_session_zscore: bool = False,
     session_normalize: Literal["none", "zscore", "demean", "robust"] = "none",
+    aggregate: Literal["trials", "session_medians", "session_means"] = "trials",
     ax: Optional[plt.Axes] = None,
     figsize: Tuple[float, float] = (7.0, 4.5),
     box_color: str = "#4C72B0",
@@ -2171,6 +2172,17 @@ def plot_cd_projection_box_by_choice_probability_combined(
             signal.
           - 'robust' : (y - median) / IQR per session. Like z-score but
             insensitive to outliers.
+    aggregate : {'trials','session_medians','session_means'}, default 'trials'
+        How each P(right) bin is summarized.
+          - 'trials'         : pool every trial across sessions, one box per
+            bin (original behavior). Bin counts can be dominated by sessions
+            with many trials.
+          - 'session_medians': compute per-session per-bin median first, then
+            box-plot those session medians within each bin. Each session
+            contributes one observation per bin (or zero if it has no trials
+            there). Recommended for cross-session trend visualization
+            because it removes within-session sample-size imbalance.
+          - 'session_means'  : same as 'session_medians' but uses the mean.
 
     All other parameters mirror
     :func:`plot_cd_projection_box_by_choice_probability`.
@@ -2233,9 +2245,33 @@ def plot_cd_projection_box_by_choice_probability_combined(
     if not ps:
         raise ValueError("No usable sessions produced (P(right), projection) pairs.")
 
-    p = np.concatenate(ps)
-    y = np.concatenate(ys)
-    hl_masks = {name: np.concatenate(masks) for name, masks in hl_accum.items() if masks}
+    # ----- Optional per-session-per-bin aggregation (cleaner cross-session trend) -----
+    if aggregate in ("session_medians", "session_means"):
+        if bins is None:
+            raise ValueError(
+                "aggregate='session_medians'/'session_means' requires explicit `bins` edges."
+            )
+        reducer = np.nanmedian if aggregate == "session_medians" else np.nanmean
+        edges_a = np.asarray(bins, dtype=float)
+        centers_a = 0.5 * (edges_a[:-1] + edges_a[1:])
+        agg_p: List[float] = []
+        agg_y: List[float] = []
+        for p_i, y_i in zip(ps, ys):
+            idx_i = np.digitize(p_i, edges_a, right=False)
+            idx_i = np.clip(idx_i, 1, len(edges_a) - 1)
+            for k in range(1, len(edges_a)):
+                sel = (idx_i == k)
+                if sel.sum() == 0:
+                    continue
+                agg_p.append(float(centers_a[k - 1]))
+                agg_y.append(float(reducer(y_i[sel])))
+        p = np.asarray(agg_p, dtype=float)
+        y = np.asarray(agg_y, dtype=float)
+        hl_masks = {}  # highlights don't survive this aggregation
+    else:
+        p = np.concatenate(ps)
+        y = np.concatenate(ys)
+        hl_masks = {name: np.concatenate(masks) for name, masks in hl_accum.items() if masks}
 
     norm_tag = {
         "none": "",
@@ -2244,10 +2280,16 @@ def plot_cd_projection_box_by_choice_probability_combined(
         "robust": "  [per-session robust z]",
     }[session_normalize]
     if title is None:
+        agg_tag = {
+            "trials": "",
+            "session_medians": "  [session medians]",
+            "session_means": "  [session means]",
+        }[aggregate]
         title = (
             f"Combined ({len(used)} sessions) — CD projection by P(right)"
             + (f"  (window {p_right_window})" if p_right_column is None else "")
             + norm_tag
+            + agg_tag
         )
     xlabel = (
         "P(right) (sliding, causal)" if p_right_column is None
