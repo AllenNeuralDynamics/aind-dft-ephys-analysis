@@ -1889,6 +1889,66 @@ def plot_cd_projection_box_by_choice_probability(
     if p.size == 0:
         raise ValueError(f"[{sess.session}] no finite (P(right), projection) pairs to plot.")
 
+    if title is None:
+        title = (
+            f"[{sess.session}] CD projection by P(right)"
+            + (f"  (window {p_right_window})" if p_right is None and p_right_column is None else "")
+        )
+    xlabel = (
+        "P(right) (sliding, causal)" if p_right_column is None and p_right is None
+        else (p_right_column or "P(right)")
+    )
+    return _render_pright_boxplot(
+        p=p,
+        y=y,
+        hl_masks=hl_masks,
+        bins=bins,
+        min_count=min_count,
+        connect=connect,
+        show_scatter=show_scatter,
+        scatter_jitter=scatter_jitter,
+        highlight_colors=highlight_colors,
+        highlight_point_size=highlight_point_size,
+        highlight_alpha=highlight_alpha,
+        ax=ax,
+        figsize=figsize,
+        box_color=box_color,
+        line_color=line_color,
+        point_size=point_size,
+        point_alpha=point_alpha,
+        title=title,
+        xlabel=xlabel,
+        ylabel=f"mean CD projection in [{window[0]:g}, {window[1]:g}] s",
+        empty_msg_prefix=f"[{sess.session}]",
+    )
+
+
+def _render_pright_boxplot(
+    *,
+    p: np.ndarray,
+    y: np.ndarray,
+    hl_masks: Dict[str, np.ndarray],
+    bins: Optional[Sequence[float]],
+    min_count: int,
+    connect: Literal["median", "mean", "none"],
+    show_scatter: bool,
+    scatter_jitter: float,
+    highlight_colors: Optional[Sequence[str]],
+    highlight_point_size: float,
+    highlight_alpha: float,
+    ax: Optional[plt.Axes],
+    figsize: Tuple[float, float],
+    box_color: str,
+    line_color: Optional[str],
+    point_size: float,
+    point_alpha: float,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    empty_msg_prefix: str = "",
+) -> Dict[str, Any]:
+    """Shared box-plot renderer used by per-session and combined entry points."""
+
     # ----- Group trials -----
     if bins is None:
         # Use discrete grid k/p_right_window. Round to 6 decimals to suppress
@@ -1923,7 +1983,7 @@ def plot_cd_projection_box_by_choice_probability(
             if vals.size >= min_count]
     if not kept:
         raise ValueError(
-            f"[{sess.session}] no P(right) groups have >= {min_count} trials."
+            f"{empty_msg_prefix} no P(right) groups have >= {min_count} trials."
         )
     positions = np.array([k[0] for k in kept], dtype=float)
     data = [k[1] for k in kept]
@@ -2038,16 +2098,8 @@ def plot_cd_projection_box_by_choice_probability(
         )
 
     ax.set_xlim(-0.02, 1.02)
-    ax.set_xlabel(
-        "P(right) (sliding, causal)" if p_right_column is None and p_right is None
-        else (p_right_column or "P(right)")
-    )
-    ax.set_ylabel(f"mean CD projection in [{window[0]:g}, {window[1]:g}] s")
-    if title is None:
-        title = (
-            f"[{sess.session}] CD projection by P(right)"
-            + (f"  (window {p_right_window})" if p_right is None and p_right_column is None else "")
-        )
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
     ax.set_title(title)
     if connect != "none" or hl_masks:
         ax.legend(loc="best", fontsize=8, frameon=False)
@@ -2061,6 +2113,150 @@ def plot_cd_projection_box_by_choice_probability(
         "labels": labels,
         "highlight_masks": hl_masks,
     }
+
+
+def plot_cd_projection_box_by_choice_probability_combined(
+    sessions_data: Sequence[CDSessionData],
+    *,
+    window: Tuple[float, float],
+    p_right_window: int = 10,
+    p_right_column: Optional[str] = None,
+    bins: Optional[Sequence[float]] = None,
+    min_count: int = 1,
+    connect: Literal["median", "mean", "none"] = "median",
+    show_scatter: bool = True,
+    scatter_jitter: float = 0.015,
+    highlight_trial_types: Sequence[str] = (),
+    highlight_colors: Optional[Sequence[str]] = None,
+    highlight_point_size: float = 36.0,
+    highlight_alpha: float = 0.45,
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
+    per_session_zscore: bool = False,
+    ax: Optional[plt.Axes] = None,
+    figsize: Tuple[float, float] = (7.0, 4.5),
+    box_color: str = "#4C72B0",
+    line_color: Optional[str] = None,
+    point_size: float = 12.0,
+    point_alpha: float = 0.35,
+    title: Optional[str] = None,
+    projection_source: Literal["unbiased", "all"] = "unbiased",
+) -> Dict[str, Any]:
+    """Pool CD-projection-vs-P(right) box plots across multiple sessions.
+
+    Per session, the per-trial (P(right), CD-projection) pairs are computed
+    the same way as :func:`plot_cd_projection_box_by_choice_probability`
+    (via the scatter helper) and then concatenated. The pooled values are
+    grouped and rendered with the same box-plot renderer.
+
+    Parameters
+    ----------
+    sessions_data : sequence of CDSessionData
+        Pre-loaded session objects (from :func:`load_cd_session`). Sessions
+        that raise during per-trial computation (missing behavior column,
+        empty proj_all_trials, etc.) are skipped with a warning.
+    per_session_zscore : bool, default False
+        If True, z-score the per-trial projection within each session before
+        pooling. Useful when sessions differ in CD-projection scale (e.g.
+        different unit counts) and you want to compare the *shape* of the
+        P(right)-vs-projection relationship rather than absolute magnitude.
+
+    All other parameters mirror
+    :func:`plot_cd_projection_box_by_choice_probability`.
+    """
+    if not sessions_data:
+        raise ValueError("sessions_data is empty.")
+
+    ps: List[np.ndarray] = []
+    ys: List[np.ndarray] = []
+    hl_accum: Dict[str, List[np.ndarray]] = {name: [] for name in highlight_trial_types}
+    used: List[str] = []
+
+    for sess in sessions_data:
+        try:
+            _fig_tmp, _ax_tmp = plt.subplots(figsize=(1, 1))
+            res = plot_cd_projection_vs_choice_probability(
+                sess,
+                window=window,
+                p_right_window=p_right_window,
+                p_right_column=p_right_column,
+                highlight_trial_types=tuple(highlight_trial_types),
+                restrict_events=restrict_events,
+                restrict_align=restrict_align,
+                ax=_ax_tmp,
+                show_correlation=False,
+                projection_source=projection_source,
+            )
+            plt.close(_fig_tmp)
+        except Exception as e:  # noqa: BLE001
+            print(f"[skip] {sess.session}: {e}")
+            continue
+
+        p_i = np.asarray(res["p_right"], dtype=float)
+        y_i = np.asarray(res["proj_mean"], dtype=float)
+        finite = np.isfinite(p_i) & np.isfinite(y_i)
+        p_i, y_i = p_i[finite], y_i[finite]
+        if p_i.size == 0:
+            continue
+        if per_session_zscore:
+            mu = float(np.nanmean(y_i))
+            sd = float(np.nanstd(y_i)) + 1e-12
+            y_i = (y_i - mu) / sd
+        ps.append(p_i)
+        ys.append(y_i)
+        masks_full = res.get("highlight_masks", {}) or {}
+        for name in highlight_trial_types:
+            m_full = np.asarray(masks_full.get(name, np.zeros(finite.size, dtype=bool)), dtype=bool)
+            hl_accum[name].append(m_full[finite])
+        used.append(sess.session)
+
+    if not ps:
+        raise ValueError("No usable sessions produced (P(right), projection) pairs.")
+
+    p = np.concatenate(ps)
+    y = np.concatenate(ys)
+    hl_masks = {name: np.concatenate(masks) for name, masks in hl_accum.items() if masks}
+
+    if title is None:
+        title = (
+            f"Combined ({len(used)} sessions) — CD projection by P(right)"
+            + (f"  (window {p_right_window})" if p_right_column is None else "")
+            + ("  [per-session z]" if per_session_zscore else "")
+        )
+    xlabel = (
+        "P(right) (sliding, causal)" if p_right_column is None
+        else (p_right_column or "P(right)")
+    )
+    ylabel = (
+        f"per-session z(CD projection) in [{window[0]:g}, {window[1]:g}] s"
+        if per_session_zscore
+        else f"mean CD projection in [{window[0]:g}, {window[1]:g}] s"
+    )
+    out = _render_pright_boxplot(
+        p=p,
+        y=y,
+        hl_masks=hl_masks,
+        bins=bins,
+        min_count=min_count,
+        connect=connect,
+        show_scatter=show_scatter,
+        scatter_jitter=scatter_jitter,
+        highlight_colors=highlight_colors,
+        highlight_point_size=highlight_point_size,
+        highlight_alpha=highlight_alpha,
+        ax=ax,
+        figsize=figsize,
+        box_color=box_color,
+        line_color=line_color,
+        point_size=point_size,
+        point_alpha=point_alpha,
+        title=title,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        empty_msg_prefix="[combined]",
+    )
+    out["sessions_used"] = used
+    return out
 
 
 def _plot_pair(
