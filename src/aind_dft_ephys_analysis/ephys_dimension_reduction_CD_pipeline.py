@@ -3703,7 +3703,7 @@ def plot_action_decoding_over_time(
     figsize: Tuple[float, float] = (11, 5),
     chance: float = 0.5,
     show: bool = True,
-) -> plt.Figure:
+) -> Optional[plt.Figure]:
     """Plot time-resolved decoder performance for the 4 action axes.
 
     Parameters
@@ -3722,6 +3722,10 @@ def plot_action_decoding_over_time(
         y-axis so you can see when balancing starts to drop sample size.
     chance
         Horizontal reference line.
+    show
+        If True, calls ``plt.show()`` and returns ``None`` (avoids the
+        Jupyter display hook re-rendering the returned ``Figure``). If
+        False, returns the ``Figure`` for further customization.
     """
     if axes is None:
         axes = [a for a in ACTION_AXES.keys() if a in df["axis"].unique()]
@@ -3774,4 +3778,5 @@ def plot_action_decoding_over_time(
     fig.tight_layout()
     if show:
         plt.show()
+        return None
     return fig
