@@ -3800,12 +3800,12 @@ def decode_prev_reward_over_time(
     for session in sessions:
         if verbose:
             print(f"\n=========== Session: {session} ===========")
-        zarr_path = psth_root / f"psth_results-{session}" / f"psth_binsize_{binsize}_align_{align}.zarr"
+        zarr_path = psth_root / f"{session}_{binsize}s.zarr"
         if not zarr_path.exists():
             print(f"  [skip] PSTH zarr missing: {zarr_path}")
             continue
         try:
-            psth_da = load_zarr(zarr_path)
+            psth_da = load_zarr(str(zarr_path))
         except Exception as e:  # noqa: BLE001
             print(f"  [skip] failed to load {zarr_path.name}: {e}")
             continue
