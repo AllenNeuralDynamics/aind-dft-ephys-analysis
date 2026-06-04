@@ -2959,3 +2959,403 @@ def plot_choice_prob_vs_activity(
     if show:
         plt.show()
     return results
+
+
+# ---------------------------------------------------------------------------
+# 4. DECODER (1D threshold classifier on CD projection)
+# ---------------------------------------------------------------------------
+
+def _window_mean(
+    trace: np.ndarray,
+    time: np.ndarray,
+    window: Tuple[float, float],
+) -> np.ndarray:
+    """Average a (n_trials, n_time) trace over a time window. NaNs ignored."""
+    if trace.size == 0:
+        return np.empty(0, dtype=float)
+    mask = (time >= window[0]) & (time <= window[1])
+    if not np.any(mask):
+        raise ValueError(
+            f"window {window} does not overlap trace time range "
+            f"[{time[0]:.3f}, {time[-1]:.3f}]."
+        )
+    seg = trace[:, mask]
+    with np.errstate(invalid="ignore"):
+        return np.nanmean(seg, axis=1)
+
+
+def _fit_threshold(
+    scores_a: np.ndarray,
+    scores_b: np.ndarray,
+    method: Literal["midpoint", "optimal"] = "optimal",
+) -> Tuple[float, int]:
+    """Find a 1D decision boundary separating class A from class B.
+
+    Returns
+    -------
+    (boundary, sign) : (float, int)
+        Decision rule: predict A iff ``sign * (score - boundary) > 0``.
+        ``sign = +1`` when mean(A) > mean(B), else ``-1``.
+    """
+    if scores_a.size == 0 or scores_b.size == 0:
+        raise ValueError("Both classes need at least one trial to fit a threshold.")
+    ma = float(np.nanmean(scores_a))
+    mb = float(np.nanmean(scores_b))
+    sign = 1 if ma >= mb else -1
+    if method == "midpoint":
+        return 0.5 * (ma + mb), sign
+    if method == "optimal":
+        # Scan all midpoints between consecutive sorted unique scores; pick the
+        # one with the highest balanced accuracy on (A, B).
+        all_scores = np.concatenate([scores_a, scores_b])
+        all_scores = all_scores[~np.isnan(all_scores)]
+        if all_scores.size == 0:
+            return 0.5 * (ma + mb), sign
+        srt = np.sort(np.unique(all_scores))
+        if srt.size < 2:
+            return float(srt[0]), sign
+        cands = 0.5 * (srt[:-1] + srt[1:])
+        # also consider the data extremes
+        cands = np.concatenate(([srt[0] - 1e-9, srt[-1] + 1e-9], cands))
+        best_bal = -np.inf
+        best_t = 0.5 * (ma + mb)
+        for t in cands:
+            if sign > 0:
+                tpr = np.mean(scores_a > t)
+                tnr = np.mean(scores_b <= t)
+            else:
+                tpr = np.mean(scores_a < t)
+                tnr = np.mean(scores_b >= t)
+            bal = 0.5 * (tpr + tnr)
+            if bal > best_bal:
+                best_bal = bal
+                best_t = float(t)
+        return best_t, sign
+    raise ValueError(f"Unknown threshold method: {method!r}")
+
+
+def _roc_auc_1d(
+    scores_a: np.ndarray,
+    scores_b: np.ndarray,
+    sign: int,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Compute ROC curve & AUC for 1D scores. Positive class = A.
+
+    Higher ``sign * score`` should indicate class A.
+    """
+    sa = sign * scores_a
+    sb = sign * scores_b
+    sa = sa[~np.isnan(sa)]
+    sb = sb[~np.isnan(sb)]
+    if sa.size == 0 or sb.size == 0:
+        return np.array([0.0, 1.0]), np.array([0.0, 1.0]), float("nan")
+    # Mann-Whitney U based AUC
+    all_s = np.concatenate([sa, sb])
+    labels = np.concatenate([np.ones_like(sa), np.zeros_like(sb)])
+    order = np.argsort(all_s, kind="mergesort")
+    s_sorted = all_s[order]
+    l_sorted = labels[order]
+    # rank with ties handled
+    ranks = np.empty_like(s_sorted, dtype=float)
+    i = 0
+    n = len(s_sorted)
+    while i < n:
+        j = i
+        while j + 1 < n and s_sorted[j + 1] == s_sorted[i]:
+            j += 1
+        ranks[i:j + 1] = 0.5 * (i + j) + 1.0
+        i = j + 1
+    n_pos = sa.size
+    n_neg = sb.size
+    sum_ranks_pos = ranks[l_sorted == 1].sum()
+    auc = (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+    # Build ROC curve by sweeping thresholds from high to low (predict A when
+    # score > threshold).
+    thresh_order = np.argsort(-all_s, kind="mergesort")
+    l_desc = labels[thresh_order]
+    tps = np.cumsum(l_desc == 1)
+    fps = np.cumsum(l_desc == 0)
+    tpr = np.concatenate(([0.0], tps / max(n_pos, 1)))
+    fpr = np.concatenate(([0.0], fps / max(n_neg, 1)))
+    return fpr, tpr, float(auc)
+
+
+@dataclass
+class CDDecoderResult:
+    """Outcome of a 1D threshold decoder on a CD projection."""
+    session: str
+    trial_types: Tuple[str, str]
+    window: Tuple[float, float]
+    method: str
+    boundary: float
+    sign: int                   # +1 if class A has higher score, else -1
+    train_scores_a: np.ndarray
+    train_scores_b: np.ndarray
+    test_scores_a: np.ndarray
+    test_scores_b: np.ndarray
+    train_accuracy: float
+    test_accuracy: float
+    train_balanced_accuracy: float
+    test_balanced_accuracy: float
+    test_confusion: np.ndarray  # 2x2 ints; rows = true [A,B], cols = pred [A,B]
+    test_auc: float
+    test_fpr: np.ndarray
+    test_tpr: np.ndarray
+
+
+def _predict(scores: np.ndarray, boundary: float, sign: int) -> np.ndarray:
+    """Return 1 for predicted-A, 0 for predicted-B."""
+    return ((sign * (scores - boundary)) > 0).astype(int)
+
+
+def decode_cd_session(
+    sess: CDSessionData,
+    *,
+    window: Tuple[float, float],
+    method: Literal["midpoint", "optimal"] = "optimal",
+) -> CDDecoderResult:
+    """Fit a 1D decision boundary on the **train** projections of a CD session
+    and evaluate it on the held-out **test** projections.
+
+    Parameters
+    ----------
+    sess
+        Output of :func:`load_cd_session`.
+    window
+        Time window (s) over which to average the projection trace to obtain
+        one scalar feature per trial.
+    method
+        ``"midpoint"`` uses 0.5*(mean(A)+mean(B)); ``"optimal"`` scans all
+        candidate thresholds and picks the one with the highest balanced
+        accuracy on the training projections.
+    """
+    train_a = _window_mean(sess.proj_train_A, sess.time, window)
+    train_b = _window_mean(sess.proj_train_B, sess.time, window)
+    test_a = _window_mean(sess.proj_test_A, sess.time, window)
+    test_b = _window_mean(sess.proj_test_B, sess.time, window)
+
+    boundary, sign = _fit_threshold(train_a, train_b, method=method)
+
+    # Train metrics
+    pa_tr = _predict(train_a, boundary, sign)
+    pb_tr = _predict(train_b, boundary, sign)
+    train_acc = (pa_tr.sum() + (1 - pb_tr).sum()) / max(pa_tr.size + pb_tr.size, 1)
+    train_bal = 0.5 * (
+        (pa_tr.mean() if pa_tr.size else 0.0)
+        + ((1 - pb_tr).mean() if pb_tr.size else 0.0)
+    )
+
+    # Test metrics
+    pa_te = _predict(test_a, boundary, sign)
+    pb_te = _predict(test_b, boundary, sign)
+    test_acc = (pa_te.sum() + (1 - pb_te).sum()) / max(pa_te.size + pb_te.size, 1)
+    test_bal = 0.5 * (
+        (pa_te.mean() if pa_te.size else 0.0)
+        + ((1 - pb_te).mean() if pb_te.size else 0.0)
+    )
+
+    # Confusion matrix on test
+    conf = np.array(
+        [
+            [int(pa_te.sum()), int((1 - pa_te).sum())],
+            [int(pb_te.sum()), int((1 - pb_te).sum())],
+        ],
+        dtype=int,
+    )
+
+    fpr, tpr, auc = _roc_auc_1d(test_a, test_b, sign)
+
+    return CDDecoderResult(
+        session=sess.session,
+        trial_types=sess.trial_types,
+        window=tuple(window),
+        method=str(method),
+        boundary=float(boundary),
+        sign=int(sign),
+        train_scores_a=train_a,
+        train_scores_b=train_b,
+        test_scores_a=test_a,
+        test_scores_b=test_b,
+        train_accuracy=float(train_acc),
+        test_accuracy=float(test_acc),
+        train_balanced_accuracy=float(train_bal),
+        test_balanced_accuracy=float(test_bal),
+        test_confusion=conf,
+        test_auc=float(auc),
+        test_fpr=fpr,
+        test_tpr=tpr,
+    )
+
+
+def decode_cd_session_over_time(
+    sess: CDSessionData,
+    *,
+    bin_window: float = 0.2,
+    step: Optional[float] = None,
+    method: Literal["midpoint", "optimal"] = "optimal",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Slide a small window across the trial and decode at each step.
+
+    Returns
+    -------
+    (centers, test_accuracy, test_auc) : tuple of 1D arrays
+        Length = number of windows. ``centers`` are the window midpoints (s).
+    """
+    if step is None:
+        step = max(sess.dt, bin_window / 4)
+    t0 = float(sess.time[0]) + bin_window / 2.0
+    t1 = float(sess.time[-1]) - bin_window / 2.0
+    if t1 <= t0:
+        raise ValueError(
+            f"bin_window {bin_window} too large for trace span "
+            f"[{sess.time[0]:.3f}, {sess.time[-1]:.3f}]."
+        )
+    centers = np.arange(t0, t1 + 1e-9, step)
+    accs = np.empty_like(centers)
+    aucs = np.empty_like(centers)
+    for i, c in enumerate(centers):
+        win = (c - bin_window / 2.0, c + bin_window / 2.0)
+        try:
+            r = decode_cd_session(sess, window=win, method=method)
+        except Exception:  # noqa: BLE001
+            accs[i] = np.nan
+            aucs[i] = np.nan
+            continue
+        accs[i] = r.test_accuracy
+        aucs[i] = r.test_auc
+    return centers, accs, aucs
+
+
+def plot_cd_decoder(
+    sess: CDSessionData,
+    *,
+    window: Tuple[float, float],
+    method: Literal["midpoint", "optimal"] = "optimal",
+    show_time_curve: bool = True,
+    time_curve_bin: float = 0.2,
+    time_curve_step: Optional[float] = None,
+    bins: int = 30,
+    figsize: Tuple[float, float] = (15, 9),
+    show: bool = True,
+) -> CDDecoderResult:
+    """Decode a CD session and produce a 2x2 (or 2x3) summary figure:
+
+    1. Train histogram + boundary
+    2. Test histogram + boundary (predictions colored)
+    3. ROC curve (test)
+    4. Confusion-matrix annotation + accuracy bars
+    5. (Optional) accuracy / AUC vs time
+
+    Returns the :class:`CDDecoderResult`.
+    """
+    r = decode_cd_session(sess, window=window, method=method)
+
+    have_time = show_time_curve and sess.time.size > 1
+    if have_time:
+        fig, axes = plt.subplots(2, 3, figsize=figsize)
+    else:
+        fig, axes = plt.subplots(2, 2, figsize=(figsize[0] * 2 / 3, figsize[1]))
+
+    label_a, label_b = r.trial_types
+    color_a, color_b = "tab:blue", "tab:orange"
+
+    # --- (1) Train histogram ---
+    ax = axes[0, 0]
+    train_all = np.concatenate([r.train_scores_a, r.train_scores_b])
+    if train_all.size:
+        edges = np.histogram_bin_edges(train_all, bins=bins)
+        ax.hist(r.train_scores_a, bins=edges, color=color_a, alpha=0.6, label=label_a)
+        ax.hist(r.train_scores_b, bins=edges, color=color_b, alpha=0.6, label=label_b)
+    ax.axvline(r.boundary, color="k", linestyle="--", lw=1.5, label=f"boundary={r.boundary:.3f}")
+    ax.set_xlabel("CD projection (train)")
+    ax.set_ylabel("Trials")
+    ax.set_title(
+        f"Train — acc={r.train_accuracy:.2%}, bal={r.train_balanced_accuracy:.2%}"
+    )
+    ax.legend(fontsize=8)
+
+    # --- (2) Test histogram ---
+    ax = axes[0, 1]
+    test_all = np.concatenate([r.test_scores_a, r.test_scores_b])
+    if test_all.size:
+        edges = np.histogram_bin_edges(test_all, bins=bins)
+        ax.hist(r.test_scores_a, bins=edges, color=color_a, alpha=0.6, label=label_a)
+        ax.hist(r.test_scores_b, bins=edges, color=color_b, alpha=0.6, label=label_b)
+    ax.axvline(r.boundary, color="k", linestyle="--", lw=1.5)
+    ax.set_xlabel("CD projection (test)")
+    ax.set_ylabel("Trials")
+    ax.set_title(
+        f"Test — acc={r.test_accuracy:.2%}, bal={r.test_balanced_accuracy:.2%}, "
+        f"AUC={r.test_auc:.3f}"
+    )
+    ax.legend(fontsize=8)
+
+    # --- (3) ROC ---
+    ax = axes[1, 0]
+    ax.plot(r.test_fpr, r.test_tpr, "-", color="tab:purple", lw=2,
+            label=f"AUC = {r.test_auc:.3f}")
+    ax.plot([0, 1], [0, 1], ":", color="gray", lw=1)
+    ax.set_xlabel(f"False positive rate ({label_b} called {label_a})")
+    ax.set_ylabel(f"True positive rate ({label_a} called {label_a})")
+    ax.set_title("ROC (test)")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.legend(loc="lower right", fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # --- (4) Confusion + summary bars ---
+    ax = axes[1, 1]
+    cm = r.test_confusion
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_xticks([0, 1], labels=[f"pred {label_a}", f"pred {label_b}"])
+    ax.set_yticks([0, 1], labels=[f"true {label_a}", f"true {label_b}"])
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center",
+                    color="black" if cm[i, j] < cm.max() / 2 else "white",
+                    fontsize=12, fontweight="bold")
+    ax.set_title(
+        f"Confusion (test)\nmethod={r.method}, window={window}"
+    )
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # --- (5) Decoding over time ---
+    if have_time:
+        centers, accs, aucs = decode_cd_session_over_time(
+            sess, bin_window=time_curve_bin, step=time_curve_step, method=method,
+        )
+        # Top-right (1,2): accuracy
+        ax = axes[0, 2]
+        ax.plot(centers, accs, "-", color="tab:green", lw=2, label="accuracy")
+        ax.axhline(0.5, color="gray", linestyle=":", lw=1)
+        ax.axvspan(window[0], window[1], color="orange", alpha=0.15,
+                   label=f"summary window")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Test accuracy")
+        ax.set_ylim(0, 1)
+        ax.set_title(f"Accuracy vs time ({time_curve_bin}s bin)")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        # Bottom-right (1,2): AUC
+        ax = axes[1, 2]
+        ax.plot(centers, aucs, "-", color="tab:purple", lw=2, label="AUC")
+        ax.axhline(0.5, color="gray", linestyle=":", lw=1)
+        ax.axvspan(window[0], window[1], color="orange", alpha=0.15)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Test AUC")
+        ax.set_ylim(0, 1)
+        ax.set_title("AUC vs time")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle(
+        f"CD decoder — {sess.session}\n"
+        f"{label_a} vs {label_b}",
+        y=1.02,
+    )
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return r
