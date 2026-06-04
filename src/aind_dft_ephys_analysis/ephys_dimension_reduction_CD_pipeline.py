@@ -3359,3 +3359,402 @@ def plot_cd_decoder(
     if show:
         plt.show()
     return r
+
+
+# ---------------------------------------------------------------------------
+# 5. TIME-RESOLVED 4-axis DECODER (CD re-fit per bin, with eligibility &
+#    per-bin re-balancing)
+# ---------------------------------------------------------------------------
+
+def _balance_cells_from_ids(
+    cell_ids: Dict[str, np.ndarray],
+    eligible: Optional[np.ndarray],
+    *,
+    n_per_cell: Optional[int],
+    seed: int,
+) -> Tuple[Dict[str, np.ndarray], int]:
+    """In-memory variant of :func:`_balance_action_cells`.
+
+    Intersects each cell with ``eligible`` (if given), then subsamples each to
+    a common ``n = min(...)`` (or ``n_per_cell`` if forced).
+    Returns ``(balanced_ids, n_used_per_cell)``. Returns empty arrays and 0
+    if any cell ends up empty.
+    """
+    filt: Dict[str, np.ndarray] = {}
+    for cell, ids in cell_ids.items():
+        ids = np.asarray(ids, dtype=int).ravel()
+        ids = ids[ids >= 0]
+        if eligible is not None:
+            ids = np.intersect1d(ids, eligible, assume_unique=False)
+        filt[cell] = np.unique(ids)
+
+    sizes = {c: int(v.size) for c, v in filt.items()}
+    if any(s == 0 for s in sizes.values()):
+        return {c: np.empty(0, dtype=int) for c in filt}, 0
+
+    n_min = min(sizes.values())
+    if n_per_cell is not None:
+        n = min(int(n_per_cell), n_min)
+    else:
+        n = n_min
+    if n <= 0:
+        return {c: np.empty(0, dtype=int) for c in filt}, 0
+
+    rng = np.random.default_rng(int(seed))
+    out: Dict[str, np.ndarray] = {}
+    for cell, pool in filt.items():
+        if pool.size <= n:
+            out[cell] = np.sort(pool)
+        else:
+            pick = rng.choice(pool, size=int(n), replace=False)
+            out[cell] = np.sort(pick.astype(int))
+    return out, int(n)
+
+
+def decode_action_axes_over_time(
+    *,
+    sessions: Iterable[str],
+    psth_root: str | Path,
+    behavior_root: str | Path,
+    metadata: Optional[pd.DataFrame] = None,
+    binsize: str = "0.1",
+    align: str = "go_cue",
+    bin_centers: Optional[np.ndarray] = None,
+    t_start: float = -1.5,
+    t_end: float = 0.5,
+    bin_step: float = 0.1,
+    bin_window: float = 0.2,
+    restrict_events: Optional[Tuple[str, str]] = ("trial_start", "go_cue"),
+    restrict_align: Optional[str] = None,
+    axes: Sequence[str] = ("prev_choice", "up_choice", "switch_stay", "switch_dir"),
+    region_group: Sequence[str] = (),
+    min_units_num: int = 30,
+    n_per_cell: Optional[int] = None,
+    seed: int = 0,
+    norm_mode: str = "divide_sqrtN",
+    zscore_units: bool = False,
+    decoder_method: Literal["midpoint", "optimal"] = "optimal",
+    two_fold_cv: bool = True,
+    random_state: int = 0,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Time-resolved 4-axis CD decoder.
+
+    For every session and every time bin:
+
+    1. Identify trials whose ``[restrict_events[0], restrict_events[1]]``
+       interval (offsets w.r.t. ``restrict_align`` or ``align``) covers the
+       full bin ``[c - bin_window/2, c + bin_window/2]``.
+    2. Intersect the 4 action cells (``L_L``, ``switch_LR``, ``switch_RL``,
+       ``R_R``) with the eligible set and subsample each to a common count
+       ``n = min(...)`` (deterministic given ``seed``). This balances every
+       axis w.r.t. the orthogonal factors at *this specific bin*.
+    3. For each requested axis, fit a fresh CD axis on the balanced cell
+       unions using only that bin's window, decode the held-out test trials
+       with a 1D threshold, and store accuracy + AUC.
+
+    Parameters
+    ----------
+    bin_centers : array-like or None
+        Explicit bin centers (s). When ``None`` they are built from
+        ``t_start``, ``t_end``, ``bin_step``.
+    bin_window : float
+        Width of the CD-fit + decoding window centered on each bin center.
+    restrict_events : (start_event, end_event) or None
+        If given, restricts each bin to trials whose per-trial event interval
+        fully covers it. Set to ``None`` to skip eligibility filtering.
+    n_per_cell : int or None
+        If set, forces the per-cell sample size (capped by the available
+        eligible count). Otherwise uses ``min(...)`` per bin.
+    seed : int
+        Master seed for the per-cell subsampling RNG. The actual RNG seed
+        used at bin ``k`` is ``seed + k`` so each bin gets a fresh draw
+        while still being reproducible.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per (session, axis, bin_center) with columns:
+        ``session``, ``axis``, ``center``, ``n_per_cell``, ``n_eligible``,
+        ``train_acc``, ``test_acc``, ``train_bal_acc``, ``test_bal_acc``,
+        ``test_auc``, ``boundary``, ``sign``.
+    """
+    from create_psth import load_zarr
+    from general_utils import smart_read_csv
+
+    for ax in axes:
+        if ax not in ACTION_AXES:
+            raise ValueError(f"Unknown axis {ax!r}; expected one of {list(ACTION_AXES.keys())}")
+
+    if bin_centers is None:
+        bin_centers = np.arange(float(t_start), float(t_end) + 1e-9, float(bin_step))
+    bin_centers = np.asarray(bin_centers, dtype=float)
+
+    psth_root = Path(psth_root)
+    behavior_root = Path(behavior_root)
+    sessions = list(sessions)
+    region_lbl, region_print = region_label(region_group)
+    rows: List[Dict[str, Any]] = []
+
+    metadata_empty = metadata is None or len(metadata) == 0
+
+    for session in sessions:
+        if verbose:
+            print(f"\n=== {session} (region={region_lbl}) ===")
+        try:
+            psth_path = psth_root / f"{session}_{binsize}s.zarr"
+            beh_path = behavior_root / f"behavior_summary-{session}.csv"
+            psth_da = load_zarr(str(psth_path))
+            df = smart_read_csv(str(beh_path))
+        except Exception as e:  # noqa: BLE001
+            print(f"  [skip] load failed: {e}")
+            continue
+
+        # Unit selection
+        if metadata_empty or not region_group:
+            unit_ids = None
+            n_units_used = "ALL"
+        else:
+            mask = (
+                (metadata["sorted_session_name"] == session)
+                & (metadata["brain_region"].isin(region_group))
+            )
+            unit_ids = metadata.loc[mask, "unit_index"].to_numpy()
+            if len(unit_ids) < min_units_num:
+                print(f"  [skip] only {len(unit_ids)} units < {min_units_num}")
+                continue
+            n_units_used = len(unit_ids)
+        if verbose:
+            print(f"  units={n_units_used}")
+
+        # Raw cell IDs from the per-session behavior CSV.
+        cell_ids: Dict[str, np.ndarray] = {}
+        try:
+            for cell in ACTION_CELLS:
+                col = f"{cell}_trials"
+                if col not in df.columns:
+                    raise KeyError(f"missing column {col!r} in {beh_path.name}")
+                cell_ids[cell] = np.asarray(df[col].iloc[0], dtype=int).ravel()
+        except Exception as e:  # noqa: BLE001
+            print(f"  [skip] cell ID load failed: {e}")
+            continue
+
+        # Per-trial event offsets for the eligibility test (load once).
+        offsets: Optional[Dict[int, Tuple[float, float]]] = None
+        if restrict_events is not None:
+            try:
+                offsets = compute_per_trial_event_offsets(
+                    session,
+                    event_start=restrict_events[0],
+                    event_end=restrict_events[1],
+                    align=restrict_align or align,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"  [warn] restrict_events offsets failed ({e}); skipping eligibility")
+                offsets = None
+
+        # --- per-bin loop ---
+        for k, center in enumerate(bin_centers):
+            win = (float(center) - bin_window / 2.0, float(center) + bin_window / 2.0)
+
+            if offsets is not None:
+                eligible = np.array(
+                    [tid for tid, (s, e) in offsets.items()
+                     if s <= win[0] and e >= win[1]],
+                    dtype=int,
+                )
+            else:
+                eligible = None
+
+            balanced, n_used = _balance_cells_from_ids(
+                cell_ids, eligible, n_per_cell=n_per_cell, seed=int(seed) + int(k),
+            )
+            n_elig = int(eligible.size) if eligible is not None else -1
+
+            if n_used == 0:
+                for ax in axes:
+                    rows.append({
+                        "session": session, "axis": ax, "center": float(center),
+                        "n_per_cell": 0, "n_eligible": n_elig,
+                        "train_acc": np.nan, "test_acc": np.nan,
+                        "train_bal_acc": np.nan, "test_bal_acc": np.nan,
+                        "test_auc": np.nan, "boundary": np.nan, "sign": 0,
+                    })
+                continue
+
+            for ax_name in axes:
+                cells_a, cells_b = ACTION_AXES[ax_name]
+                a_ids = np.unique(np.concatenate([balanced[c] for c in cells_a]))
+                b_ids = np.unique(np.concatenate([balanced[c] for c in cells_b]))
+                if a_ids.size == 0 or b_ids.size == 0:
+                    rows.append({
+                        "session": session, "axis": ax_name, "center": float(center),
+                        "n_per_cell": n_used, "n_eligible": n_elig,
+                        "train_acc": np.nan, "test_acc": np.nan,
+                        "train_bal_acc": np.nan, "test_bal_acc": np.nan,
+                        "test_auc": np.nan, "boundary": np.nan, "sign": 0,
+                    })
+                    continue
+                try:
+                    out = coding_direction_from_psth(
+                        psth_da=psth_da,
+                        trial_ids_typeA=a_ids,
+                        trial_ids_typeB=b_ids,
+                        align=align,
+                        time_window=win,
+                        projection_time_window=win,
+                        random_state=int(random_state),
+                        two_fold_cv=bool(two_fold_cv),
+                        norm_mode=norm_mode,
+                        zscore_units=zscore_units,
+                        save_path=None,
+                        unit_ids=unit_ids,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    if verbose:
+                        print(f"    [bin {center:+.2f}s axis={ax_name}] CD fit failed: {e}")
+                    rows.append({
+                        "session": session, "axis": ax_name, "center": float(center),
+                        "n_per_cell": n_used, "n_eligible": n_elig,
+                        "train_acc": np.nan, "test_acc": np.nan,
+                        "train_bal_acc": np.nan, "test_bal_acc": np.nan,
+                        "test_auc": np.nan, "boundary": np.nan, "sign": 0,
+                    })
+                    continue
+
+                tr_a = np.asarray(out["projection_train_A"], dtype=float).ravel()
+                tr_b = np.asarray(out["projection_train_B"], dtype=float).ravel()
+                te_a = np.asarray(out["projection_test_A"], dtype=float).ravel()
+                te_b = np.asarray(out["projection_test_B"], dtype=float).ravel()
+                if tr_a.size == 0 or tr_b.size == 0:
+                    rows.append({
+                        "session": session, "axis": ax_name, "center": float(center),
+                        "n_per_cell": n_used, "n_eligible": n_elig,
+                        "train_acc": np.nan, "test_acc": np.nan,
+                        "train_bal_acc": np.nan, "test_bal_acc": np.nan,
+                        "test_auc": np.nan, "boundary": np.nan, "sign": 0,
+                    })
+                    continue
+
+                boundary, sign = _fit_threshold(tr_a, tr_b, method=decoder_method)
+                pa_tr = _predict(tr_a, boundary, sign)
+                pb_tr = _predict(tr_b, boundary, sign)
+                train_acc = (pa_tr.sum() + (1 - pb_tr).sum()) / max(pa_tr.size + pb_tr.size, 1)
+                train_bal = 0.5 * (
+                    (pa_tr.mean() if pa_tr.size else 0.0)
+                    + ((1 - pb_tr).mean() if pb_tr.size else 0.0)
+                )
+                if te_a.size and te_b.size:
+                    pa_te = _predict(te_a, boundary, sign)
+                    pb_te = _predict(te_b, boundary, sign)
+                    test_acc = (pa_te.sum() + (1 - pb_te).sum()) / max(pa_te.size + pb_te.size, 1)
+                    test_bal = 0.5 * (
+                        (pa_te.mean() if pa_te.size else 0.0)
+                        + ((1 - pb_te).mean() if pb_te.size else 0.0)
+                    )
+                    _, _, auc = _roc_auc_1d(te_a, te_b, sign)
+                else:
+                    test_acc = np.nan
+                    test_bal = np.nan
+                    auc = np.nan
+
+                rows.append({
+                    "session": session, "axis": ax_name, "center": float(center),
+                    "n_per_cell": n_used, "n_eligible": n_elig,
+                    "train_acc": float(train_acc),
+                    "test_acc": float(test_acc),
+                    "train_bal_acc": float(train_bal),
+                    "test_bal_acc": float(test_bal),
+                    "test_auc": float(auc),
+                    "boundary": float(boundary),
+                    "sign": int(sign),
+                })
+
+            if verbose and (k % max(1, len(bin_centers) // 10) == 0):
+                print(f"    bin {center:+.3f}s done (n_per_cell={n_used}, eligible={n_elig})")
+
+    return pd.DataFrame(rows)
+
+
+def plot_action_decoding_over_time(
+    df: pd.DataFrame,
+    *,
+    metric: Literal["test_bal_acc", "test_acc", "test_auc"] = "test_bal_acc",
+    axes: Optional[Sequence[str]] = None,
+    aggregate: Literal["sessions", "mean_sem"] = "mean_sem",
+    show_n: bool = True,
+    figsize: Tuple[float, float] = (11, 5),
+    chance: float = 0.5,
+    show: bool = True,
+) -> plt.Figure:
+    """Plot time-resolved decoder performance for the 4 action axes.
+
+    Parameters
+    ----------
+    df
+        Output of :func:`decode_action_axes_over_time`.
+    metric
+        Which column to plot vs time.
+    axes
+        Subset of axes to draw (default: all axes present in ``df``).
+    aggregate
+        ``"mean_sem"`` plots mean ± SEM across sessions per axis.
+        ``"sessions"`` plots one thin line per session and overlays the mean.
+    show_n
+        If True, plots ``min(n_per_cell)`` across sessions on a second
+        y-axis so you can see when balancing starts to drop sample size.
+    chance
+        Horizontal reference line.
+    """
+    if axes is None:
+        axes = [a for a in ACTION_AXES.keys() if a in df["axis"].unique()]
+    n_axes = len(axes)
+
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n_axes, 4)))
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for i, axis_name in enumerate(axes):
+        sub = df[df["axis"] == axis_name].copy()
+        if sub.empty:
+            continue
+        color = colors[i]
+
+        if aggregate == "sessions":
+            for sess, sdf in sub.groupby("session"):
+                sdf = sdf.sort_values("center")
+                ax.plot(
+                    sdf["center"], sdf[metric],
+                    "-", color=color, alpha=0.25, lw=1,
+                )
+
+        agg = sub.groupby("center")[metric].agg(["mean", "std", "count"]).reset_index()
+        agg["sem"] = agg["std"] / np.sqrt(agg["count"].clip(lower=1))
+        ax.plot(agg["center"], agg["mean"], "-o", color=color, lw=2, ms=4,
+                label=axis_name)
+        ax.fill_between(
+            agg["center"], agg["mean"] - agg["sem"], agg["mean"] + agg["sem"],
+            color=color, alpha=0.2,
+        )
+
+    ax.axhline(chance, color="red", linestyle=":", lw=1, label=f"chance ({chance:g})")
+    ax.axvline(0, color="gray", linestyle="--", lw=1, alpha=0.5)
+    ax.set_xlabel("Time (s, aligned to PSTH event)")
+    ax.set_ylabel({"test_bal_acc": "Test balanced accuracy",
+                   "test_acc": "Test accuracy",
+                   "test_auc": "Test AUC"}.get(metric, metric))
+    ax.set_ylim(0.3, 1.0)
+    ax.set_title("Time-resolved CD decoder — 4 action/transition axes")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9, loc="best", ncol=2)
+
+    if show_n:
+        ax2 = ax.twinx()
+        nser = df.groupby("center")["n_per_cell"].agg(lambda v: int(np.nanmin(v)) if len(v) else 0)
+        ax2.plot(nser.index, nser.values, "-", color="gray", alpha=0.4, lw=1)
+        ax2.set_ylabel("min n_per_cell across sessions", color="gray")
+        ax2.tick_params(axis="y", labelcolor="gray")
+
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return fig
