@@ -393,6 +393,287 @@ def build_cd_for_session(
     return failures
 
 
+# ---------------------------------------------------------------------------
+# 1b. ACTION/TRANSITION 4-axis CD helpers (Prev × Upcoming 2x2 design)
+# ---------------------------------------------------------------------------
+
+#: Names of the 4 cells in the (previous choice × upcoming choice) 2x2 design.
+#: These must already be present as ``{name}_trials`` columns in the per-session
+#: behavior summary CSV (written by :func:`behavior_utils.find_trials`).
+ACTION_CELLS: Tuple[str, str, str, str] = (
+    "L_L",          # prev L, up L  (stay)
+    "switch_LR",    # prev L, up R  (switch)
+    "switch_RL",    # prev R, up L  (switch)
+    "R_R",          # prev R, up R  (stay)
+)
+
+#: Definition of the four contrasts. Each entry maps ``axis_name`` to the two
+#: cell unions that form class A / class B for that axis. After per-session
+#: subsampling to ``n = min(|cell|)``, every axis below is automatically
+#: balanced w.r.t. the orthogonal factors.
+ACTION_AXES: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
+    # Prev-L (L_L + switch_LR) vs Prev-R (switch_RL + R_R)
+    "prev_choice":   (("L_L", "switch_LR"), ("switch_RL", "R_R")),
+    # Up-L (L_L + switch_RL) vs Up-R (switch_LR + R_R)
+    "up_choice":     (("L_L", "switch_RL"), ("switch_LR", "R_R")),
+    # Switch (switch_LR + switch_RL) vs Stay (L_L + R_R)
+    "switch_stay":   (("switch_LR", "switch_RL"), ("L_L", "R_R")),
+    # Switch direction: LR vs RL (already balanced after subsampling).
+    "switch_dir":    (("switch_LR",), ("switch_RL",)),
+}
+
+
+def _balance_action_cells(
+    behavior_csv: str | Path,
+    *,
+    seed: int = 0,
+    suffix: str = "balanced",
+    n_per_cell: Optional[int] = None,
+    overwrite_columns: bool = True,
+) -> Tuple[Dict[str, str], Dict[str, int]]:
+    """Subsample the four action-transition cells to a balanced count and
+    persist them (plus axis unions) as new ``*_{suffix}_trials`` columns in
+    the per-session behavior summary CSV.
+
+    Parameters
+    ----------
+    behavior_csv : path
+        Per-session behavior summary CSV (``behavior_summary-{session}.csv``)
+        produced by :func:`behavior_utils.generate_behavior_summary`. Must
+        contain the four base columns ``L_L_trials``, ``switch_LR_trials``,
+        ``switch_RL_trials``, ``R_R_trials``.
+    seed : int, default 0
+        RNG seed for the per-cell subsample.
+    suffix : str, default ``"balanced"``
+        Column-name suffix. New columns will be e.g.
+        ``L_L_{suffix}_trials`` and ``prev_L_{suffix}_trials``.
+    n_per_cell : int, optional
+        If given, force the per-cell sample size. Otherwise uses
+        ``min(|cell|)`` across the four cells (the largest count where
+        every cell still has enough trials).
+    overwrite_columns : bool, default True
+        If False and the target columns already exist, the function reads
+        them from the CSV without re-sampling and returns the existing
+        names. Useful when chaining repeated calls.
+
+    Returns
+    -------
+    tuple
+        ``(axis_columns, counts)`` where:
+
+        - ``axis_columns`` maps each axis in :data:`ACTION_AXES` to a
+          ``(colA, colB)`` pair — these are the column names you'd pass
+          as ``trial_types=`` to :func:`build_cd_dataset`.
+        - ``counts`` maps cell name → balanced sample size (also includes
+          ``"n_per_cell"`` and ``"n_min_raw"``).
+    """
+    from general_utils import smart_read_csv
+
+    behavior_csv = Path(behavior_csv)
+    df = smart_read_csv(str(behavior_csv))
+
+    # Read the raw cell IDs.
+    raw_ids: Dict[str, np.ndarray] = {}
+    for cell in ACTION_CELLS:
+        col = f"{cell}_trials"
+        if col not in df.columns:
+            raise KeyError(
+                f"{behavior_csv.name}: missing column {col!r}; "
+                f"regenerate behavior summary."
+            )
+        ids = np.asarray(df[col].iloc[0], dtype=int).ravel()
+        raw_ids[cell] = np.unique(ids[ids >= 0])
+
+    n_min_raw = int(min(v.size for v in raw_ids.values()))
+    if n_per_cell is None:
+        n_per_cell = n_min_raw
+    if n_per_cell <= 0:
+        raise ValueError(
+            f"{behavior_csv.name}: cannot balance — at least one of "
+            f"{ACTION_CELLS} is empty (sizes: "
+            f"{ {k: int(v.size) for k, v in raw_ids.items()} })."
+        )
+
+    # Subsample each cell deterministically.
+    rng = np.random.default_rng(int(seed))
+    balanced_ids: Dict[str, np.ndarray] = {}
+    for cell in ACTION_CELLS:
+        pool = raw_ids[cell]
+        if pool.size <= n_per_cell:
+            balanced_ids[cell] = np.sort(pool)
+        else:
+            pick = rng.choice(pool, size=int(n_per_cell), replace=False)
+            balanced_ids[cell] = np.sort(pick.astype(int))
+
+    # Build axis unions.
+    axis_unions: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for axis, (cells_a, cells_b) in ACTION_AXES.items():
+        ids_a = np.unique(np.concatenate([balanced_ids[c] for c in cells_a]))
+        ids_b = np.unique(np.concatenate([balanced_ids[c] for c in cells_b]))
+        axis_unions[axis] = (ids_a.astype(int), ids_b.astype(int))
+
+    # Build column-name maps.
+    cell_cols: Dict[str, str] = {c: f"{c}_{suffix}_trials" for c in ACTION_CELLS}
+    axis_a_name = {
+        "prev_choice": "prev_L",
+        "up_choice":   "up_L",
+        "switch_stay": "switch",
+        "switch_dir":  "switch_LR",
+    }
+    axis_b_name = {
+        "prev_choice": "prev_R",
+        "up_choice":   "up_R",
+        "switch_stay": "stay",
+        "switch_dir":  "switch_RL",
+    }
+    axis_columns: Dict[str, Tuple[str, str]] = {
+        axis: (
+            f"{axis_a_name[axis]}_{suffix}_trials",
+            f"{axis_b_name[axis]}_{suffix}_trials",
+        )
+        for axis in ACTION_AXES
+    }
+
+    # Decide whether to skip (re-read existing columns).
+    target_cols = set(cell_cols.values()) | {c for pair in axis_columns.values() for c in pair}
+    if (not overwrite_columns) and target_cols.issubset(df.columns):
+        counts = {c: int(np.asarray(df[cell_cols[c]].iloc[0], dtype=int).size) for c in ACTION_CELLS}
+        counts["n_per_cell"] = int(min(counts.values())) if counts else 0
+        counts["n_min_raw"] = n_min_raw
+        return axis_columns, counts
+
+    # Write columns.
+    for cell, col in cell_cols.items():
+        df[col] = [balanced_ids[cell].tolist()]
+    for axis, (colA, colB) in axis_columns.items():
+        ids_a, ids_b = axis_unions[axis]
+        df[colA] = [ids_a.tolist()]
+        df[colB] = [ids_b.tolist()]
+
+    df.to_csv(behavior_csv, index=False)
+
+    counts = {c: int(balanced_ids[c].size) for c in ACTION_CELLS}
+    counts["n_per_cell"] = int(n_per_cell)
+    counts["n_min_raw"] = n_min_raw
+    return axis_columns, counts
+
+
+def build_action_transition_cds(
+    *,
+    sessions: Iterable[str],
+    psth_root: str | Path,
+    behavior_root: str | Path,
+    cd_root: str | Path,
+    metadata: Optional[pd.DataFrame] = None,
+    seed: int = 0,
+    suffix: str = "balanced",
+    n_per_cell: Optional[int] = None,
+    axes: Sequence[str] = ("prev_choice", "up_choice", "switch_stay", "switch_dir"),
+    overwrite_columns: bool = True,
+    verbose: bool = True,
+    **kwargs: Any,
+) -> Tuple[List[Tuple[str, ...]], Dict[str, Dict[str, int]]]:
+    """Build four balanced CD axes per session for the Prev x Upcoming design.
+
+    For every session this:
+      1. Reads ``behavior_summary-{session}.csv``.
+      2. Subsamples ``L_L``, ``switch_LR``, ``switch_RL``, ``R_R`` to a common
+         per-cell size ``n = min(...)`` (with the supplied ``seed``) so that
+         every contrast is balanced w.r.t. the orthogonal factor.
+      3. Persists those balanced lists plus the four axis unions
+         (``prev_L_balanced_trials``, ..., ``stay_balanced_trials``) as new
+         columns in the same CSV so downstream loaders can reach them by
+         name.
+      4. Calls :func:`build_cd_dataset` once per axis (``axes`` argument)
+         using the corresponding union columns as ``trial_types``.
+
+    Parameters
+    ----------
+    axes : sequence of str
+        Subset of :data:`ACTION_AXES` keys to actually fit. Default = all
+        four. Each produces its own CD zarr per session/region/window.
+    seed, suffix, n_per_cell, overwrite_columns
+        Forwarded to :func:`_balance_action_cells`.
+    **kwargs
+        Forwarded to :func:`build_cd_dataset` (e.g. ``align``, ``binsize``,
+        ``brain_regions_groups``, ``time_windows``, ``min_units_num``,
+        ``norm_mode``, ``random_state``, ``overwrite``, ...).
+
+    Returns
+    -------
+    tuple
+        ``(failed, counts_per_session)`` where ``failed`` is the merged
+        failure list across all axes (same shape as
+        :func:`build_cd_dataset`) and ``counts_per_session`` maps session
+        name to the per-cell balanced counts.
+    """
+    behavior_root = Path(behavior_root)
+    sessions = list(sessions)
+    failed_all: List[Tuple[str, ...]] = []
+    counts_per_session: Dict[str, Dict[str, int]] = {}
+    axis_columns_per_session: Dict[str, Dict[str, Tuple[str, str]]] = {}
+
+    # ----- 1) Balance each session -----
+    sessions_for_axes: List[str] = []
+    for session in sessions:
+        beh_path = behavior_root / f"behavior_summary-{session}.csv"
+        if not beh_path.exists():
+            print(f"[skip] {session}: behavior CSV not found at {beh_path}")
+            continue
+        try:
+            axis_columns, counts = _balance_action_cells(
+                beh_path,
+                seed=seed,
+                suffix=suffix,
+                n_per_cell=n_per_cell,
+                overwrite_columns=overwrite_columns,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[skip] {session}: balancing failed: {e}")
+            failed_all.append((session, "action_axes", "balance", str(e)))
+            continue
+        counts_per_session[session] = counts
+        axis_columns_per_session[session] = axis_columns
+        sessions_for_axes.append(session)
+        if verbose:
+            cell_n = {c: counts[c] for c in ACTION_CELLS}
+            print(
+                f"[{session}] balanced cells (seed={seed}): {cell_n} "
+                f"(min raw = {counts['n_min_raw']}, per-cell = {counts['n_per_cell']})"
+            )
+
+    if not sessions_for_axes:
+        print("\nNo usable sessions after balancing.")
+        return failed_all, counts_per_session
+
+    # ----- 2) For each axis, build a CD zarr across the kept sessions -----
+    for axis in axes:
+        if axis not in ACTION_AXES:
+            raise ValueError(
+                f"Unknown axis {axis!r}; expected one of {list(ACTION_AXES.keys())}."
+            )
+        # All sessions use the same column-name pair for a given axis (built
+        # deterministically by `_balance_action_cells`).
+        ref_cols = axis_columns_per_session[sessions_for_axes[0]][axis]
+        if verbose:
+            print(
+                f"\n>>> Building axis {axis!r}: A={ref_cols[0]} | B={ref_cols[1]} "
+                f"({len(sessions_for_axes)} sessions)"
+            )
+        axis_failed = build_cd_dataset(
+            sessions=sessions_for_axes,
+            psth_root=psth_root,
+            behavior_root=behavior_root,
+            cd_root=cd_root,
+            metadata=metadata,
+            trial_types=ref_cols,
+            **kwargs,
+        )
+        failed_all.extend(axis_failed)
+
+    return failed_all, counts_per_session
+
+
 def build_cd_dataset(
     *,
     sessions: Iterable[str],
