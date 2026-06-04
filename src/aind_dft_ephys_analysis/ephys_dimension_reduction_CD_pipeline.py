@@ -2133,6 +2133,7 @@ def plot_cd_projection_box_by_choice_probability_combined(
     restrict_events: Optional[Tuple[str, str]] = None,
     restrict_align: Optional[str] = None,
     per_session_zscore: bool = False,
+    session_normalize: Literal["none", "zscore", "demean", "robust"] = "none",
     ax: Optional[plt.Axes] = None,
     figsize: Tuple[float, float] = (7.0, 4.5),
     box_color: str = "#4C72B0",
@@ -2156,10 +2157,20 @@ def plot_cd_projection_box_by_choice_probability_combined(
         that raise during per-trial computation (missing behavior column,
         empty proj_all_trials, etc.) are skipped with a warning.
     per_session_zscore : bool, default False
-        If True, z-score the per-trial projection within each session before
-        pooling. Useful when sessions differ in CD-projection scale (e.g.
-        different unit counts) and you want to compare the *shape* of the
-        P(right)-vs-projection relationship rather than absolute magnitude.
+        Deprecated convenience alias for ``session_normalize='zscore'``.
+    session_normalize : {'none','zscore','demean','robust'}, default 'none'
+        Per-session normalization applied to the CD projection before
+        pooling. Useful when sessions have different baselines / scales
+        (e.g. different unit counts) and pooling raw values flattens the
+        across-session trend.
+          - 'none'   : pool raw projections (original behavior).
+          - 'demean' : subtract per-session mean. Preserves within-session
+            spread; usually the best choice when scales are comparable.
+          - 'zscore' : (y - mean) / std per session. Equalizes magnitude
+            across sessions; may down-weight sessions with strong CD
+            signal.
+          - 'robust' : (y - median) / IQR per session. Like z-score but
+            insensitive to outliers.
 
     All other parameters mirror
     :func:`plot_cd_projection_box_by_choice_probability`.
@@ -2199,9 +2210,18 @@ def plot_cd_projection_box_by_choice_probability_combined(
         if p_i.size == 0:
             continue
         if per_session_zscore:
+            session_normalize = "zscore"
+        if session_normalize == "zscore":
             mu = float(np.nanmean(y_i))
             sd = float(np.nanstd(y_i)) + 1e-12
             y_i = (y_i - mu) / sd
+        elif session_normalize == "demean":
+            y_i = y_i - float(np.nanmean(y_i))
+        elif session_normalize == "robust":
+            med = float(np.nanmedian(y_i))
+            q75, q25 = np.nanpercentile(y_i, [75, 25])
+            iqr = float(q75 - q25) + 1e-12
+            y_i = (y_i - med) / iqr
         ps.append(p_i)
         ys.append(y_i)
         masks_full = res.get("highlight_masks", {}) or {}
@@ -2217,21 +2237,29 @@ def plot_cd_projection_box_by_choice_probability_combined(
     y = np.concatenate(ys)
     hl_masks = {name: np.concatenate(masks) for name, masks in hl_accum.items() if masks}
 
+    norm_tag = {
+        "none": "",
+        "zscore": "  [per-session z]",
+        "demean": "  [per-session demean]",
+        "robust": "  [per-session robust z]",
+    }[session_normalize]
     if title is None:
         title = (
             f"Combined ({len(used)} sessions) — CD projection by P(right)"
             + (f"  (window {p_right_window})" if p_right_column is None else "")
-            + ("  [per-session z]" if per_session_zscore else "")
+            + norm_tag
         )
     xlabel = (
         "P(right) (sliding, causal)" if p_right_column is None
         else (p_right_column or "P(right)")
     )
-    ylabel = (
-        f"per-session z(CD projection) in [{window[0]:g}, {window[1]:g}] s"
-        if per_session_zscore
-        else f"mean CD projection in [{window[0]:g}, {window[1]:g}] s"
-    )
+    ylabel_unit = {
+        "none": f"mean CD projection in [{window[0]:g}, {window[1]:g}] s",
+        "zscore": f"per-session z(CD projection) in [{window[0]:g}, {window[1]:g}] s",
+        "demean": f"per-session demeaned CD projection in [{window[0]:g}, {window[1]:g}] s",
+        "robust": f"per-session robust-z(CD projection) in [{window[0]:g}, {window[1]:g}] s",
+    }
+    ylabel = ylabel_unit[session_normalize]
     out = _render_pright_boxplot(
         p=p,
         y=y,
