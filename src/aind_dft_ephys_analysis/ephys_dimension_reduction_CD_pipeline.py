@@ -422,6 +422,49 @@ ACTION_AXES: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
     "switch_dir":    (("switch_LR",), ("switch_RL",)),
 }
 
+# ---------------------------------------------------------------------------
+# Previous-trial reward design (independent 2-cell decoder)
+# ---------------------------------------------------------------------------
+# A separate, single-axis design that contrasts trials whose *previous* trial
+# was rewarded vs. unrewarded. Cells are computed on the fly from the NWB
+# ``rewarded_historyL/R`` columns (shifted by 1 trial), then per-bin balanced
+# the same way the action axes are.
+
+PREV_REWARD_CELLS: Tuple[str, str] = ("prev_rewarded", "prev_unrewarded")
+
+PREV_REWARD_AXES: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
+    "prev_reward": (("prev_rewarded",), ("prev_unrewarded",)),
+}
+
+
+def compute_prev_reward_cells(session_name: str) -> Dict[str, np.ndarray]:
+    """Return ``{'prev_rewarded': ids, 'prev_unrewarded': ids}`` for one session.
+
+    Cell membership uses the previous trial's reward outcome
+    (``rewarded_historyL[i-1] OR rewarded_historyR[i-1]``). Trial 0 is
+    excluded (no previous trial).
+    """
+    from nwb_utils import NWBUtils
+
+    nwb_data = NWBUtils.read_ophys_or_behavior_nwb(session_name=session_name)
+    if nwb_data is None:
+        raise FileNotFoundError(f"Could not load NWB for session '{session_name}'.")
+    try:
+        rL = np.asarray(nwb_data.trials["rewarded_historyL"][:], dtype=bool)
+        rR = np.asarray(nwb_data.trials["rewarded_historyR"][:], dtype=bool)
+    finally:
+        try:
+            nwb_data.io.close()
+        except Exception:  # noqa: BLE001
+            pass
+    rewarded = np.logical_or(rL, rR)
+    idx = np.arange(1, len(rewarded), dtype=int)
+    prev_rew = rewarded[:-1]
+    return {
+        "prev_rewarded":   idx[prev_rew],
+        "prev_unrewarded": idx[~prev_rew],
+    }
+
 
 def _balance_action_cells(
     behavior_csv: str | Path,
@@ -3694,6 +3737,217 @@ def decode_action_axes_over_time(
                     "boundary": float(boundary),
                     "sign": int(sign),
                 })
+
+            if verbose and (k % max(1, len(bin_centers) // 10) == 0):
+                print(f"    bin {center:+.3f}s done (n_per_cell={n_used}, eligible={n_elig})")
+
+    return pd.DataFrame(rows)
+
+
+def decode_prev_reward_over_time(
+    *,
+    sessions: Iterable[str],
+    psth_root: str | Path,
+    metadata: Optional[pd.DataFrame] = None,
+    binsize: str = "0.1",
+    align: str = "go_cue",
+    bin_centers: Optional[np.ndarray] = None,
+    t_start: float = -1.5,
+    t_end: float = 0.5,
+    bin_step: float = 0.1,
+    bin_window: float = 0.2,
+    restrict_events: Optional[Tuple[str, str]] = ("trial_start", "go_cue"),
+    restrict_align: Optional[str] = None,
+    region_group: Sequence[str] = (),
+    min_units_num: int = 30,
+    n_per_cell: Optional[int] = None,
+    seed: int = 0,
+    norm_mode: str = "divide_sqrtN",
+    zscore_units: bool = False,
+    decoder_method: Literal["midpoint", "optimal"] = "optimal",
+    two_fold_cv: bool = True,
+    random_state: int = 0,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Time-resolved CD decoder for the **previous-trial reward** axis.
+
+    Single-axis, 2-cell design (``prev_rewarded`` vs ``prev_unrewarded``).
+    Trial membership is computed from the NWB ``rewarded_historyL/R`` columns
+    shifted by one trial (see :func:`compute_prev_reward_cells`).
+
+    Per bin, the two cells are intersected with the eligible set (trials
+    whose ``[restrict_events[0], restrict_events[1]]`` interval covers the
+    bin) and subsampled to ``n = min(...)`` so the decoder is balanced
+    across reward outcomes at every bin.
+
+    Returns a DataFrame with the same columns as
+    :func:`decode_action_axes_over_time` (axis is always ``"prev_reward"``).
+    """
+    from create_psth import load_zarr
+
+    if bin_centers is None:
+        n_bins = int(round((float(t_end) - float(t_start)) / float(bin_step))) + 1
+        n_bins = max(n_bins, 1)
+        bin_centers = np.linspace(
+            float(t_start), float(t_start) + (n_bins - 1) * float(bin_step), n_bins
+        )
+    bin_centers = np.asarray(bin_centers, dtype=float)
+
+    psth_root = Path(psth_root)
+    sessions = list(sessions)
+    rows: List[Dict[str, object]] = []
+
+    for session in sessions:
+        if verbose:
+            print(f"\n=========== Session: {session} ===========")
+        zarr_path = psth_root / f"psth_results-{session}" / f"psth_binsize_{binsize}_align_{align}.zarr"
+        if not zarr_path.exists():
+            print(f"  [skip] PSTH zarr missing: {zarr_path}")
+            continue
+        try:
+            psth_da = load_zarr(zarr_path)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [skip] failed to load {zarr_path.name}: {e}")
+            continue
+
+        # Unit selection (same convention as the action decoder).
+        unit_ids: Optional[np.ndarray] = None
+        n_units_used = int(psth_da.sizes.get("unit", 0))
+        if metadata is not None and len(region_group):
+            mask = (
+                (metadata["sorted_session_name"] == session)
+                & (metadata["brain_region"].isin(region_group))
+            )
+            unit_ids = metadata.loc[mask, "unit_index"].to_numpy()
+            if len(unit_ids) < min_units_num:
+                print(f"  [skip] only {len(unit_ids)} units < {min_units_num}")
+                continue
+            n_units_used = len(unit_ids)
+        if verbose:
+            print(f"  units={n_units_used}")
+
+        # Prev-reward cell membership (from NWB).
+        try:
+            cell_ids = compute_prev_reward_cells(session)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [skip] prev-reward cell construction failed: {e}")
+            continue
+
+        # Eligibility offsets in the PSTH align frame.
+        offsets: Optional[Dict[int, Tuple[float, float]]] = None
+        if restrict_events is not None:
+            if restrict_align is not None and restrict_align != align and verbose:
+                print(
+                    f"  [info] restrict_align={restrict_align!r} differs from "
+                    f"PSTH align={align!r}; using PSTH align for eligibility frame."
+                )
+            try:
+                offsets = compute_per_trial_event_offsets(
+                    session,
+                    event_start=restrict_events[0],
+                    event_end=restrict_events[1],
+                    align=align,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"  [warn] restrict_events offsets failed ({e}); skipping eligibility")
+                offsets = None
+
+        for k, center in enumerate(bin_centers):
+            win = (float(center) - bin_window / 2.0, float(center) + bin_window / 2.0)
+
+            if offsets is not None:
+                eps = 1e-6
+                eligible = np.array(
+                    [tid for tid, (s, e) in offsets.items()
+                     if s <= win[0] + eps and e >= win[1] - eps],
+                    dtype=int,
+                )
+            else:
+                eligible = None
+
+            balanced, n_used = _balance_cells_from_ids(
+                cell_ids, eligible, n_per_cell=n_per_cell, seed=int(seed) + int(k),
+            )
+            n_elig = int(eligible.size) if eligible is not None else -1
+
+            base_row = {
+                "session": session, "axis": "prev_reward", "center": float(center),
+                "n_per_cell": n_used, "n_eligible": n_elig,
+                "train_acc": np.nan, "test_acc": np.nan,
+                "train_bal_acc": np.nan, "test_bal_acc": np.nan,
+                "test_auc": np.nan, "boundary": np.nan, "sign": 0,
+            }
+            if n_used == 0:
+                rows.append({**base_row, "n_per_cell": 0})
+                continue
+
+            a_ids = balanced["prev_rewarded"]
+            b_ids = balanced["prev_unrewarded"]
+            if a_ids.size == 0 or b_ids.size == 0:
+                rows.append(base_row)
+                continue
+            try:
+                out = coding_direction_from_psth(
+                    psth_da=psth_da,
+                    trial_ids_typeA=a_ids,
+                    trial_ids_typeB=b_ids,
+                    align=align,
+                    time_window=win,
+                    projection_time_window=win,
+                    random_state=int(random_state),
+                    two_fold_cv=bool(two_fold_cv),
+                    norm_mode=norm_mode,
+                    zscore_units=zscore_units,
+                    save_path=None,
+                    unit_ids=unit_ids,
+                )
+            except Exception as e:  # noqa: BLE001
+                if verbose:
+                    print(f"    [bin {center:+.2f}s prev_reward] CD fit failed: {e}")
+                rows.append(base_row)
+                continue
+
+            tr_a = np.asarray(out["projection_train_A"], dtype=float).ravel()
+            tr_b = np.asarray(out["projection_train_B"], dtype=float).ravel()
+            te_a = np.asarray(out["projection_test_A"], dtype=float).ravel()
+            te_b = np.asarray(out["projection_test_B"], dtype=float).ravel()
+            if tr_a.size == 0 or tr_b.size == 0:
+                rows.append(base_row)
+                continue
+
+            boundary, sign = _fit_threshold(tr_a, tr_b, method=decoder_method)
+            pa_tr = _predict(tr_a, boundary, sign)
+            pb_tr = _predict(tr_b, boundary, sign)
+            train_acc = (pa_tr.sum() + (1 - pb_tr).sum()) / max(pa_tr.size + pb_tr.size, 1)
+            train_bal = 0.5 * (
+                (pa_tr.mean() if pa_tr.size else 0.0)
+                + ((1 - pb_tr).mean() if pb_tr.size else 0.0)
+            )
+            if te_a.size and te_b.size:
+                pa_te = _predict(te_a, boundary, sign)
+                pb_te = _predict(te_b, boundary, sign)
+                test_acc = (pa_te.sum() + (1 - pb_te).sum()) / max(pa_te.size + pb_te.size, 1)
+                test_bal = 0.5 * (
+                    (pa_te.mean() if pa_te.size else 0.0)
+                    + ((1 - pb_te).mean() if pb_te.size else 0.0)
+                )
+                _, _, auc = _roc_auc_1d(te_a, te_b, sign)
+            else:
+                test_acc = np.nan
+                test_bal = np.nan
+                auc = np.nan
+
+            rows.append({
+                "session": session, "axis": "prev_reward", "center": float(center),
+                "n_per_cell": n_used, "n_eligible": n_elig,
+                "train_acc": float(train_acc),
+                "test_acc": float(test_acc),
+                "train_bal_acc": float(train_bal),
+                "test_bal_acc": float(test_bal),
+                "test_auc": float(auc),
+                "boundary": float(boundary),
+                "sign": int(sign),
+            })
 
             if verbose and (k % max(1, len(bin_centers) // 10) == 0):
                 print(f"    bin {center:+.3f}s done (n_per_cell={n_used}, eligible={n_elig})")
