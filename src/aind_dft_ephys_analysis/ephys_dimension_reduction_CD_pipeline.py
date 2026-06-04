@@ -3495,7 +3495,11 @@ def decode_action_axes_over_time(
             raise ValueError(f"Unknown axis {ax!r}; expected one of {list(ACTION_AXES.keys())}")
 
     if bin_centers is None:
-        bin_centers = np.arange(float(t_start), float(t_end) + 1e-9, float(bin_step))
+        # Use linspace so multiples of bin_step land exactly (avoids floating
+        # drift from arange that can cost edge bins via eligibility checks).
+        n_bins = int(round((float(t_end) - float(t_start)) / float(bin_step))) + 1
+        n_bins = max(n_bins, 1)
+        bin_centers = np.linspace(float(t_start), float(t_start) + (n_bins - 1) * float(bin_step), n_bins)
     bin_centers = np.asarray(bin_centers, dtype=float)
 
     psth_root = Path(psth_root)
@@ -3575,9 +3579,13 @@ def decode_action_axes_over_time(
             win = (float(center) - bin_window / 2.0, float(center) + bin_window / 2.0)
 
             if offsets is not None:
+                # Tiny tolerance so bins that touch the eligibility edge
+                # exactly (e.g. window ends at go_cue = 0.0) aren't lost to
+                # floating-point drift coming from np.arange grids.
+                eps = 1e-6
                 eligible = np.array(
                     [tid for tid, (s, e) in offsets.items()
-                     if s <= win[0] and e >= win[1]],
+                     if s <= win[0] + eps and e >= win[1] - eps],
                     dtype=int,
                 )
             else:
