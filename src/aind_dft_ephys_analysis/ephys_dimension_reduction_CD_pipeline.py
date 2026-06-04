@@ -991,10 +991,12 @@ def compute_per_trial_event_offsets(
 
     Only events whose ``extract_event_timestamps`` result is one entry per
     trial (indexed by trial index) are supported — e.g. ``"trial_start"``,
-    ``"trial_end"``, ``"go_cue"``. If ``align`` is ``None`` it defaults to
-    ``event_start`` (so the start offset is exactly 0).
+    ``"trial_end"``, ``"go_cue"``, ``"previous_trial_go_cue"``,
+    ``"previous_trial_start"``, ``"previous_trial_end"``. If ``align`` is
+    ``None`` it defaults to ``event_start`` (so the start offset is exactly 0).
 
-    Trials with NaN times are dropped.
+    Trials with NaN times (including trial 0 when any ``previous_trial_*``
+    event is used) are dropped automatically.
     """
     from nwb_utils import NWBUtils
     from behavior_utils import extract_event_timestamps
@@ -3463,6 +3465,12 @@ def decode_action_axes_over_time(
     restrict_events : (start_event, end_event) or None
         If given, restricts each bin to trials whose per-trial event interval
         fully covers it. Set to ``None`` to skip eligibility filtering.
+        Both events must be one-per-trial (e.g. ``"trial_start"``,
+        ``"trial_end"``, ``"go_cue"``, ``"previous_trial_go_cue"``,
+        ``"previous_trial_start"``, ``"previous_trial_end"``). Useful pairs
+        include ``("trial_start", "go_cue")`` (current ITI) and
+        ``("previous_trial_go_cue", "go_cue")`` (full prev-to-current span,
+        which automatically drops trial 0).
     n_per_cell : int or None
         If set, forces the per-cell sample size (capped by the available
         eligible count). Otherwise uses ``min(...)`` per bin.
@@ -3540,14 +3548,23 @@ def decode_action_axes_over_time(
             continue
 
         # Per-trial event offsets for the eligibility test (load once).
+        # Offsets are always returned in the PSTH ``align`` frame so they can
+        # be compared directly to the bin window. ``restrict_align`` is kept
+        # for backward-compat but ignored when it differs from ``align``.
         offsets: Optional[Dict[int, Tuple[float, float]]] = None
         if restrict_events is not None:
+            if restrict_align is not None and restrict_align != align:
+                if verbose:
+                    print(
+                        f"  [info] restrict_align={restrict_align!r} differs from "
+                        f"PSTH align={align!r}; using PSTH align for eligibility frame."
+                    )
             try:
                 offsets = compute_per_trial_event_offsets(
                     session,
                     event_start=restrict_events[0],
                     event_end=restrict_events[1],
-                    align=restrict_align or align,
+                    align=align,
                 )
             except Exception as e:  # noqa: BLE001
                 print(f"  [warn] restrict_events offsets failed ({e}); skipping eligibility")

@@ -166,6 +166,28 @@ def extract_event_timestamps(
     rewarded = np.logical_or(rewardedL, rewardedR)
     responses = trials['animal_response'][:]
 
+    # Previous-trial alignments (trial 0 has no previous trial -> NaN).
+    # Per-trial indexing: out[i] = <event from trial i-1>.
+    if event_name == 'previous_trial_go_cue':
+        prev = np.full(len(go_times), np.nan, dtype=float)
+        if len(go_times) > 1:
+            prev[1:] = go_times[:-1]
+        return prev.tolist()
+
+    if event_name == 'previous_trial_start':
+        ts = trials['start_time'][:]
+        prev = np.full(len(ts), np.nan, dtype=float)
+        if len(ts) > 1:
+            prev[1:] = ts[:-1]
+        return prev.tolist()
+
+    if event_name == 'previous_trial_end':
+        te = trials['stop_time'][:]
+        prev = np.full(len(te), np.nan, dtype=float)
+        if len(te) > 1:
+            prev[1:] = te[:-1]
+        return prev.tolist()
+
     if event_name == 'reward_go_cue_start':
         return go_times[rewarded].tolist()
 
