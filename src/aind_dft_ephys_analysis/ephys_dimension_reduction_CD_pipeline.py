@@ -3990,7 +3990,11 @@ def plot_action_decoding_over_time(
         False, returns the ``Figure`` for further customization.
     """
     if axes is None:
-        axes = [a for a in ACTION_AXES.keys() if a in df["axis"].unique()]
+        present = list(df["axis"].unique())
+        # Preserve the canonical ACTION_AXES ordering when applicable, then
+        # append any other axes (e.g. "prev_reward") found in df.
+        axes = [a for a in ACTION_AXES.keys() if a in present]
+        axes += [a for a in present if a not in axes]
     n_axes = len(axes)
 
     colors = plt.cm.tab10(np.linspace(0, 1, max(n_axes, 4)))
