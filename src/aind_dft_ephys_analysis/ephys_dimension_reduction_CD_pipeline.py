@@ -3995,6 +3995,7 @@ def compute_cd_stability(
     min_units_num: int = 30,
     restrict_events: Optional[Tuple[str, str]] = None,
     restrict_align: Optional[str] = None,
+    use_common_trials: bool = False,
     norm_mode: str = "divide_sqrtN",
     zscore_units: bool = False,
     random_state: int = 0,
@@ -4018,6 +4019,12 @@ def compute_cd_stability(
     differs from ``align``) fully covers that window. A small floating-point
     tolerance (1e-6) is applied on each edge. The per-window ``n_typeA`` /
     ``n_typeB`` reflect the *eligible* trials actually used.
+
+    ``use_common_trials`` : if ``True``, intersect the per-window eligible
+    trial sets and refit every CD axis on the *same* (common) trial set.
+    This isolates temporal variation in the population code from variation
+    driven by changing trial composition. Has no effect when
+    ``restrict_events is None`` (every trial is then eligible everywhere).
 
     Returns
     -------
@@ -4116,13 +4123,54 @@ def compute_cd_stability(
                 )
             offsets = None
 
+    # Optional: intersect eligible trials across all windows so every CD
+    # axis is fit on the SAME trial set.
+    common_ids: Optional[np.ndarray] = None
+    if use_common_trials and offsets is not None:
+        per_win_eligible: List[np.ndarray] = []
+        for win in windows:
+            elig = np.array(
+                [tid for tid, (s, e) in offsets.items()
+                 if s <= win[0] + 1e-6 and e >= win[1] - 1e-6],
+                dtype=int,
+            )
+            per_win_eligible.append(elig)
+        if per_win_eligible:
+            common_ids = per_win_eligible[0]
+            for elig in per_win_eligible[1:]:
+                common_ids = np.intersect1d(common_ids, elig, assume_unique=False)
+        else:
+            common_ids = np.empty(0, dtype=int)
+        if verbose:
+            print(
+                f"  use_common_trials=True: common eligible trials across "
+                f"{len(windows)} windows = {common_ids.size}"
+            )
+        if common_ids.size == 0:
+            raise RuntimeError(
+                f"[{session}] use_common_trials=True but no trial is eligible "
+                f"in every window. Narrow t_start/t_end/bin_width or disable."
+            )
+
     # Fit one CD axis per window --------------------------------------------
     axes: List[np.ndarray] = []
     used_windows: List[Tuple[float, float]] = []
     per_window_counts: List[Tuple[int, int, int]] = []  # (n_eligible, n_A, n_B)
     eps = 1e-6
     for win in windows:
-        if offsets is not None:
+        if common_ids is not None:
+            # Same trial set for every window.
+            a_ids = np.intersect1d(typeA_ids, common_ids, assume_unique=False)
+            b_ids = np.intersect1d(typeB_ids, common_ids, assume_unique=False)
+            n_elig = int(common_ids.size)
+            if a_ids.size == 0 or b_ids.size == 0:
+                if verbose:
+                    print(
+                        f"  [skip] window {win}: common-trial |A|={a_ids.size}, "
+                        f"|B|={b_ids.size}"
+                    )
+                continue
+        elif offsets is not None:
             eligible = np.array(
                 [tid for tid, (s, e) in offsets.items()
                  if s <= win[0] + eps and e >= win[1] - eps],
@@ -4200,6 +4248,8 @@ def compute_cd_stability(
         "binsize": binsize,
         "restrict_events": (tuple(restrict_events) if restrict_events else None),
         "restrict_align": restrict_align,
+        "use_common_trials": bool(use_common_trials),
+        "common_trial_ids": (None if common_ids is None else common_ids.copy()),
     }
 
 
