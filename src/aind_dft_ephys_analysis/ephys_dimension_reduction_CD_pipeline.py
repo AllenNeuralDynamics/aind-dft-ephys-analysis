@@ -4277,6 +4277,326 @@ def compute_cd_stability_multi(
     return out
 
 
+def compute_action_cd_stability(
+    *,
+    session: str,
+    psth_root: str | Path,
+    behavior_root: str | Path,
+    align: str = "trial_start",
+    binsize: str = "0.1",
+    time_windows: Optional[Sequence[Tuple[float, float]]] = None,
+    t_start: Optional[float] = None,
+    t_end: Optional[float] = None,
+    bin_width: Optional[float] = None,
+    axes: Sequence[str] = ("prev_choice", "up_choice", "switch_stay", "switch_dir"),
+    metadata: Optional[pd.DataFrame] = None,
+    region_group: Sequence[str] = (),
+    min_units_num: int = 30,
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
+    n_per_cell: Optional[int] = None,
+    use_common_trials: bool = False,
+    norm_mode: str = "divide_sqrtN",
+    zscore_units: bool = False,
+    seed: int = 0,
+    random_state: int = 0,
+    verbose: bool = True,
+) -> Dict[str, Dict[str, Any]]:
+    """CD-axis stability across non-overlapping windows for the action axes.
+
+    Counterpart of :func:`compute_cd_stability` for the 4-cell (prev-choice
+    x upcoming-choice) design used by :func:`decode_action_axes_over_time`.
+    For each window:
+
+    1. Find trials whose ``[restrict_events[0], restrict_events[1]]`` offsets
+       (in the PSTH ``align`` frame) cover the window.
+    2. Intersect with each of the 4 :data:`ACTION_CELLS` and subsample to a
+       common ``n = min(...)`` (or ``n_per_cell`` if forced) so each axis is
+       balanced w.r.t. the orthogonal factors at this bin.
+    3. For each requested axis (``prev_choice``, ``up_choice``,
+       ``switch_stay``, ``switch_dir``), union the balanced cells and fit a
+       fresh unit-norm CD axis on the window's data.
+
+    ``use_common_trials`` : if ``True``, the eligible-trial sets are first
+    intersected across all windows, then balancing is performed *once* on
+    that common set and reused for every window. This isolates temporal
+    variation in the population code from variation driven by changing trial
+    composition.
+
+    Returns
+    -------
+    dict
+        ``{axis_name: stab_dict}`` where each ``stab_dict`` has the same
+        schema as :func:`compute_cd_stability` (with ``trial_types`` set to
+        the per-axis cell tuples).
+    """
+    from create_psth import load_zarr
+    from general_utils import smart_read_csv
+
+    # --- Resolve windows ---------------------------------------------------
+    if time_windows is None:
+        if t_start is None or t_end is None or bin_width is None:
+            raise ValueError(
+                "Provide either `time_windows` or all of `t_start`/`t_end`/`bin_width`."
+            )
+        windows = _make_nonoverlapping_windows(float(t_start), float(t_end), float(bin_width))
+    else:
+        windows = [(float(a), float(b)) for (a, b) in time_windows]
+    if not windows:
+        raise ValueError("No time windows produced; check inputs.")
+
+    # --- Validate axes -----------------------------------------------------
+    bad = [a for a in axes if a not in ACTION_AXES]
+    if bad:
+        raise ValueError(f"Unknown axis names {bad}; expected subset of {list(ACTION_AXES.keys())}")
+
+    # --- Load PSTH + behavior CSV -----------------------------------------
+    psth_path = Path(psth_root) / f"{session}_{binsize}s.zarr"
+    beh_path = Path(behavior_root) / f"behavior_summary-{session}.csv"
+    if not psth_path.exists():
+        raise FileNotFoundError(f"PSTH zarr not found: {psth_path}")
+    if not beh_path.exists():
+        raise FileNotFoundError(f"Behavior CSV not found: {beh_path}")
+
+    psth_da = load_zarr(str(psth_path))
+    df = smart_read_csv(str(beh_path))
+
+    cell_ids: Dict[str, np.ndarray] = {}
+    for cell in ACTION_CELLS:
+        col = f"{cell}_trials"
+        if col not in df.columns:
+            raise KeyError(f"Missing column {col!r} in {beh_path.name}")
+        cell_ids[cell] = np.asarray(df[col].iloc[0], dtype=int).ravel()
+
+    # --- Unit selection ---------------------------------------------------
+    unit_ids: Optional[np.ndarray] = None
+    if metadata is not None and len(region_group):
+        mask = (
+            (metadata["sorted_session_name"] == session)
+            & (metadata["brain_region"].isin(region_group))
+        )
+        unit_ids = metadata.loc[mask, "unit_index"].to_numpy()
+        if len(unit_ids) < min_units_num:
+            raise ValueError(
+                f"Only {len(unit_ids)} units < min_units_num={min_units_num}"
+            )
+
+    if verbose:
+        print(
+            f"[{session}] action CD stability: {len(windows)} windows, "
+            f"axes={list(axes)}, units={'ALL' if unit_ids is None else len(unit_ids)}"
+        )
+
+    # --- Per-trial eligibility offsets (PSTH align frame) -----------------
+    offsets: Optional[Dict[int, Tuple[float, float]]] = None
+    if restrict_events is not None:
+        if restrict_align is not None and restrict_align != align and verbose:
+            print(
+                f"  [info] restrict_align={restrict_align!r} differs from "
+                f"PSTH align={align!r}; using PSTH align for eligibility frame."
+            )
+        try:
+            offsets = compute_per_trial_event_offsets(
+                session,
+                event_start=restrict_events[0],
+                event_end=restrict_events[1],
+                align=align,
+            )
+            if verbose:
+                print(
+                    f"  restrict_events={restrict_events}: "
+                    f"{len(offsets)} trials have valid offsets."
+                )
+        except Exception as e:  # noqa: BLE001
+            if verbose:
+                print(
+                    f"  [warn] restrict_events offsets failed ({e}); "
+                    "skipping eligibility filter."
+                )
+            offsets = None
+
+    # --- Optional: shared eligible trial set across all windows ------------
+    common_ids: Optional[np.ndarray] = None
+    common_balanced: Optional[Dict[str, np.ndarray]] = None
+    common_n_used: int = 0
+    if use_common_trials and offsets is not None:
+        per_win_eligible: List[np.ndarray] = []
+        for win in windows:
+            elig = np.array(
+                [tid for tid, (s, e) in offsets.items()
+                 if s <= win[0] + 1e-6 and e >= win[1] - 1e-6],
+                dtype=int,
+            )
+            per_win_eligible.append(elig)
+        common_ids = per_win_eligible[0]
+        for elig in per_win_eligible[1:]:
+            common_ids = np.intersect1d(common_ids, elig, assume_unique=False)
+        if verbose:
+            print(
+                f"  use_common_trials=True: common eligible trials across "
+                f"{len(windows)} windows = {common_ids.size}"
+            )
+        if common_ids.size == 0:
+            raise RuntimeError(
+                f"[{session}] use_common_trials=True but no trial is eligible "
+                f"in every window. Narrow t_start/t_end/bin_width or disable."
+            )
+        # Balance once on the common set; reuse for every window.
+        common_balanced, common_n_used = _balance_cells_from_ids(
+            cell_ids, common_ids, n_per_cell=n_per_cell, seed=int(seed),
+        )
+        if common_n_used == 0:
+            raise RuntimeError(
+                f"[{session}] use_common_trials=True but common-trial balance "
+                f"yielded 0 trials per cell."
+            )
+        if verbose:
+            print(f"  common balanced: n_per_cell={common_n_used}")
+
+    # --- Per-window per-axis CD fit ---------------------------------------
+    # axes_per: axis -> list of (window, axis_vector, n_eligible, n_per_cell, n_A, n_B)
+    axes_per: Dict[str, List[Tuple[Tuple[float, float], np.ndarray, int, int, int, int]]] = {
+        ax: [] for ax in axes
+    }
+
+    eps = 1e-6
+    for k, win in enumerate(windows):
+        if common_balanced is not None:
+            balanced = common_balanced
+            n_used = common_n_used
+            n_elig = int(common_ids.size) if common_ids is not None else -1
+        else:
+            if offsets is not None:
+                eligible = np.array(
+                    [tid for tid, (s, e) in offsets.items()
+                     if s <= win[0] + eps and e >= win[1] - eps],
+                    dtype=int,
+                )
+                n_elig = int(eligible.size)
+            else:
+                eligible = None
+                n_elig = -1
+            balanced, n_used = _balance_cells_from_ids(
+                cell_ids, eligible, n_per_cell=n_per_cell, seed=int(seed) + int(k),
+            )
+            if n_used == 0:
+                if verbose:
+                    print(f"  [skip] window {win}: empty after balancing")
+                continue
+
+        for ax_name in axes:
+            cells_a, cells_b = ACTION_AXES[ax_name]
+            a_ids = np.unique(np.concatenate([balanced[c] for c in cells_a]))
+            b_ids = np.unique(np.concatenate([balanced[c] for c in cells_b]))
+            if a_ids.size == 0 or b_ids.size == 0:
+                continue
+            try:
+                out = coding_direction_from_psth(
+                    psth_da=psth_da,
+                    trial_ids_typeA=a_ids,
+                    trial_ids_typeB=b_ids,
+                    align=align,
+                    time_window=win,
+                    projection_time_window=win,
+                    random_state=int(random_state),
+                    two_fold_cv=False,
+                    norm_mode=norm_mode,
+                    zscore_units=zscore_units,
+                    save_path=None,
+                    unit_ids=unit_ids,
+                )
+            except Exception as e:  # noqa: BLE001
+                if verbose:
+                    print(f"  [warn] window {win} axis={ax_name} CD fit failed: {e}")
+                continue
+            w = np.asarray(out["final_all"]["axis_w"], dtype=float).ravel()
+            if w.size == 0:
+                continue
+            axes_per[ax_name].append(
+                (win, w, n_elig, int(n_used), int(a_ids.size), int(b_ids.size))
+            )
+
+    # --- Assemble per-axis stab dicts -------------------------------------
+    results: Dict[str, Dict[str, Any]] = {}
+    for ax_name in axes:
+        recs = axes_per[ax_name]
+        if not recs:
+            if verbose:
+                print(f"  [warn] axis={ax_name}: no CD axes successfully fitted")
+            continue
+        used = np.asarray([r[0] for r in recs], dtype=float)        # (n_windows, 2)
+        axes_arr = np.vstack([r[1] for r in recs])                  # (n_windows, n_units)
+        centers = used.mean(axis=1)
+        n_elig_arr = np.asarray([r[2] for r in recs], dtype=int)
+        n_pc_arr   = np.asarray([r[3] for r in recs], dtype=int)
+        n_a_arr    = np.asarray([r[4] for r in recs], dtype=int)
+        n_b_arr    = np.asarray([r[5] for r in recs], dtype=int)
+        norms = np.linalg.norm(axes_arr, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        axes_unit = axes_arr / norms
+        cosine = axes_unit @ axes_unit.T
+        cells_a, cells_b = ACTION_AXES[ax_name]
+        results[ax_name] = {
+            "session": session,
+            "axis": ax_name,
+            "time_windows": used,
+            "centers": centers,
+            "axes": axes_arr,
+            "cosine": cosine,
+            "unit_ids": unit_ids,
+            "n_typeA": int(sum(cell_ids[c].size for c in cells_a)),
+            "n_typeB": int(sum(cell_ids[c].size for c in cells_b)),
+            "per_window_n_eligible": n_elig_arr,
+            "per_window_n_per_cell": n_pc_arr,
+            "per_window_n_A": n_a_arr,
+            "per_window_n_B": n_b_arr,
+            "trial_types": (tuple(cells_a), tuple(cells_b)),
+            "align": align,
+            "binsize": binsize,
+            "restrict_events": (tuple(restrict_events) if restrict_events else None),
+            "restrict_align": restrict_align,
+            "use_common_trials": bool(use_common_trials),
+            "common_trial_ids": (None if common_ids is None else common_ids.copy()),
+            "n_per_cell": n_per_cell,
+        }
+    if not results:
+        raise RuntimeError(f"[{session}] No action CD axes successfully fitted.")
+    return results
+
+
+def compute_action_cd_stability_multi(
+    *,
+    sessions: Iterable[str],
+    psth_root: str | Path,
+    behavior_root: str | Path,
+    axes: Sequence[str] = ("prev_choice", "up_choice", "switch_stay", "switch_dir"),
+    **kwargs: Any,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Run :func:`compute_action_cd_stability` for many sessions.
+
+    Returns a nested dict keyed first by axis name, then by session, so each
+    axis's per-session collection can be passed directly to
+    :func:`plot_cd_stability`.
+    """
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {ax: {} for ax in axes}
+    for session in sessions:
+        try:
+            per_axis = compute_action_cd_stability(
+                session=session,
+                psth_root=psth_root,
+                behavior_root=behavior_root,
+                axes=axes,
+                **kwargs,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[skip] {session}: {e}")
+            continue
+        for ax_name, stab in per_axis.items():
+            out[ax_name][session] = stab
+    # Drop axes that ended up empty across all sessions.
+    return {ax: d for ax, d in out.items() if d}
+
+
 def plot_cd_stability(
     stability: Dict[str, Any] | Sequence[Dict[str, Any]] | Dict[str, Dict[str, Any]],
     *,
