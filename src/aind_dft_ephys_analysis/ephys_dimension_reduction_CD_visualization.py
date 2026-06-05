@@ -496,12 +496,22 @@ def plot_cd_heatmap(
     B_plot = B_sm[_sort_order(B_sm)] if have_B else None
 
     # ---- color limits ----
+    # Compute auto vmin/vmax only from the *visible* time window (``xlim``)
+    # when given, so outliers outside the displayed range don't shrink the
+    # effective contrast inside it. Data values are NOT clipped — only the
+    # colorbar mapping is.
     if vmin is None and vmax is None:
+        if xlim is not None:
+            cmask = (time >= float(xlim[0])) & (time <= float(xlim[1]))
+            if not np.any(cmask):
+                cmask = np.ones_like(time, dtype=bool)
+        else:
+            cmask = np.ones_like(time, dtype=bool)
         pool = []
         if A_plot is not None:
-            pool.append(A_plot[np.isfinite(A_plot)])
+            pool.append(A_plot[:, cmask][np.isfinite(A_plot[:, cmask])])
         if B_plot is not None:
-            pool.append(B_plot[np.isfinite(B_plot)])
+            pool.append(B_plot[:, cmask][np.isfinite(B_plot[:, cmask])])
         if pool:
             flat = np.concatenate(pool)
             if flat.size:
