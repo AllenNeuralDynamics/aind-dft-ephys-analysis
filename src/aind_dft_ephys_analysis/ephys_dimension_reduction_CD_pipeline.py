@@ -4287,14 +4287,42 @@ def plot_cd_stability(
 
     # Aggregate across sessions --------------------------------------------
     if aggregate:
-        shapes = {s["cosine"].shape for s in stabs}
-        if len(shapes) != 1:
-            raise ValueError(
-                "Cannot aggregate: sessions have different window grids "
-                f"({shapes})."
+        # Build the union of all window centers (rounded for robust hashing),
+        # then for each session map its cosine matrix into that full grid
+        # (NaN where a window was skipped). nanmean across sessions handles
+        # the gaps. This makes aggregation robust to per-session eligibility
+        # filtering producing different (shorter) window lists.
+        round_decimals = 6
+        center_sets = []
+        for s in stabs:
+            center_sets.append(np.round(np.asarray(s["centers"], dtype=float), round_decimals))
+        all_centers = np.unique(np.concatenate(center_sets))
+        n_full = all_centers.size
+        cubes = np.full((len(stabs), n_full, n_full), np.nan, dtype=float)
+        for k, s in enumerate(stabs):
+            sc = np.round(np.asarray(s["centers"], dtype=float), round_decimals)
+            cos = np.asarray(s["cosine"], dtype=float)
+            # Index of each session center in the full grid
+            idx = np.searchsorted(all_centers, sc)
+            # Defensive: ensure exact matches (np.unique was applied above)
+            if not np.all(all_centers[idx] == sc):
+                raise RuntimeError(
+                    "Failed to align session centers to the union grid; "
+                    "this should not happen."
+                )
+            cubes[k][np.ix_(idx, idx)] = cos
+        with np.errstate(invalid="ignore"):
+            cos_mean = np.nanmean(cubes, axis=0)
+        # Coverage per cell: how many sessions contribute to each pair.
+        coverage = np.sum(np.isfinite(cubes), axis=0)
+        centers = all_centers
+
+        if np.any(coverage == 0):
+            print(
+                f"[plot_cd_stability] {int((coverage == 0).sum())} cells have "
+                "no session coverage and will appear blank."
             )
-        cos_mean = np.nanmean(np.stack([s["cosine"] for s in stabs], axis=0), axis=0)
-        centers = stabs[0]["centers"]
+
         fig, ax = plt.subplots(figsize=figsize or (6, 5))
         ttl = title or (
             f"CD stability (cosine) — mean across {len(stabs)} sessions"
@@ -4317,19 +4345,18 @@ def plot_cd_stability(
     if figsize is None:
         figsize = (5.0 * n_cols, 4.5 * n_rows)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False)
-    last_im = None
     for k, s in enumerate(stabs):
         r, c = divmod(k, n_cols)
         ax = axes[r, c]
         ttl = title if (single_input and title) else f"{s.get('session', '?')}"
-        last_im = _draw(ax, s["cosine"], s["centers"], ttl)
+        im = _draw(ax, s["cosine"], s["centers"], ttl)
+        # Per-panel colorbar (snug next to its own heatmap).
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
+                     label="cosine similarity")
     # Hide unused axes
     for k in range(n_sess, n_rows * n_cols):
         r, c = divmod(k, n_cols)
         axes[r, c].set_visible(False)
-    if last_im is not None:
-        fig.colorbar(last_im, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02,
-                     label="cosine similarity")
     if title and not single_input:
         fig.suptitle(title)
     fig.tight_layout()
