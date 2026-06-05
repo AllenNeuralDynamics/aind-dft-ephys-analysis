@@ -376,7 +376,7 @@ def plot_cd_heatmap(
     cmap: str = "RdBu_r",
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
-    vrange_quantile: float = 0.99,
+    vrange_quantile: float = 0.98,
     symmetric_colorbar: bool = True,
     labels: Tuple[str, str] = ("Type A", "Type B"),
     figsize: Optional[Tuple[float, float]] = None,
@@ -414,8 +414,10 @@ def plot_cd_heatmap(
     vmin, vmax : float, optional
         Color limits. If both None, computed from the central ``vrange_quantile``
         of the (smoothed) data, optionally made symmetric around 0.
-    vrange_quantile : float, default 0.99
-        When auto-computing limits, use this two-sided quantile.
+    vrange_quantile : float, default 0.98
+        When auto-computing limits, use this two-sided quantile (i.e.
+        clips at the (1-q)/q tails — e.g. ``0.98`` -> 2nd / 98th
+        percentiles for higher contrast in the presence of outliers).
     symmetric_colorbar : bool, default True
         Force ``vmin = -vmax`` when auto-computing limits (useful for diverging
         colormaps like ``RdBu_r``).

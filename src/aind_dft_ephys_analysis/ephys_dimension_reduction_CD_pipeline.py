@@ -1432,7 +1432,7 @@ def plot_cd_session_heatmap(
     cmap: str = "RdBu_r",
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
-    vrange_quantile: float = 0.99,
+    vrange_quantile: float = 0.98,
     symmetric_colorbar: bool = True,
     figsize: Optional[Tuple[float, float]] = None,
     threshold: Optional[float] = None,
@@ -1674,7 +1674,7 @@ def plot_cd_session_bumps(
     density_bin_width_sec: Optional[float] = 0.25,
     xlim: Optional[Tuple[float, float]] = None,
     cmap: str = "RdBu_r",
-    vrange_quantile: float = 0.99,
+    vrange_quantile: float = 0.98,
     return_df: bool = False,
 ) -> Optional[Dict[str, pd.DataFrame]]:
     """Detect and visualize transient bumps in per-trial CD projections.
