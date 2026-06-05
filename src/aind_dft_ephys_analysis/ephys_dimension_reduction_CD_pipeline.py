@@ -3993,6 +3993,8 @@ def compute_cd_stability(
     metadata: Optional[pd.DataFrame] = None,
     region_group: Sequence[str] = (),
     min_units_num: int = 30,
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
     norm_mode: str = "divide_sqrtN",
     zscore_units: bool = False,
     random_state: int = 0,
@@ -4008,6 +4010,14 @@ def compute_cd_stability(
     Provide either an explicit ``time_windows`` list of ``(t0, t1)`` tuples,
     or ``t_start`` / ``t_end`` / ``bin_width`` (windows are then tiled
     contiguously, no overlap).
+
+    ``restrict_events`` : optional ``(event_start, event_end)`` pair. When
+    given, per window the CD axis is fit only on trials whose per-trial
+    ``[event_start, event_end]`` interval (offsets in the PSTH ``align``
+    frame; ``restrict_align`` is accepted for symmetry but ignored when it
+    differs from ``align``) fully covers that window. A small floating-point
+    tolerance (1e-6) is applied on each edge. The per-window ``n_typeA`` /
+    ``n_typeB`` reflect the *eligible* trials actually used.
 
     Returns
     -------
@@ -4078,15 +4088,66 @@ def compute_cd_stability(
             f"units={'ALL' if unit_ids is None else len(unit_ids)}"
         )
 
+    # Per-trial eligibility offsets (in the PSTH ``align`` frame), if any.
+    offsets: Optional[Dict[int, Tuple[float, float]]] = None
+    if restrict_events is not None:
+        if restrict_align is not None and restrict_align != align and verbose:
+            print(
+                f"  [info] restrict_align={restrict_align!r} differs from "
+                f"PSTH align={align!r}; using PSTH align for eligibility frame."
+            )
+        try:
+            offsets = compute_per_trial_event_offsets(
+                session,
+                event_start=restrict_events[0],
+                event_end=restrict_events[1],
+                align=align,
+            )
+            if verbose:
+                print(
+                    f"  restrict_events={restrict_events}: "
+                    f"{len(offsets)} trials have valid offsets."
+                )
+        except Exception as e:  # noqa: BLE001
+            if verbose:
+                print(
+                    f"  [warn] restrict_events offsets failed ({e}); "
+                    "skipping eligibility filter."
+                )
+            offsets = None
+
     # Fit one CD axis per window --------------------------------------------
     axes: List[np.ndarray] = []
     used_windows: List[Tuple[float, float]] = []
+    per_window_counts: List[Tuple[int, int, int]] = []  # (n_eligible, n_A, n_B)
+    eps = 1e-6
     for win in windows:
+        if offsets is not None:
+            eligible = np.array(
+                [tid for tid, (s, e) in offsets.items()
+                 if s <= win[0] + eps and e >= win[1] - eps],
+                dtype=int,
+            )
+            a_ids = np.intersect1d(typeA_ids, eligible, assume_unique=False)
+            b_ids = np.intersect1d(typeB_ids, eligible, assume_unique=False)
+            n_elig = int(eligible.size)
+            if a_ids.size == 0 or b_ids.size == 0:
+                if verbose:
+                    print(
+                        f"  [skip] window {win}: |A_eligible|={a_ids.size}, "
+                        f"|B_eligible|={b_ids.size}"
+                    )
+                continue
+        else:
+            a_ids = typeA_ids
+            b_ids = typeB_ids
+            n_elig = -1
+
         try:
             out = coding_direction_from_psth(
                 psth_da=psth_da,
-                trial_ids_typeA=typeA_ids,
-                trial_ids_typeB=typeB_ids,
+                trial_ids_typeA=a_ids,
+                trial_ids_typeB=b_ids,
                 align=align,
                 time_window=win,
                 projection_time_window=win,
@@ -4106,6 +4167,7 @@ def compute_cd_stability(
             continue
         axes.append(w)
         used_windows.append(win)
+        per_window_counts.append((n_elig, int(a_ids.size), int(b_ids.size)))
 
     if not axes:
         raise RuntimeError(f"[{session}] No CD axes successfully fitted.")
@@ -4113,6 +4175,7 @@ def compute_cd_stability(
     axes_arr = np.vstack(axes)                         # (n_windows, n_units)
     used = np.asarray(used_windows, dtype=float)       # (n_windows, 2)
     centers = used.mean(axis=1)
+    counts_arr = np.asarray(per_window_counts, dtype=int)  # (n_windows, 3)
 
     # Cosine similarity (axes are already unit-norm; renormalize defensively).
     norms = np.linalg.norm(axes_arr, axis=1, keepdims=True)
@@ -4129,9 +4192,14 @@ def compute_cd_stability(
         "unit_ids": unit_ids,
         "n_typeA": int(typeA_ids.size),
         "n_typeB": int(typeB_ids.size),
+        "per_window_n_eligible": counts_arr[:, 0] if counts_arr.size else np.empty(0, int),
+        "per_window_n_A":        counts_arr[:, 1] if counts_arr.size else np.empty(0, int),
+        "per_window_n_B":        counts_arr[:, 2] if counts_arr.size else np.empty(0, int),
         "trial_types": tuple(trial_types),
         "align": align,
         "binsize": binsize,
+        "restrict_events": (tuple(restrict_events) if restrict_events else None),
+        "restrict_align": restrict_align,
     }
 
 
