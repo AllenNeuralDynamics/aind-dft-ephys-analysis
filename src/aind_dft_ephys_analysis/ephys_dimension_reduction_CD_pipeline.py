@@ -3955,6 +3955,322 @@ def decode_prev_reward_over_time(
     return pd.DataFrame(rows)
 
 
+# ---------------------------------------------------------------------------
+# CD axis stability across non-overlapping time windows
+# ---------------------------------------------------------------------------
+
+def _make_nonoverlapping_windows(
+    t_start: float, t_end: float, bin_width: float
+) -> List[Tuple[float, float]]:
+    """Return a list of contiguous non-overlapping ``(t0, t1)`` windows.
+
+    Windows tile ``[t_start, t_end]`` with width ``bin_width``. The last
+    window is truncated if it does not fit exactly.
+    """
+    if bin_width <= 0:
+        raise ValueError(f"bin_width must be > 0, got {bin_width!r}")
+    if t_end <= t_start:
+        raise ValueError(f"t_end ({t_end}) must be > t_start ({t_start})")
+    n = int(np.floor((float(t_end) - float(t_start)) / float(bin_width)))
+    edges = [float(t_start) + i * float(bin_width) for i in range(n + 1)]
+    if edges[-1] < float(t_end) - 1e-9:
+        edges.append(float(t_end))
+    return [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
+
+
+def compute_cd_stability(
+    *,
+    session: str,
+    psth_root: str | Path,
+    behavior_root: str | Path,
+    trial_types: Tuple[str, str],
+    align: str = "go_cue",
+    binsize: str = "0.1",
+    time_windows: Optional[Sequence[Tuple[float, float]]] = None,
+    t_start: Optional[float] = None,
+    t_end: Optional[float] = None,
+    bin_width: Optional[float] = None,
+    metadata: Optional[pd.DataFrame] = None,
+    region_group: Sequence[str] = (),
+    min_units_num: int = 30,
+    norm_mode: str = "divide_sqrtN",
+    zscore_units: bool = False,
+    random_state: int = 0,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Compute CD axes in non-overlapping time windows + their cosine matrix.
+
+    For one session we refit the coding-direction axis (class A vs class B,
+    defined by ``trial_types``) inside every requested window, then take the
+    pairwise cosine similarity between the unit-space axis vectors. Each axis
+    is unit-norm (set by :func:`_compute_cd_axis`), so cosine = dot product.
+
+    Provide either an explicit ``time_windows`` list of ``(t0, t1)`` tuples,
+    or ``t_start`` / ``t_end`` / ``bin_width`` (windows are then tiled
+    contiguously, no overlap).
+
+    Returns
+    -------
+    dict
+        ``session``       : session name
+        ``time_windows``  : ``np.ndarray`` of shape ``(n_windows, 2)``
+        ``centers``       : window centers (s, ``np.ndarray``)
+        ``axes``          : ``(n_windows, n_units)`` matrix of unit-norm CDs
+        ``cosine``        : ``(n_windows, n_windows)`` cosine-similarity matrix
+        ``unit_ids``      : unit indices used (or None for ALL units)
+        ``n_typeA``, ``n_typeB`` : trial counts going into each per-window fit
+        ``trial_types``   : the input ``trial_types`` tuple
+        ``align``, ``binsize`` : echoed from inputs
+    """
+    from create_psth import load_zarr
+    from general_utils import smart_read_csv
+
+    # Resolve window list ----------------------------------------------------
+    if time_windows is None:
+        if t_start is None or t_end is None or bin_width is None:
+            raise ValueError(
+                "Provide either `time_windows` or all of `t_start`/`t_end`/`bin_width`."
+            )
+        windows = _make_nonoverlapping_windows(float(t_start), float(t_end), float(bin_width))
+    else:
+        windows = [(float(a), float(b)) for (a, b) in time_windows]
+    if not windows:
+        raise ValueError("No time windows produced; check inputs.")
+
+    psth_path = Path(psth_root) / f"{session}_{binsize}s.zarr"
+    beh_path = Path(behavior_root) / f"behavior_summary-{session}.csv"
+    if not psth_path.exists():
+        raise FileNotFoundError(f"PSTH zarr not found: {psth_path}")
+    if not beh_path.exists():
+        raise FileNotFoundError(f"Behavior CSV not found: {beh_path}")
+
+    psth_da = load_zarr(str(psth_path))
+    df = smart_read_csv(str(beh_path))
+
+    if trial_types[0] not in df.columns or trial_types[1] not in df.columns:
+        raise KeyError(
+            f"Behavior CSV missing trial_types columns: {trial_types}"
+        )
+    typeA_ids = _clean_ids(df[trial_types[0]])
+    typeB_ids = _clean_ids(df[trial_types[1]])
+    if typeA_ids.size == 0 or typeB_ids.size == 0:
+        raise ValueError(
+            f"Empty trial set: |A|={typeA_ids.size}, |B|={typeB_ids.size}"
+        )
+
+    # Unit selection (same convention as decode_action_axes_over_time) ------
+    unit_ids: Optional[np.ndarray] = None
+    if metadata is not None and len(region_group):
+        mask = (
+            (metadata["sorted_session_name"] == session)
+            & (metadata["brain_region"].isin(region_group))
+        )
+        unit_ids = metadata.loc[mask, "unit_index"].to_numpy()
+        if len(unit_ids) < min_units_num:
+            raise ValueError(
+                f"Only {len(unit_ids)} units < min_units_num={min_units_num}"
+            )
+
+    if verbose:
+        print(
+            f"[{session}] CD stability: {len(windows)} windows, "
+            f"|A|={typeA_ids.size}, |B|={typeB_ids.size}, "
+            f"units={'ALL' if unit_ids is None else len(unit_ids)}"
+        )
+
+    # Fit one CD axis per window --------------------------------------------
+    axes: List[np.ndarray] = []
+    used_windows: List[Tuple[float, float]] = []
+    for win in windows:
+        try:
+            out = coding_direction_from_psth(
+                psth_da=psth_da,
+                trial_ids_typeA=typeA_ids,
+                trial_ids_typeB=typeB_ids,
+                align=align,
+                time_window=win,
+                projection_time_window=win,
+                random_state=int(random_state),
+                two_fold_cv=False,
+                norm_mode=norm_mode,
+                zscore_units=zscore_units,
+                save_path=None,
+                unit_ids=unit_ids,
+            )
+        except Exception as e:  # noqa: BLE001
+            if verbose:
+                print(f"  [warn] window {win} CD fit failed: {e}")
+            continue
+        w = np.asarray(out["final_all"]["axis_w"], dtype=float).ravel()
+        if w.size == 0:
+            continue
+        axes.append(w)
+        used_windows.append(win)
+
+    if not axes:
+        raise RuntimeError(f"[{session}] No CD axes successfully fitted.")
+
+    axes_arr = np.vstack(axes)                         # (n_windows, n_units)
+    used = np.asarray(used_windows, dtype=float)       # (n_windows, 2)
+    centers = used.mean(axis=1)
+
+    # Cosine similarity (axes are already unit-norm; renormalize defensively).
+    norms = np.linalg.norm(axes_arr, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    axes_unit = axes_arr / norms
+    cosine = axes_unit @ axes_unit.T                   # (n_windows, n_windows)
+
+    return {
+        "session": session,
+        "time_windows": used,
+        "centers": centers,
+        "axes": axes_arr,
+        "cosine": cosine,
+        "unit_ids": unit_ids,
+        "n_typeA": int(typeA_ids.size),
+        "n_typeB": int(typeB_ids.size),
+        "trial_types": tuple(trial_types),
+        "align": align,
+        "binsize": binsize,
+    }
+
+
+def compute_cd_stability_multi(
+    *,
+    sessions: Iterable[str],
+    psth_root: str | Path,
+    behavior_root: str | Path,
+    trial_types: Tuple[str, str],
+    **kwargs: Any,
+) -> Dict[str, Dict[str, Any]]:
+    """Run :func:`compute_cd_stability` for many sessions; skip failures."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for session in sessions:
+        try:
+            out[session] = compute_cd_stability(
+                session=session,
+                psth_root=psth_root,
+                behavior_root=behavior_root,
+                trial_types=trial_types,
+                **kwargs,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[skip] {session}: {e}")
+    return out
+
+
+def plot_cd_stability(
+    stability: Dict[str, Any] | Sequence[Dict[str, Any]] | Dict[str, Dict[str, Any]],
+    *,
+    aggregate: bool = False,
+    cmap: str = "RdBu_r",
+    vmin: float = -1.0,
+    vmax: float = 1.0,
+    annotate_centers: bool = True,
+    title: Optional[str] = None,
+    figsize: Optional[Tuple[float, float]] = None,
+    show: bool = True,
+) -> Optional[plt.Figure]:
+    """Heatmap(s) of pairwise CD cosine similarity across time windows.
+
+    Accepts either:
+
+    - a single stability ``dict`` (one heatmap),
+    - a sequence/dict of stability dicts (one heatmap per session), or
+    - a sequence/dict of stability dicts with ``aggregate=True`` -> a single
+      heatmap of the **mean cosine across sessions** (sessions must share
+      the same window grid).
+    """
+    # Normalize input -------------------------------------------------------
+    if isinstance(stability, dict) and "cosine" in stability and "centers" in stability:
+        stabs: List[Dict[str, Any]] = [stability]
+        single_input = True
+    elif isinstance(stability, dict):
+        stabs = list(stability.values())
+        single_input = False
+    else:
+        stabs = list(stability)
+        single_input = False
+    if not stabs:
+        print("[plot_cd_stability] no stability dicts provided.")
+        return None
+
+    def _draw(ax: plt.Axes, cos: np.ndarray, centers: np.ndarray, panel_title: str) -> Any:
+        n = cos.shape[0]
+        extent = (-0.5, n - 0.5, n - 0.5, -0.5)
+        im = ax.imshow(cos, cmap=cmap, vmin=vmin, vmax=vmax, extent=extent,
+                        aspect="equal", origin="upper", interpolation="nearest")
+        if annotate_centers:
+            # Show window-center labels every few ticks.
+            step = max(1, n // 12)
+            ticks = np.arange(0, n, step)
+            labels = [f"{centers[i]:+.2f}" for i in ticks]
+            ax.set_xticks(ticks)
+            ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+            ax.set_yticks(ticks)
+            ax.set_yticklabels(labels, fontsize=8)
+        else:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        ax.set_xlabel("Window center (s)")
+        ax.set_ylabel("Window center (s)")
+        ax.set_title(panel_title, fontsize=10)
+        return im
+
+    # Aggregate across sessions --------------------------------------------
+    if aggregate:
+        shapes = {s["cosine"].shape for s in stabs}
+        if len(shapes) != 1:
+            raise ValueError(
+                "Cannot aggregate: sessions have different window grids "
+                f"({shapes})."
+            )
+        cos_mean = np.nanmean(np.stack([s["cosine"] for s in stabs], axis=0), axis=0)
+        centers = stabs[0]["centers"]
+        fig, ax = plt.subplots(figsize=figsize or (6, 5))
+        ttl = title or (
+            f"CD stability (cosine) — mean across {len(stabs)} sessions"
+        )
+        im = _draw(ax, cos_mean, centers, ttl)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="cosine similarity")
+        fig.tight_layout()
+        if show:
+            plt.show()
+            return None
+        return fig
+
+    # One panel per session -------------------------------------------------
+    n_sess = len(stabs)
+    if single_input:
+        n_cols, n_rows = 1, 1
+    else:
+        n_cols = min(3, n_sess)
+        n_rows = int(np.ceil(n_sess / n_cols))
+    if figsize is None:
+        figsize = (5.0 * n_cols, 4.5 * n_rows)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False)
+    last_im = None
+    for k, s in enumerate(stabs):
+        r, c = divmod(k, n_cols)
+        ax = axes[r, c]
+        ttl = title if (single_input and title) else f"{s.get('session', '?')}"
+        last_im = _draw(ax, s["cosine"], s["centers"], ttl)
+    # Hide unused axes
+    for k in range(n_sess, n_rows * n_cols):
+        r, c = divmod(k, n_cols)
+        axes[r, c].set_visible(False)
+    if last_im is not None:
+        fig.colorbar(last_im, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02,
+                     label="cosine similarity")
+    if title and not single_input:
+        fig.suptitle(title)
+    fig.tight_layout()
+    if show:
+        plt.show()
+        return None
+    return fig
+
+
 def plot_action_decoding_over_time(
     df: pd.DataFrame,
     *,
