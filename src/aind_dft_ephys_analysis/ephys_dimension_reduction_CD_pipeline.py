@@ -1887,6 +1887,426 @@ def plot_cd_session_bumps(
 
 
 # ---------------------------------------------------------------------------
+# Single-trial dwell metrics (persistency index)
+# ---------------------------------------------------------------------------
+
+def _dwell_metrics_from_trace(
+    trace: np.ndarray,
+    time: np.ndarray,
+    *,
+    t0: float,
+    t1: float,
+    center: float,
+    class_sign: int,
+    deadband: float = 0.0,
+) -> Dict[str, float]:
+    """Per-trial dwell summary for one 1-D projection trace.
+
+    ``trace``/``time`` are equal-length 1-D arrays; NaN samples are treated
+    as missing and excluded from every count. Only samples whose ``time`` is
+    in ``[t0, t1]`` contribute. ``center`` is subtracted before scoring; a
+    sample is considered "on the class side" when its (centered) sign equals
+    ``class_sign`` (``+1`` for class A, ``-1`` for class B, ``0`` to disable
+    the on-class metrics). A non-zero ``deadband`` zeros out any sample with
+    ``abs(centered) < deadband`` (i.e. it is treated as ambiguous / not on
+    either side).
+
+    Returns a dict of scalar metrics; if no valid samples fall in the
+    window, every value is NaN (except counts, which are 0).
+    """
+    if trace.size == 0 or time.size == 0:
+        nan = float("nan")
+        return {
+            "valid_duration_sec": 0.0, "n_valid_samples": 0,
+            "mean_projection": nan, "median_projection": nan,
+            "mean_abs_projection": nan,
+            "frac_pos": nan, "frac_neg": nan, "frac_zero": nan,
+            "mean_sign": nan, "n_sign_changes": 0,
+            "longest_run_pos_sec": nan, "longest_run_neg_sec": nan,
+            "frac_on_class": nan, "frac_off_class": nan,
+            "mean_signed_distance_on_class": nan,
+            "longest_run_on_class_sec": nan, "longest_run_off_class_sec": nan,
+            "persistency_index": nan,
+        }
+
+    sel = (time >= t0) & (time <= t1)
+    x = trace[sel].astype(float, copy=False)
+    t = time[sel]
+    valid = np.isfinite(x)
+    if not np.any(valid):
+        return _dwell_metrics_from_trace(
+            np.empty(0, dtype=float), np.empty(0, dtype=float),
+            t0=t0, t1=t1, center=center, class_sign=class_sign,
+            deadband=deadband,
+        )
+    x = x[valid] - float(center)
+    t = t[valid]
+
+    # Sample spacing (use a robust median diff; falls back to total / N).
+    if t.size >= 2:
+        dt = float(np.median(np.diff(t)))
+        if not np.isfinite(dt) or dt <= 0:
+            dt = float((t[-1] - t[0]) / max(t.size - 1, 1))
+    else:
+        dt = 0.0
+    valid_dur = float(dt * x.size)
+
+    # Sign per sample with optional deadband.
+    s = np.sign(x)
+    if deadband > 0:
+        s = np.where(np.abs(x) < float(deadband), 0.0, s)
+
+    n_pos = int(np.sum(s > 0))
+    n_neg = int(np.sum(s < 0))
+    n_zero = int(np.sum(s == 0))
+    n = int(s.size)
+
+    def _longest_run(mask: np.ndarray) -> int:
+        if mask.size == 0 or not np.any(mask):
+            return 0
+        best = cur = 0
+        for v in mask:
+            if v:
+                cur += 1
+                if cur > best:
+                    best = cur
+            else:
+                cur = 0
+        return int(best)
+
+    longest_pos = _longest_run(s > 0)
+    longest_neg = _longest_run(s < 0)
+
+    # Zero-crossings: count transitions between strictly opposite signs,
+    # treating zeros (deadband or exact 0) as transparent.
+    nz = s[s != 0]
+    if nz.size >= 2:
+        n_sign_changes = int(np.sum(np.diff(np.sign(nz)) != 0))
+    else:
+        n_sign_changes = 0
+
+    if class_sign == 0:
+        frac_on = float("nan")
+        frac_off = float("nan")
+        longest_on = float("nan")
+        longest_off = float("nan")
+        mean_on_distance = float("nan")
+        persistency = float("nan")
+    else:
+        cs = int(np.sign(class_sign))
+        on_mask = s == cs
+        off_mask = s == -cs
+        frac_on = float(np.sum(on_mask) / n) if n else float("nan")
+        frac_off = float(np.sum(off_mask) / n) if n else float("nan")
+        longest_on = float(_longest_run(on_mask) * dt)
+        longest_off = float(_longest_run(off_mask) * dt)
+        mean_on_distance = float(cs * np.mean(x))
+        # Persistency index in [-1, +1]: +1 if always on own side, -1 if
+        # always off; 0 if equally split. Computed from non-zero samples
+        # so deadband samples don't pull the score toward 0.
+        non_zero = n_pos + n_neg
+        if non_zero > 0:
+            persistency = float(cs * (n_pos - n_neg) / non_zero)
+        else:
+            persistency = float("nan")
+
+    return {
+        "valid_duration_sec": valid_dur,
+        "n_valid_samples": n,
+        "mean_projection": float(np.mean(x)),
+        "median_projection": float(np.median(x)),
+        "mean_abs_projection": float(np.mean(np.abs(x))),
+        "frac_pos": float(n_pos / n) if n else float("nan"),
+        "frac_neg": float(n_neg / n) if n else float("nan"),
+        "frac_zero": float(n_zero / n) if n else float("nan"),
+        "mean_sign": float(np.mean(s)) if n else float("nan"),
+        "n_sign_changes": n_sign_changes,
+        "longest_run_pos_sec": float(longest_pos * dt),
+        "longest_run_neg_sec": float(longest_neg * dt),
+        "frac_on_class": frac_on,
+        "frac_off_class": frac_off,
+        "mean_signed_distance_on_class": mean_on_distance,
+        "longest_run_on_class_sec": longest_on,
+        "longest_run_off_class_sec": longest_off,
+        "persistency_index": persistency,
+    }
+
+
+def compute_cd_dwell_metrics(
+    sess: CDSessionData,
+    *,
+    trial_types: Optional[Sequence[str]] = None,
+    split: Literal["train", "test"] = "test",
+    time_window: Tuple[float, float] = (0.0, 5.0),
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
+    restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
+    smooth_gauss: float = 0.1,
+    smooth_mode: Literal["gaussian", "moving"] = "gaussian",
+    projection_source: Literal["unbiased", "all"] = "unbiased",
+    center: float | Literal["cross_class_median"] = 0.0,
+    deadband: float = 0.0,
+    class_signs: Tuple[int, int] = (1, -1),
+) -> pd.DataFrame:
+    """Per-trial dwell / persistency metrics for one CD session.
+
+    For each selected trial, compute a battery of scalar metrics that
+    summarize how persistently the single-trial projection stays on its
+    class side within ``time_window``. The headline metric is
+    ``persistency_index`` ``in [-1, +1]``:
+
+    - ``+1`` â†’ every (non-deadband) sample is on the trial's own-class side
+    - ``-1`` â†’ every (non-deadband) sample is on the other class's side
+    - ``0``  â†’ time on either side is equal
+
+    Trial selection, per-trial re-alignment, and per-trial masking mirror
+    :func:`plot_cd_session_heatmap`. When ``trial_types`` is given, the
+    final all-trials projection (``projection_source``) is used; otherwise
+    the train/test CV traces are used (``split``).
+
+    Parameters
+    ----------
+    time_window
+        ``(t0, t1)`` seconds, in the time frame of the trace shown to the
+        scorer (i.e. after any re-alignment from ``restrict_align``). The
+        intersection with each trial's per-trial valid window is used.
+    center
+        Origin subtracted from each sample before sign-scoring. Either a
+        float (default ``0``) or ``"cross_class_median"`` (use the median of
+        every (trial, time) sample across both classes in ``time_window`` as
+        a data-driven decision boundary).
+    deadband
+        Samples with ``abs(value - center) < deadband`` are treated as
+        ambiguous and contribute to neither side (still counted in
+        ``valid_duration_sec`` and in ``frac_zero``).
+    class_signs
+        Two-tuple ``(sign_A, sign_B)`` mapping the class index (``0`` for the
+        first ``trial_types`` entry / class A, ``1`` for the second / class B)
+        to its expected projection-side sign (``+1`` / ``-1``). Default
+        ``(+1, -1)``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-form, one row per trial. Columns include ``session``,
+        ``class_name``, ``class_index``, ``class_sign``, ``trial_id``, plus
+        the scalar metrics produced by :func:`_dwell_metrics_from_trace`.
+    """
+    # --- Trial selection ---------------------------------------------------
+    if trial_types is not None:
+        proj_all_arr = _pick_proj_all(sess, projection_source)
+        if proj_all_arr.size == 0:
+            raise ValueError(
+                f"[{sess.session}] proj_all_trials is empty; rebuild CD zarr "
+                "to include projection_trace_all_trials."
+            )
+        if sess.behavior_df is None:
+            raise ValueError(f"[{sess.session}] behavior_df missing; cannot resolve trial_types.")
+        tt_list = [trial_types] if isinstance(trial_types, str) else list(trial_types)
+        if len(tt_list) not in (1, 2):
+            raise ValueError("trial_types must contain 1 or 2 column names.")
+
+        def _ids_from_df(col: str) -> np.ndarray:
+            if col not in sess.behavior_df.columns:
+                raise KeyError(
+                    f"[{sess.session}] column {col!r} not found in behavior CSV."
+                )
+            try:
+                return np.asarray(sess.behavior_df[col].iloc[0], dtype=int).ravel()
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"[{sess.session}] could not parse {col!r}: {e}") from e
+
+        def _select(col: str) -> Tuple[np.ndarray, np.ndarray]:
+            tids = _ids_from_df(col)
+            mask = np.isin(sess.trial_id_all_trials, tids)
+            return proj_all_arr[mask], sess.trial_id_all_trials[mask]
+
+        raw_A, ids_A = _select(tt_list[0])
+        name_A = tt_list[0]
+        if len(tt_list) == 2:
+            raw_B, ids_B = _select(tt_list[1])
+            name_B = tt_list[1]
+        else:
+            raw_B = np.empty((0, proj_all_arr.shape[1]), dtype=proj_all_arr.dtype)
+            ids_B = np.empty(0, dtype=int)
+            name_B = ""
+    else:
+        if split == "train":
+            raw_A, raw_B = sess.proj_train_A, sess.proj_train_B
+            ids_A, ids_B = sess.trial_id_train_A, sess.trial_id_train_B
+        elif split == "test":
+            raw_A, raw_B = sess.proj_test_A, sess.proj_test_B
+            ids_A, ids_B = sess.trial_id_test_A, sess.trial_id_test_B
+        else:
+            raise ValueError(f"split must be 'train' or 'test', got {split!r}")
+        name_A, name_B = sess.trial_types
+
+    proj_A = raw_A
+    proj_B = raw_B
+
+    # --- Per-trial re-alignment (build_align -> restrict_align) ------------
+    if (
+        restrict_align is not None
+        and sess.build_align is not None
+        and restrict_align != sess.build_align
+    ):
+        try:
+            shifts = compute_per_trial_align_shifts(
+                sess.session,
+                from_align=sess.build_align,
+                to_align=restrict_align,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[warn] could not re-align {sess.session} "
+                f"({sess.build_align}->{restrict_align}): {e}"
+            )
+            shifts = {}
+        if shifts:
+            proj_A = _realign_traces(raw_A, ids_A, sess.dt, shifts) if raw_A.size else raw_A
+            proj_B = _realign_traces(raw_B, ids_B, sess.dt, shifts) if raw_B.size else raw_B
+            raw_A = proj_A
+            raw_B = proj_B
+
+    # --- Per-trial eligibility masking + smoothing -------------------------
+    if restrict_window_per_trial is None and restrict_events is not None:
+        ev_start, ev_end = restrict_events
+        restrict_window_per_trial = compute_per_trial_event_offsets(
+            sess.session,
+            event_start=ev_start,
+            event_end=ev_end,
+            align=restrict_align,
+        )
+
+    if restrict_window_per_trial is not None:
+        proj_A = _mask_trace_per_trial(
+            raw_A, ids_A, sess.time, restrict_window_per_trial,
+            smooth_seconds=smooth_gauss, dt=sess.dt, smooth_mode=smooth_mode,
+        ) if raw_A.size else raw_A
+        proj_B = _mask_trace_per_trial(
+            raw_B, ids_B, sess.time, restrict_window_per_trial,
+            smooth_seconds=smooth_gauss, dt=sess.dt, smooth_mode=smooth_mode,
+        ) if raw_B.size else raw_B
+    elif smooth_gauss is not None and smooth_gauss > 0:
+        # No per-trial mask: smooth the whole row (rows that are all-NaN
+        # remain all-NaN, so this is safe for sparse data too).
+        from scipy.ndimage import gaussian_filter1d, uniform_filter1d
+        kp = max(1, int(round(float(smooth_gauss) / (sess.dt or 1.0))))
+
+        def _smooth_rows(arr: np.ndarray) -> np.ndarray:
+            if arr.size == 0:
+                return arr
+            out = arr.astype(float, copy=True)
+            for i in range(out.shape[0]):
+                row = out[i]
+                valid = np.isfinite(row)
+                if not np.any(valid):
+                    continue
+                seg = row[valid]
+                if seg.size > 1:
+                    if smooth_mode == "gaussian":
+                        seg = gaussian_filter1d(seg, sigma=kp, mode="nearest")
+                    else:
+                        seg = uniform_filter1d(seg, size=kp, mode="nearest")
+                out[i, valid] = seg
+            return out
+
+        proj_A = _smooth_rows(proj_A)
+        proj_B = _smooth_rows(proj_B)
+
+    # --- Center selection --------------------------------------------------
+    if isinstance(center, str):
+        if center != "cross_class_median":
+            raise ValueError(
+                f"center must be a float or 'cross_class_median', got {center!r}"
+            )
+        # Pool every (trial, time) sample inside time_window across both classes.
+        tmask = (sess.time >= float(time_window[0])) & (sess.time <= float(time_window[1]))
+        pool = []
+        if proj_A.size and proj_A.ndim == 2:
+            pool.append(proj_A[:, tmask].ravel())
+        if proj_B.size and proj_B.ndim == 2:
+            pool.append(proj_B[:, tmask].ravel())
+        if pool:
+            all_pool = np.concatenate(pool)
+            finite = all_pool[np.isfinite(all_pool)]
+            center_val = float(np.median(finite)) if finite.size else 0.0
+        else:
+            center_val = 0.0
+    else:
+        center_val = float(center)
+
+    # --- Per-trial dwell metrics ------------------------------------------
+    sign_A, sign_B = int(class_signs[0]), int(class_signs[1])
+    t0, t1 = float(time_window[0]), float(time_window[1])
+
+    rows: List[Dict[str, Any]] = []
+
+    def _emit(proj: np.ndarray, ids: np.ndarray, name: str, class_idx: int,
+              class_sign: int) -> None:
+        if proj.size == 0 or proj.ndim != 2:
+            return
+        for i, tid in enumerate(ids):
+            m = _dwell_metrics_from_trace(
+                proj[i], sess.time,
+                t0=t0, t1=t1,
+                center=center_val,
+                class_sign=class_sign,
+                deadband=float(deadband),
+            )
+            m.update({
+                "session": sess.session,
+                "trial_id": int(tid),
+                "class_name": name,
+                "class_index": class_idx,
+                "class_sign": class_sign,
+                "center": center_val,
+                "deadband": float(deadband),
+                "t_start": t0,
+                "t_end": t1,
+            })
+            rows.append(m)
+
+    _emit(proj_A, ids_A, name_A, 0, sign_A)
+    if name_B:
+        _emit(proj_B, ids_B, name_B, 1, sign_B)
+
+    if not rows:
+        return pd.DataFrame()
+
+    cols_first = [
+        "session", "trial_id", "class_name", "class_index", "class_sign",
+        "t_start", "t_end", "center", "deadband",
+    ]
+    df = pd.DataFrame(rows)
+    rest = [c for c in df.columns if c not in cols_first]
+    return df[cols_first + rest]
+
+
+def compute_cd_dwell_metrics_multi(
+    sessions_data: Iterable[CDSessionData],
+    **kwargs: Any,
+) -> pd.DataFrame:
+    """Run :func:`compute_cd_dwell_metrics` on many sessions; concat rows.
+
+    Sessions that raise are skipped with a printed warning. Returns a long
+    DataFrame keyed by ``session`` + ``trial_id``; empty if nothing succeeded.
+    """
+    frames: List[pd.DataFrame] = []
+    for sess in sessions_data:
+        try:
+            df = compute_cd_dwell_metrics(sess, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            print(f"[skip] {getattr(sess, 'session', '?')}: {e}")
+            continue
+        if not df.empty:
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+# ---------------------------------------------------------------------------
 # Scatter: average CD projection vs P(right) per trial
 # ---------------------------------------------------------------------------
 
