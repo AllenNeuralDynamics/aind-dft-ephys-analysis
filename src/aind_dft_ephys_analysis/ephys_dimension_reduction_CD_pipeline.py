@@ -2306,6 +2306,162 @@ def compute_cd_dwell_metrics_multi(
     return pd.concat(frames, ignore_index=True)
 
 
+def plot_persistency_vs_iti(
+    dwell_df: pd.DataFrame,
+    *,
+    bin_edges: Optional[Sequence[float]] = None,
+    n_bins: int = 10,
+    upper_quantile: float = 0.98,
+    min_count_for_violin: int = 5,
+    jitter: float = 0.02,
+    scatter_alpha: float = 0.25,
+    scatter_size: float = 8.0,
+    rng_seed: int = 0,
+    figsize: Tuple[float, float] = (12, 4),
+    title: Optional[str] = None,
+    print_stats: bool = True,
+) -> None:
+    """Plot ``persistency_index`` vs ITI length from a dwell-metrics frame.
+
+    Two panels:
+
+    - Left: per-trial scatter (lightly x-jittered) and per-bin median trace,
+      one color per ``class_name``.
+    - Right: pooled-class violin of ``persistency_index`` within ITI bins.
+
+    Also prints the pooled and per-class Spearman correlations when
+    ``print_stats=True``.
+
+    Parameters
+    ----------
+    dwell_df
+        Long-form DataFrame returned by :func:`compute_cd_dwell_metrics` /
+        :func:`compute_cd_dwell_metrics_multi`. Must contain
+        ``persistency_index``, ``valid_duration_sec``, ``class_name``, and
+        ``session``.
+    bin_edges
+        Explicit ITI bin edges (seconds). If ``None``, ``n_bins`` evenly
+        spaced bins are built between 0 and the ``upper_quantile`` of
+        ``valid_duration_sec``.
+    n_bins
+        Number of bins when ``bin_edges`` is not provided.
+    upper_quantile
+        Upper quantile of ``valid_duration_sec`` used as the top bin edge
+        when ``bin_edges`` is not provided.
+    min_count_for_violin
+        Skip violin bodies for bins with fewer than this many trials.
+    jitter, scatter_alpha, scatter_size
+        Cosmetic scatter knobs.
+    rng_seed
+        Seed for the x-jitter RNG (kept deterministic for reproducibility).
+    figsize
+        Matplotlib figure size in inches.
+    title
+        Optional override for the suptitle.
+    print_stats
+        Print Spearman correlations (pooled + per-class) before plotting.
+    """
+    from scipy.stats import spearmanr
+
+    if dwell_df is None or dwell_df.empty:
+        print("No dwell metrics computed.")
+        return
+
+    required = {"persistency_index", "valid_duration_sec", "class_name", "session"}
+    missing = required - set(dwell_df.columns)
+    if missing:
+        raise KeyError(
+            f"dwell_df is missing required column(s): {sorted(missing)}"
+        )
+
+    df = dwell_df.dropna(subset=["persistency_index", "valid_duration_sec"]).copy()
+    if df.empty:
+        print("No dwell metrics after dropping NaNs.")
+        return
+
+    classes = list(df["class_name"].unique())
+    colors = {c: f"C{i}" for i, c in enumerate(classes)}
+
+    if bin_edges is None:
+        iti_hi = float(np.quantile(df["valid_duration_sec"], float(upper_quantile)))
+        edges = np.linspace(0, max(iti_hi, 1.0), int(n_bins) + 1)
+    else:
+        edges = np.asarray(bin_edges, dtype=float)
+    bin_centers = 0.5 * (edges[:-1] + edges[1:])
+    df["iti_bin"] = pd.cut(df["valid_duration_sec"], edges, include_lowest=True)
+
+    rho_all, p_all = spearmanr(df["valid_duration_sec"], df["persistency_index"])
+    if print_stats:
+        print(f"Spearman rho (pooled): {rho_all:+.3f}  (p={p_all:.2e},  n={len(df)})")
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    # --- Left: scatter + per-bin median per class ---
+    ax = axes[0]
+    rng = np.random.default_rng(rng_seed)
+    for c in classes:
+        sub = df[df["class_name"] == c]
+        jit = rng.uniform(-float(jitter), float(jitter), size=len(sub))
+        ax.scatter(
+            sub["valid_duration_sec"] + jit,
+            sub["persistency_index"],
+            s=float(scatter_size), alpha=float(scatter_alpha),
+            color=colors[c], edgecolor="none",
+        )
+        med = (
+            sub.groupby("iti_bin", observed=True)["persistency_index"]
+            .median().reindex(df["iti_bin"].cat.categories)
+        )
+        ax.plot(bin_centers, med.values, color=colors[c], lw=2,
+                marker="o", label=f"{c} (median)")
+        if print_stats:
+            rho, p = spearmanr(sub["valid_duration_sec"], sub["persistency_index"])
+            print(f"  {c}: Spearman rho = {rho:+.3f}  (p={p:.2e},  n={len(sub)})")
+    ax.axhline(0, color="k", lw=0.8, alpha=0.5)
+    ax.set_xlim(0, edges[-1])
+    ax.set_ylim(-1.05, 1.05)
+    ax.set_xlabel("ITI length (valid_duration_sec, s)")
+    ax.set_ylabel("persistency_index")
+    ax.set_title("Persistency vs ITI — per class")
+    ax.legend(loc="lower right", fontsize=9)
+
+    # --- Right: pooled violin per ITI bin ---
+    ax = axes[1]
+    data_by_bin = [
+        df.loc[df["iti_bin"] == lvl, "persistency_index"].values
+        for lvl in df["iti_bin"].cat.categories
+    ]
+    valid = [(c, d) for c, d in zip(bin_centers, data_by_bin)
+             if d.size > int(min_count_for_violin)]
+    if valid:
+        vcenters, vdata = zip(*valid)
+        parts = ax.violinplot(
+            vdata, positions=vcenters,
+            widths=0.9 * (edges[1] - edges[0]),
+            showmedians=True, showextrema=False,
+        )
+        for body in parts["bodies"]:
+            body.set_alpha(0.4)
+            body.set_facecolor("steelblue")
+        for c, d in valid:
+            ax.text(c, 1.03, f"n={d.size}", ha="center", va="bottom", fontsize=7)
+    ax.axhline(0, color="k", lw=0.8, alpha=0.5)
+    ax.set_xlim(0, edges[-1])
+    ax.set_ylim(-1.05, 1.10)
+    ax.set_xlabel("ITI length bin center (s)")
+    ax.set_ylabel("persistency_index (pooled classes)")
+    ax.set_title("Persistency by ITI bin")
+
+    if title is None:
+        title = (
+            f"Persistency vs ITI — {len(classes)} classes, "
+            f"{df['session'].nunique()} sessions"
+        )
+    fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+    plt.show()
+
+
 # ---------------------------------------------------------------------------
 # Scatter: average CD projection vs P(right) per trial
 # ---------------------------------------------------------------------------
