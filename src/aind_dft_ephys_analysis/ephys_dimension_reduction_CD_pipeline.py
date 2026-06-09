@@ -3839,6 +3839,547 @@ def plot_bump_diagnostics(
 
 
 # ---------------------------------------------------------------------------
+# Frequency-domain diagnostics (Welch PSD + autocorrelation + IBI histogram)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _CDSpectrumResult:
+    """Per-session output of :func:`compute_cd_spectrum`.
+
+    Holds the trial-averaged Welch PSD and biased autocorrelation for
+    each of the two trial classes. Within a session, every retained
+    trial contributes to the same frequency grid (because Welch is
+    called with a fixed ``nperseg`` across trials) and the same lag
+    grid (because each per-trial ACF is truncated / NaN-padded to
+    ``max_lag_samples + 1`` lags), so trial-averaging is a simple
+    arithmetic mean.
+    """
+    session: str
+    fs: float
+    nperseg: int
+    # Frequency-domain (Welch PSD averaged across trials)
+    freqs: np.ndarray
+    psd_A: np.ndarray
+    psd_B: np.ndarray
+    n_psd_trials_A: int
+    n_psd_trials_B: int
+    # Time-domain (biased autocorrelation averaged across trials,
+    # normalized to r[0] = 1 per trial)
+    lags: np.ndarray
+    acf_A: np.ndarray
+    acf_B: np.ndarray
+    n_acf_trials_A: int
+    n_acf_trials_B: int
+    # Class metadata
+    name_A: str
+    name_B: str
+    note: str = ""
+
+
+def _longest_finite_segment(
+    row: np.ndarray,
+    time: np.ndarray,
+    t0: float,
+    t1: float,
+) -> Optional[np.ndarray]:
+    """Return the longest contiguous finite run of ``row`` inside ``[t0, t1]``.
+
+    Returns ``None`` if no finite samples lie inside the window.
+    """
+    tmask = (time >= float(t0)) & (time <= float(t1))
+    if not np.any(tmask):
+        return None
+    seg_full = row[tmask].astype(float, copy=False)
+    valid = np.isfinite(seg_full)
+    if not np.any(valid):
+        return None
+    runs: List[Tuple[int, int]] = []
+    in_run = False
+    start = 0
+    for i, v in enumerate(valid):
+        if v and not in_run:
+            start = i
+            in_run = True
+        elif (not v) and in_run:
+            runs.append((start, i))
+            in_run = False
+    if in_run:
+        runs.append((start, len(valid)))
+    if not runs:
+        return None
+    s, e = max(runs, key=lambda r: r[1] - r[0])
+    seg = seg_full[s:e]
+    return seg if seg.size > 0 else None
+
+
+def compute_cd_spectrum(
+    sess: CDSessionData,
+    *,
+    trial_types: Optional[Sequence[str]] = None,
+    split: Literal["train", "test"] = "test",
+    time_window: Tuple[float, float] = (0.0, 15.0),
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
+    restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
+    smooth_gauss: float = 0.0,
+    smooth_mode: Literal["gaussian", "moving"] = "gaussian",
+    projection_source: Literal["unbiased", "all"] = "unbiased",
+    center: float | Literal["cross_class_median"] = 0.0,
+    class_signs: Tuple[int, int] = (1, -1),
+    # Spectrum-specific knobs
+    nperseg_sec: float = 2.0,
+    noverlap_frac: float = 0.5,
+    max_lag_sec: float = 2.0,
+    detrend: Literal["constant", "linear"] = "constant",
+    demean_per_trial: bool = True,
+) -> _CDSpectrumResult:
+    """Per-session trial-averaged Welch PSD + biased ACF per class.
+
+    For each trial of each class:
+
+    1. Reuse :func:`_prepare_cd_session_for_scoring` (same trial
+       selection / re-alignment / per-trial masking / smoothing /
+       center as :func:`compute_cd_dwell_metrics` and
+       :func:`compute_cd_bump_events`) so the spectrum analyses the
+       SAME traces those metrics ran on.
+    2. Extract the **longest contiguous finite segment** inside
+       ``time_window``. If the segment is shorter than ``nperseg``
+       samples the trial is dropped from the PSD pool (still kept for
+       the ACF if it has at least 2 samples).
+    3. Subtract the segment mean (``demean_per_trial=True``) so the DC
+       bin does not dominate.
+    4. Compute Welch PSD with the supplied ``nperseg`` / ``noverlap`` —
+       guaranteeing every retained trial returns the same frequency
+       grid so trial-averaging is straightforward.
+    5. Compute the biased autocorrelation truncated to
+       ``max_lag_sec``, normalized to ``r[0] = 1`` per trial.
+
+    Results are averaged across trials within each class.
+
+    **Caveats**
+    -----------
+    * Gaussian smoothing with sigma = ``smooth_gauss`` acts as a low-
+      pass filter with approximate cutoff
+      :math:`f_c \\approx 1/(2\\pi\\sigma)` Hz, so any spectral content
+      above ``f_c`` will be suppressed by the kernel itself and not by
+      the underlying biology. **Default is ``smooth_gauss=0.0``** so
+      the spectrum reflects the raw projection.
+    * Sampling rate is ``1 / sess.dt``; the Nyquist frequency is
+      ``1 / (2 * sess.dt)``. For the default ``binsize=0.1`` CD zarrs
+      that is 5 Hz.
+    """
+    from scipy.signal import welch
+
+    prep = _prepare_cd_session_for_scoring(
+        sess,
+        trial_types=trial_types,
+        split=split,
+        time_window=time_window,
+        restrict_events=restrict_events,
+        restrict_align=restrict_align,
+        restrict_window_per_trial=restrict_window_per_trial,
+        smooth_gauss=smooth_gauss,
+        smooth_mode=smooth_mode,
+        projection_source=projection_source,
+        center=center,
+        class_signs=class_signs,
+    )
+
+    dt = float(sess.dt) if sess.dt else 0.0
+    if dt <= 0.0:
+        raise ValueError(f"[{sess.session}] sess.dt is not positive ({sess.dt}).")
+    fs = 1.0 / dt
+    nperseg = max(2, int(round(float(nperseg_sec) / dt)))
+    noverlap = int(round(float(noverlap_frac) * nperseg))
+    noverlap = max(0, min(noverlap, nperseg - 1))
+    max_lag_samples = max(1, int(round(float(max_lag_sec) / dt)))
+
+    t0, t1 = float(time_window[0]), float(time_window[1])
+
+    def _accumulate(
+        proj: np.ndarray,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], np.ndarray, int, int, int]:
+        """Per-class accumulator.
+
+        Returns
+        -------
+        mean_psd : np.ndarray or None
+            Trial-averaged PSD on the Welch frequency grid (or None if
+            no trial was long enough).
+        freqs_ref : np.ndarray or None
+            The frequency grid for ``mean_psd``.
+        mean_acf : np.ndarray
+            Trial-averaged ACF on ``[0, dt, ..., max_lag_sec]`` (NaN
+            where no trial contributed at that lag).
+        psd_count : int
+            Number of trials that contributed to ``mean_psd``.
+        acf_count : int
+            Number of trials that contributed to ``mean_acf``.
+        n_total : int
+            Number of trials that were considered before per-trial
+            length filtering.
+        """
+        acf_sum = np.zeros(max_lag_samples + 1, dtype=float)
+        acf_n = np.zeros(max_lag_samples + 1, dtype=float)
+        acf_count = 0
+        psd_sum: Optional[np.ndarray] = None
+        freqs_ref: Optional[np.ndarray] = None
+        psd_count = 0
+
+        if (
+            proj is None
+            or not isinstance(proj, np.ndarray)
+            or proj.ndim != 2
+            or proj.shape[0] == 0
+        ):
+            return None, None, np.full(max_lag_samples + 1, np.nan), 0, 0, 0
+
+        n_total = int(proj.shape[0])
+        for i in range(n_total):
+            seg = _longest_finite_segment(proj[i], sess.time, t0, t1)
+            if seg is None or seg.size < 2:
+                continue
+            x = seg - (np.mean(seg) if demean_per_trial else 0.0)
+
+            # ---- Welch PSD (needs at least nperseg samples) -------------
+            if x.size >= nperseg:
+                f, pxx = welch(
+                    x,
+                    fs=fs,
+                    nperseg=nperseg,
+                    noverlap=noverlap,
+                    detrend=detrend,
+                    scaling="density",
+                    return_onesided=True,
+                )
+                if psd_sum is None:
+                    freqs_ref = f
+                    psd_sum = pxx.astype(float, copy=True)
+                else:
+                    psd_sum = psd_sum + pxx
+                psd_count += 1
+
+            # ---- Biased autocorrelation, normalized so r[0] = 1 ---------
+            n = x.size
+            r_full = np.correlate(x, x, mode="full") / n
+            mid = n - 1
+            r = r_full[mid:mid + max_lag_samples + 1]
+            if r.size and r[0] > 0 and np.isfinite(r[0]):
+                r = r / r[0]
+            # NaN-pad if the trial is shorter than max_lag_samples + 1
+            if r.size < max_lag_samples + 1:
+                r = np.concatenate(
+                    [r, np.full(max_lag_samples + 1 - r.size, np.nan)]
+                )
+            valid = np.isfinite(r)
+            if valid.any():
+                acf_sum[valid] += r[valid]
+                acf_n[valid] += 1.0
+                acf_count += 1
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mean_acf = np.where(acf_n > 0, acf_sum / acf_n, np.nan)
+        mean_psd = (
+            (psd_sum / psd_count) if (psd_sum is not None and psd_count > 0)
+            else None
+        )
+        return mean_psd, freqs_ref, mean_acf, psd_count, acf_count, n_total
+
+    psd_A, freqs_A, acf_A, n_psd_A, n_acf_A, n_tot_A = _accumulate(prep.proj_A)
+    psd_B, freqs_B, acf_B, n_psd_B, n_acf_B, n_tot_B = _accumulate(prep.proj_B)
+
+    # Pick a shared freq grid. Should match between classes when both
+    # have at least one trial >= nperseg.
+    freqs = freqs_A if freqs_A is not None else (
+        freqs_B if freqs_B is not None else np.empty(0, dtype=float)
+    )
+    if psd_A is None:
+        psd_A = np.full_like(freqs, np.nan, dtype=float)
+    if psd_B is None:
+        psd_B = np.full_like(freqs, np.nan, dtype=float)
+
+    lags = np.arange(max_lag_samples + 1, dtype=float) * dt
+
+    note_parts: List[str] = []
+    if n_tot_A > n_psd_A:
+        note_parts.append(
+            f"A: {n_tot_A - n_psd_A}/{n_tot_A} trial(s) dropped from PSD "
+            f"(segment < {nperseg} samples = {nperseg * dt:.2f}s)"
+        )
+    if n_tot_B > n_psd_B:
+        note_parts.append(
+            f"B: {n_tot_B - n_psd_B}/{n_tot_B} trial(s) dropped from PSD"
+        )
+    note = "; ".join(note_parts)
+
+    return _CDSpectrumResult(
+        session=sess.session,
+        fs=fs,
+        nperseg=nperseg,
+        freqs=freqs,
+        psd_A=psd_A,
+        psd_B=psd_B,
+        n_psd_trials_A=n_psd_A,
+        n_psd_trials_B=n_psd_B,
+        lags=lags,
+        acf_A=acf_A,
+        acf_B=acf_B,
+        n_acf_trials_A=n_acf_A,
+        n_acf_trials_B=n_acf_B,
+        name_A=prep.name_A,
+        name_B=prep.name_B,
+        note=note,
+    )
+
+
+def compute_cd_spectrum_multi(
+    sessions_data: Iterable[CDSessionData],
+    **kwargs: Any,
+) -> List[_CDSpectrumResult]:
+    """Run :func:`compute_cd_spectrum` over many sessions; return list of results.
+
+    The returned list is consumed by :func:`plot_cd_spectrum`, which
+    averages PSDs / ACFs across sessions (each session contributes one
+    per-trial-averaged curve so that sessions are weighted equally
+    regardless of trial count).
+    """
+    out: List[_CDSpectrumResult] = []
+    for sess in sessions_data:
+        try:
+            res = compute_cd_spectrum(sess, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            print(f"[skip] {getattr(sess, 'session', '?')}: {e}")
+            continue
+        if res.note:
+            print(f"[{res.session}] {res.note}")
+        out.append(res)
+    return out
+
+
+def plot_cd_spectrum(
+    results: "_CDSpectrumResult | Iterable[_CDSpectrumResult]",
+    *,
+    bump_df: Optional[pd.DataFrame] = None,
+    psd_log: bool = True,
+    ibi_max_sec: float = 5.0,
+    ibi_nbins: int = 40,
+    figsize: Tuple[float, float] = (15, 4.2),
+    title: Optional[str] = None,
+    colors: Optional[Sequence[str]] = None,
+) -> None:
+    """Frequency-domain diagnostic for CD bursts.
+
+    Up to three panels, side-by-side:
+
+    1. **Welch PSD** (log-log) — one trace per class, averaged across
+       sessions. Each session contributes its own per-trial-averaged
+       PSD so sessions are weighted equally. A peak at frequency ``f0``
+       implies quasi-periodic bursts at rate ``f0``. A smooth 1/f-like
+       falloff is consistent with Poisson bursts convolved with a
+       fixed kernel.
+    2. **Trial-averaged autocorrelation** (linear) — one trace per
+       class. The first secondary peak (if any) gives the
+       characteristic burst spacing; the 1/e crossing gives the
+       autocorrelation timescale (annotated as a dotted vertical
+       line). Decays at lags < ``smooth_gauss`` are dominated by the
+       smoothing kernel — interpret only beyond that.
+    3. **Inter-bump-interval (IBI) histogram** (only if ``bump_df`` is
+       supplied) — density histogram per class with the exponential
+       distribution implied by the per-class mean IBI overlaid as a
+       dashed line. Exponential agreement ⇒ Poisson-like timing;
+       a clear mode or multi-modal distribution ⇒ quasi-periodic
+       (clock-like) timing.
+    """
+    if isinstance(results, _CDSpectrumResult):
+        results_list: List[_CDSpectrumResult] = [results]
+    else:
+        results_list = list(results)
+    if not results_list:
+        print("Nothing to plot.")
+        return
+
+    # Consistency checks across sessions.
+    freqs = results_list[0].freqs
+    lags = results_list[0].lags
+    for r in results_list[1:]:
+        if r.freqs.shape != freqs.shape:
+            raise ValueError(
+                "Per-session PSD frequency grids differ — was nperseg_sec "
+                "consistent across sessions? Re-run compute_cd_spectrum_multi "
+                "with the same parameters."
+            )
+        if r.lags.shape != lags.shape:
+            raise ValueError(
+                "Per-session ACF lag grids differ — was max_lag_sec consistent?"
+            )
+
+    name_A = results_list[0].name_A
+    name_B = results_list[0].name_B
+
+    def _stack(attr: str) -> np.ndarray:
+        return np.stack([getattr(r, attr) for r in results_list], axis=0)
+
+    psd_A_mat = _stack("psd_A")
+    psd_B_mat = _stack("psd_B")
+    acf_A_mat = _stack("acf_A")
+    acf_B_mat = _stack("acf_B")
+
+    psd_A_mean = np.nanmean(psd_A_mat, axis=0)
+    psd_B_mean = np.nanmean(psd_B_mat, axis=0)
+    acf_A_mean = np.nanmean(acf_A_mat, axis=0)
+    acf_B_mean = np.nanmean(acf_B_mat, axis=0)
+
+    n_sess = len(results_list)
+    if n_sess > 1:
+        norm = float(n_sess) ** 0.5
+        psd_A_sem = np.nanstd(psd_A_mat, axis=0) / norm
+        psd_B_sem = np.nanstd(psd_B_mat, axis=0) / norm
+        acf_A_sem = np.nanstd(acf_A_mat, axis=0) / norm
+        acf_B_sem = np.nanstd(acf_B_mat, axis=0) / norm
+    else:
+        psd_A_sem = np.zeros_like(psd_A_mean)
+        psd_B_sem = np.zeros_like(psd_B_mean)
+        acf_A_sem = np.zeros_like(acf_A_mean)
+        acf_B_sem = np.zeros_like(acf_B_mean)
+
+    if colors is None:
+        cmap = {name_A: "C0", name_B: "C3"}
+    else:
+        cmap = {
+            name_A: colors[0],
+            name_B: (colors[1] if len(colors) > 1 else "C3"),
+        }
+
+    has_ibi = bump_df is not None and not bump_df.empty
+    n_panels = 3 if has_ibi else 2
+    fig, axes = plt.subplots(1, n_panels, figsize=figsize)
+    if n_panels == 1:
+        axes = [axes]
+
+    # ----- Panel 1: PSD ----------------------------------------------------
+    ax = axes[0]
+    nA_psd = sum(r.n_psd_trials_A for r in results_list)
+    nB_psd = sum(r.n_psd_trials_B for r in results_list)
+    for name, mean, sem, c, n_t in [
+        (name_A, psd_A_mean, psd_A_sem, cmap[name_A], nA_psd),
+        (name_B, psd_B_mean, psd_B_sem, cmap[name_B], nB_psd),
+    ]:
+        if mean.size == 0 or not np.any(np.isfinite(mean)):
+            continue
+        # Skip the DC bin (f=0) when plotting on log axes.
+        if psd_log and freqs.size and freqs[0] == 0.0:
+            f_plot = freqs[1:]
+            m_plot = mean[1:]
+            s_plot = sem[1:]
+        else:
+            f_plot = freqs
+            m_plot = mean
+            s_plot = sem
+        ax.plot(
+            f_plot, m_plot, "-", color=c,
+            label=f"{name} (n_trials={int(n_t)})",
+        )
+        lo = np.maximum(m_plot - s_plot, 1e-30) if psd_log else m_plot - s_plot
+        ax.fill_between(f_plot, lo, m_plot + s_plot, color=c, alpha=0.2)
+    if psd_log:
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+    ax.set_xlabel("frequency (Hz)")
+    ax.set_ylabel("PSD (a.u.² / Hz)")
+    ax.set_title(
+        f"Welch PSD (n_sessions={n_sess}, "
+        f"nperseg={results_list[0].nperseg}, fs={results_list[0].fs:.1f} Hz)"
+    )
+    ax.legend(fontsize=8, loc="best")
+    ax.grid(True, which="both", alpha=0.3)
+
+    # ----- Panel 2: ACF ----------------------------------------------------
+    ax = axes[1]
+    nA_acf = sum(r.n_acf_trials_A for r in results_list)
+    nB_acf = sum(r.n_acf_trials_B for r in results_list)
+    for name, mean, sem, c, n_t in [
+        (name_A, acf_A_mean, acf_A_sem, cmap[name_A], nA_acf),
+        (name_B, acf_B_mean, acf_B_sem, cmap[name_B], nB_acf),
+    ]:
+        if mean.size == 0 or not np.any(np.isfinite(mean)):
+            continue
+        ax.plot(
+            lags, mean, "-", color=c,
+            label=f"{name} (n_trials={int(n_t)})",
+        )
+        ax.fill_between(lags, mean - sem, mean + sem, color=c, alpha=0.2)
+        # Annotate the 1/e crossing if it exists in the range.
+        below = np.where(mean < (1.0 / np.e))[0]
+        if below.size:
+            tau = float(lags[below[0]])
+            ax.axvline(tau, color=c, ls=":", lw=1)
+            ax.text(
+                tau, 1.0 / np.e, f" τ≈{tau:.2f}s",
+                color=c, fontsize=8, va="bottom",
+            )
+    ax.axhline(0, color="k", lw=0.5)
+    ax.axhline(1.0 / np.e, color="k", ls="--", lw=0.5, alpha=0.5)
+    ax.set_xlabel("lag (s)")
+    ax.set_ylabel("autocorrelation (r[0] = 1)")
+    ax.set_title("Trial-averaged ACF (dotted vert = 1/e crossing)")
+    ax.legend(fontsize=8, loc="best")
+    ax.grid(True, alpha=0.3)
+
+    # ----- Panel 3 (optional): IBI histogram --------------------------------
+    if has_ibi:
+        ax = axes[2]
+        if "inter_bump_sec" not in bump_df.columns:
+            ax.set_title("bump_df missing 'inter_bump_sec'")
+        else:
+            sub = bump_df.dropna(subset=["inter_bump_sec"])
+            if sub.empty:
+                ax.set_title("No IBI data")
+            else:
+                bins = np.linspace(0.0, float(ibi_max_sec), int(ibi_nbins) + 1)
+                centers = 0.5 * (bins[:-1] + bins[1:])
+                if "class_name" in sub.columns:
+                    classes = list(sub["class_name"].unique())
+                else:
+                    classes = [None]
+                for k, name in enumerate(classes):
+                    if name is None:
+                        ibis = sub["inter_bump_sec"].to_numpy(dtype=float)
+                        c = "C0"
+                        lbl = "all"
+                    else:
+                        ibis = sub.loc[
+                            sub["class_name"] == name, "inter_bump_sec"
+                        ].to_numpy(dtype=float)
+                        c = cmap.get(name, f"C{k}")
+                        lbl = name
+                    ibis = ibis[(ibis > 0) & (ibis <= float(ibi_max_sec))]
+                    if ibis.size == 0:
+                        continue
+                    ax.hist(
+                        ibis, bins=bins, color=c, alpha=0.35, density=True,
+                        label=(
+                            f"{lbl} (n={ibis.size}, "
+                            f"med={float(np.median(ibis)):.2f}s)"
+                        ),
+                    )
+                    mean_ibi = float(np.mean(ibis))
+                    if mean_ibi > 0:
+                        rate = 1.0 / mean_ibi
+                        pdf = rate * np.exp(-rate * centers)
+                        ax.plot(centers, pdf, "--", color=c, lw=1.5)
+                ax.set_xlabel("inter-bump interval (s)")
+                ax.set_ylabel("density")
+                ax.set_title("IBI distribution (dashed = exponential MLE)")
+                ax.legend(fontsize=8, loc="best")
+                ax.grid(True, alpha=0.3)
+
+    if title:
+        fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
 # Trial-level covariates (ITI, P(right)) + generic metric-vs-covariate plot
 # ---------------------------------------------------------------------------
 
