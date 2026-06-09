@@ -3030,6 +3030,428 @@ def plot_transient_vs_persistency(
 
 
 # ---------------------------------------------------------------------------
+# Per-bump event extraction (long-form: one row per detected peak)
+# ---------------------------------------------------------------------------
+
+def _bump_events_from_trace(
+    trace: np.ndarray,
+    time: np.ndarray,
+    *,
+    t0: float,
+    t1: float,
+    center: float,
+    class_sign: int,
+    signal_mode: Literal["abs", "rectified_on_class", "centered_squared"] = "abs",
+    peak_height_frac: float = 0.5,
+    min_peak_distance_sec: float = 0.05,
+) -> List[Dict[str, float]]:
+    """Detect bumps in one trial's CD trace; return one dict per bump.
+
+    Mirrors the masking / smoothing / signal-mode conventions used by
+    :func:`_transient_metrics_from_trace`, so per-bump rows produced
+    here are consistent with the per-trial transient metrics (in
+    particular, the same peak set drives ``n_bumps``).
+
+    Each returned dict has:
+    ``bump_idx`` (0-based within the trial), ``peak_time_sec``
+    (time coordinate in the same frame as ``time``), ``peak_amplitude``
+    (value of the non-negative scoring signal ``s`` at the peak),
+    ``peak_amplitude_signed`` (value of the centered trace
+    ``x = trace - center`` at the same sample, sign preserved),
+    ``peak_fwhm_sec`` (per-bump FWHM at half-height, not just the
+    dominant peak), ``inter_bump_sec`` (NaN for the first bump in a
+    trial, otherwise ``peak_time_sec`` minus the previous bump's
+    ``peak_time_sec``), ``n_bumps_in_trial``, ``valid_duration_sec``.
+    """
+    out: List[Dict[str, float]] = []
+    if trace.size == 0 or time.size == 0:
+        return out
+
+    sel = (time >= t0) & (time <= t1)
+    x_raw = trace[sel].astype(float, copy=False)
+    t_raw = time[sel]
+    valid = np.isfinite(x_raw)
+    if not np.any(valid):
+        return out
+    x = x_raw[valid] - float(center)
+    t = t_raw[valid]
+
+    if t.size >= 2:
+        dt = float(np.median(np.diff(t)))
+        if not np.isfinite(dt) or dt <= 0:
+            dt = float((t[-1] - t[0]) / max(t.size - 1, 1))
+    else:
+        dt = 0.0
+    valid_dur = float(dt * x.size)
+
+    if signal_mode == "abs":
+        s = np.abs(x)
+    elif signal_mode == "rectified_on_class":
+        cs = int(np.sign(class_sign)) if class_sign != 0 else 0
+        s = np.maximum(0.0, cs * x) if cs != 0 else np.abs(x)
+    elif signal_mode == "centered_squared":
+        s = x * x
+    else:
+        raise ValueError(
+            "signal_mode must be 'abs' | 'rectified_on_class' | "
+            f"'centered_squared', got {signal_mode!r}"
+        )
+
+    s_max = float(np.max(s)) if s.size else 0.0
+    if not np.isfinite(s_max) or s_max <= 0.0:
+        return out
+
+    from scipy.signal import find_peaks, peak_widths
+    height_thr = float(peak_height_frac) * s_max
+    distance = max(1, int(round(float(min_peak_distance_sec) / dt))) if dt > 0 else 1
+    try:
+        peaks, _props = find_peaks(s, height=height_thr, distance=distance)
+    except Exception:  # noqa: BLE001
+        peaks = np.empty(0, dtype=int)
+    if peaks.size == 0:
+        return out
+
+    # Per-peak FWHM at half-height of the global signal (matches the
+    # convention used for the "dominant" bump in the per-trial metrics).
+    try:
+        widths, _, _, _ = peak_widths(s, peaks, rel_height=0.5)
+    except Exception:  # noqa: BLE001
+        widths = np.full(peaks.size, np.nan, dtype=float)
+
+    peak_times = t[peaks]
+    peak_amps = s[peaks]
+    peak_amps_signed = x[peaks]
+    inter_bump = np.full(peaks.size, np.nan, dtype=float)
+    if peaks.size >= 2:
+        inter_bump[1:] = np.diff(peak_times)
+
+    n_bumps = int(peaks.size)
+    for i, _ in enumerate(peaks):
+        out.append({
+            "bump_idx": int(i),
+            "peak_time_sec": float(peak_times[i]),
+            "peak_amplitude": float(peak_amps[i]),
+            "peak_amplitude_signed": float(peak_amps_signed[i]),
+            "peak_fwhm_sec": float(widths[i]) * dt if dt > 0 else float("nan"),
+            "inter_bump_sec": float(inter_bump[i]),
+            "n_bumps_in_trial": n_bumps,
+            "valid_duration_sec": valid_dur,
+        })
+    return out
+
+
+def compute_cd_bump_events(
+    sess: CDSessionData,
+    *,
+    trial_types: Optional[Sequence[str]] = None,
+    split: Literal["train", "test"] = "test",
+    time_window: Tuple[float, float] = (0.0, 5.0),
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
+    restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
+    smooth_gauss: float = 0.1,
+    smooth_mode: Literal["gaussian", "moving"] = "gaussian",
+    projection_source: Literal["unbiased", "all"] = "unbiased",
+    center: float | Literal["cross_class_median"] = 0.0,
+    class_signs: Tuple[int, int] = (1, -1),
+    signal_mode: Literal["abs", "rectified_on_class", "centered_squared"] = "abs",
+    peak_height_frac: float = 0.5,
+    min_peak_distance_sec: float = 0.05,
+) -> pd.DataFrame:
+    """Long-form per-bump events for one CD session.
+
+    Returns a DataFrame with **one row per detected bump** (so trials
+    with three bumps contribute three rows). Useful for diagnostics
+    that aggregate across bumps rather than across trials:
+
+    - **median inter-bump interval vs ITI** (Poisson-like burst test)
+    - **per-bump amplitude distribution** binned by ITI
+      (stereotyped-shape test)
+    - **bump rate (= n_bumps / iti_sec)** vs ITI
+
+    All prep parameters (``trial_types``, ``time_window``,
+    ``restrict_events`` / ``restrict_align``, ``smooth_gauss``,
+    ``projection_source``, ``center``, ``class_signs``, ``signal_mode``,
+    ``peak_height_frac``, ``min_peak_distance_sec``) match
+    :func:`compute_cd_transient_metrics`, so the per-trial bump count
+    in this frame equals the ``n_bumps`` column in the corresponding
+    per-trial frame.
+    """
+    prep = _prepare_cd_session_for_scoring(
+        sess,
+        trial_types=trial_types,
+        split=split,
+        time_window=time_window,
+        restrict_events=restrict_events,
+        restrict_align=restrict_align,
+        restrict_window_per_trial=restrict_window_per_trial,
+        smooth_gauss=smooth_gauss,
+        smooth_mode=smooth_mode,
+        projection_source=projection_source,
+        center=center,
+        class_signs=class_signs,
+    )
+
+    t0, t1 = float(time_window[0]), float(time_window[1])
+    rows: List[Dict[str, Any]] = []
+
+    def _emit(proj: np.ndarray, ids: np.ndarray, name: str, class_idx: int,
+              class_sign: int) -> None:
+        if proj.size == 0 or proj.ndim != 2 or not name:
+            return
+        for i, tid in enumerate(ids):
+            events = _bump_events_from_trace(
+                proj[i], sess.time,
+                t0=t0, t1=t1,
+                center=prep.center_val,
+                class_sign=class_sign,
+                signal_mode=signal_mode,
+                peak_height_frac=float(peak_height_frac),
+                min_peak_distance_sec=float(min_peak_distance_sec),
+            )
+            for ev in events:
+                ev.update({
+                    "session": sess.session,
+                    "trial_id": int(tid),
+                    "class_name": name,
+                    "class_index": class_idx,
+                    "class_sign": class_sign,
+                    "center": prep.center_val,
+                    "t_start": t0,
+                    "t_end": t1,
+                    "signal_mode": signal_mode,
+                })
+                rows.append(ev)
+
+    _emit(prep.proj_A, prep.ids_A, prep.name_A, 0, prep.sign_A)
+    _emit(prep.proj_B, prep.ids_B, prep.name_B, 1, prep.sign_B)
+
+    if not rows:
+        return pd.DataFrame()
+
+    cols_first = [
+        "session", "trial_id", "class_name", "class_index", "class_sign",
+        "bump_idx", "n_bumps_in_trial",
+        "peak_time_sec", "peak_amplitude", "peak_amplitude_signed",
+        "peak_fwhm_sec", "inter_bump_sec",
+        "valid_duration_sec",
+        "t_start", "t_end", "center", "signal_mode",
+    ]
+    df = pd.DataFrame(rows)
+    rest = [c for c in df.columns if c not in cols_first]
+    return df[cols_first + rest]
+
+
+def compute_cd_bump_events_multi(
+    sessions_data: Iterable[CDSessionData],
+    **kwargs: Any,
+) -> pd.DataFrame:
+    """Run :func:`compute_cd_bump_events` on many sessions; concat rows."""
+    frames: List[pd.DataFrame] = []
+    for sess in sessions_data:
+        try:
+            df = compute_cd_bump_events(sess, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            print(f"[skip] {getattr(sess, 'session', '?')}: {e}")
+            continue
+        if not df.empty:
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def plot_bump_diagnostics(
+    bump_df: pd.DataFrame,
+    *,
+    covariate: str = "iti_sec",
+    hue: Optional[str] = "class_name",
+    n_bins: int = 8,
+    bin_mode: Literal["quantile", "uniform"] = "quantile",
+    log_x: bool = True,
+    amp_log_y: bool = False,
+    figsize: Tuple[float, float] = (15, 4.2),
+    title: Optional[str] = None,
+) -> None:
+    """Three-panel "fixed-shape burst" diagnostic vs a trial-level covariate.
+
+    Expects ``bump_df`` to be a long-form per-bump frame (output of
+    :func:`compute_cd_bump_events_multi`) that has been passed through
+    :func:`attach_trial_covariates` to add the trial-level covariate
+    column (default ``iti_sec``). Three subplots:
+
+    1. **Bump rate (Hz) vs covariate** -- one point per *trial*
+       (``n_bumps_in_trial / iti_sec``). Flat ⇒ time-invariant burst
+       generation.
+    2. **Median inter-bump interval vs covariate** -- one point per
+       *bump* (excluding the first bump of each trial). Flat ⇒
+       Poisson-like timing.
+    3. **Per-bump amplitude distribution by covariate bin** -- boxplots
+       of ``peak_amplitude`` across covariate bins, one panel per
+       ``hue`` group. Invariant ⇒ stereotyped bump shape.
+    """
+    if bump_df is None or bump_df.empty:
+        print("Nothing to plot.")
+        return
+    if covariate not in bump_df.columns:
+        raise KeyError(
+            f"covariate {covariate!r} not in bump_df; pass bump_df through "
+            "attach_trial_covariates first."
+        )
+
+    df = bump_df.dropna(subset=[covariate]).copy()
+    if df.empty:
+        print(f"No rows with finite {covariate}.")
+        return
+
+    classes = list(df[hue].unique()) if (hue and hue in df.columns) else [None]
+    colors = {c: f"C{i}" for i, c in enumerate(classes)}
+
+    # Build bin edges from the bump-level covariate values
+    cov_all = df[covariate].to_numpy(dtype=float)
+    if bin_mode == "quantile":
+        q = np.linspace(0.0, 1.0, int(n_bins) + 1)
+        edges = np.unique(np.nanquantile(cov_all, q))
+    else:
+        lo, hi = float(np.nanmin(cov_all)), float(np.nanmax(cov_all))
+        edges = np.linspace(lo, hi, int(n_bins) + 1)
+    if edges.size < 2:
+        print("Not enough unique covariate values to bin.")
+        return
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+    # ---- Panel 1: bump rate (one point per trial) ------------------------
+    ax = axes[0]
+    trial_keys = ["session", "trial_id", "class_index"]
+    if hue and hue in df.columns:
+        trial_keys = trial_keys + [hue]
+    trial_df = (
+        df.drop_duplicates(subset=["session", "trial_id", "class_index"])
+        .loc[:, trial_keys + ["n_bumps_in_trial", covariate]]
+        .copy()
+    )
+    trial_df = trial_df[trial_df[covariate] > 0]
+    trial_df["bump_rate_hz"] = trial_df["n_bumps_in_trial"] / trial_df[covariate]
+
+    for c in classes:
+        sub = trial_df if c is None else trial_df[trial_df[hue] == c]
+        if sub.empty:
+            continue
+        # Per-bin median of rate
+        bin_idx = np.clip(np.digitize(sub[covariate].to_numpy(dtype=float),
+                                      edges[1:-1], right=True),
+                          0, edges.size - 2)
+        meds = np.full(edges.size - 1, np.nan, dtype=float)
+        q25 = np.full(edges.size - 1, np.nan, dtype=float)
+        q75 = np.full(edges.size - 1, np.nan, dtype=float)
+        for b in range(edges.size - 1):
+            vals = sub["bump_rate_hz"].to_numpy(dtype=float)[bin_idx == b]
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                meds[b] = float(np.median(vals))
+                q25[b]  = float(np.quantile(vals, 0.25))
+                q75[b]  = float(np.quantile(vals, 0.75))
+        ax.scatter(sub[covariate], sub["bump_rate_hz"],
+                   s=8, alpha=0.15, color=colors.get(c, "C0"), edgecolor="none")
+        finite = np.isfinite(meds)
+        ax.plot(centers[finite], meds[finite], "-o",
+                color=colors.get(c, "C0"),
+                label=(f"{c} (n_trials={len(sub)})" if c is not None else None))
+        ax.fill_between(centers[finite], q25[finite], q75[finite],
+                        color=colors.get(c, "C0"), alpha=0.15)
+    if log_x:
+        ax.set_xscale("log")
+    ax.set_xlabel(covariate)
+    ax.set_ylabel("bump_rate_hz  (n_bumps / iti_sec)")
+    ax.set_title("Bump rate vs trial length")
+    if hue:
+        ax.legend(fontsize=8, loc="best")
+    ax.grid(True, alpha=0.3)
+
+    # ---- Panel 2: inter-bump interval (one point per bump, excl. 1st) ----
+    ax = axes[1]
+    ibi_df = df.dropna(subset=["inter_bump_sec"]).copy()
+    for c in classes:
+        sub = ibi_df if c is None else ibi_df[ibi_df[hue] == c]
+        if sub.empty:
+            continue
+        bin_idx = np.clip(np.digitize(sub[covariate].to_numpy(dtype=float),
+                                      edges[1:-1], right=True),
+                          0, edges.size - 2)
+        meds = np.full(edges.size - 1, np.nan, dtype=float)
+        q25 = np.full(edges.size - 1, np.nan, dtype=float)
+        q75 = np.full(edges.size - 1, np.nan, dtype=float)
+        for b in range(edges.size - 1):
+            vals = sub["inter_bump_sec"].to_numpy(dtype=float)[bin_idx == b]
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                meds[b] = float(np.median(vals))
+                q25[b]  = float(np.quantile(vals, 0.25))
+                q75[b]  = float(np.quantile(vals, 0.75))
+        ax.scatter(sub[covariate], sub["inter_bump_sec"],
+                   s=6, alpha=0.10, color=colors.get(c, "C0"), edgecolor="none")
+        finite = np.isfinite(meds)
+        ax.plot(centers[finite], meds[finite], "-o",
+                color=colors.get(c, "C0"),
+                label=(f"{c} (n_bumps={len(sub)})" if c is not None else None))
+        ax.fill_between(centers[finite], q25[finite], q75[finite],
+                        color=colors.get(c, "C0"), alpha=0.15)
+    if log_x:
+        ax.set_xscale("log")
+    ax.set_xlabel(covariate)
+    ax.set_ylabel("inter_bump_sec")
+    ax.set_title("Inter-bump interval vs trial length")
+    if hue:
+        ax.legend(fontsize=8, loc="best")
+    ax.grid(True, alpha=0.3)
+
+    # ---- Panel 3: per-bump amplitude distribution by covariate bin -------
+    ax = axes[2]
+    for c in classes:
+        sub = df if c is None else df[df[hue] == c]
+        if sub.empty:
+            continue
+        bin_idx = np.clip(np.digitize(sub[covariate].to_numpy(dtype=float),
+                                      edges[1:-1], right=True),
+                          0, edges.size - 2)
+        meds = np.full(edges.size - 1, np.nan, dtype=float)
+        q25 = np.full(edges.size - 1, np.nan, dtype=float)
+        q75 = np.full(edges.size - 1, np.nan, dtype=float)
+        for b in range(edges.size - 1):
+            vals = sub["peak_amplitude"].to_numpy(dtype=float)[bin_idx == b]
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                meds[b] = float(np.median(vals))
+                q25[b]  = float(np.quantile(vals, 0.25))
+                q75[b]  = float(np.quantile(vals, 0.75))
+        ax.scatter(sub[covariate], sub["peak_amplitude"],
+                   s=6, alpha=0.10, color=colors.get(c, "C0"), edgecolor="none")
+        finite = np.isfinite(meds)
+        ax.plot(centers[finite], meds[finite], "-o",
+                color=colors.get(c, "C0"),
+                label=(f"{c} (n_bumps={len(sub)})" if c is not None else None))
+        ax.fill_between(centers[finite], q25[finite], q75[finite],
+                        color=colors.get(c, "C0"), alpha=0.15)
+    if log_x:
+        ax.set_xscale("log")
+    if amp_log_y:
+        ax.set_yscale("log")
+    ax.set_xlabel(covariate)
+    ax.set_ylabel("peak_amplitude")
+    ax.set_title("Per-bump amplitude vs trial length")
+    if hue:
+        ax.legend(fontsize=8, loc="best")
+    ax.grid(True, alpha=0.3)
+
+    if title:
+        fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
 # Trial-level covariates (ITI, P(right)) + generic metric-vs-covariate plot
 # ---------------------------------------------------------------------------
 
