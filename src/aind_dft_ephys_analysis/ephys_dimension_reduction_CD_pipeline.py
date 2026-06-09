@@ -3030,6 +3030,308 @@ def plot_transient_vs_persistency(
 
 
 # ---------------------------------------------------------------------------
+# Trial-level covariates (ITI, P(right)) + generic metric-vs-covariate plot
+# ---------------------------------------------------------------------------
+
+def attach_trial_covariates(
+    metric_df: pd.DataFrame,
+    sessions_data: Iterable[CDSessionData],
+    *,
+    restrict_events: Tuple[str, str] = ("trial_start", "go_cue"),
+    restrict_align: Optional[str] = "trial_start",
+    p_right_window: int = 10,
+    p_right_column: Optional[str] = None,
+) -> pd.DataFrame:
+    """Add per-trial ``iti_sec`` and ``p_right`` columns to a metric DataFrame.
+
+    For every ``session`` represented in ``metric_df``, looks up:
+
+    - ``iti_sec`` = ``event_end_offset - event_start_offset`` (seconds),
+      computed via :func:`compute_per_trial_event_offsets` from the session's
+      NWB. Defaults align ``trial_start → go_cue``, so this is the standard
+      inter-trial-interval length. Unlike ``valid_duration_sec`` (which is
+      clipped to the scoring window), ``iti_sec`` reflects the raw
+      behaviorally-defined window length, including trials longer than the
+      scoring window.
+
+    - ``p_right`` = per-trial sliding-window P(right). If ``p_right_column``
+      is given, that column is read from ``sess.behavior_df`` directly;
+      otherwise P(right) is recomputed via
+      :func:`behavior_utils.compute_sliding_choice_probability` on the
+      reconstructed ``animal_response`` vector (causal window of length
+      ``p_right_window``, no-response trials excluded).
+
+    Returns a copy of ``metric_df`` with the two new columns added. Rows
+    whose ``(session, trial_id)`` cannot be resolved get NaN.
+    """
+    if metric_df is None or metric_df.empty:
+        return metric_df.copy() if metric_df is not None else pd.DataFrame()
+    if "session" not in metric_df.columns or "trial_id" not in metric_df.columns:
+        raise KeyError("metric_df must contain 'session' and 'trial_id' columns.")
+
+    sessions_by_name: Dict[str, CDSessionData] = {
+        s.session: s for s in sessions_data
+    }
+
+    out = metric_df.copy()
+    out["iti_sec"] = np.nan
+    out["p_right"] = np.nan
+
+    for sess_name, sub in metric_df.groupby("session", observed=True):
+        sess = sessions_by_name.get(sess_name)
+        if sess is None:
+            print(f"[warn] {sess_name}: not in sessions_data; skipped covariates.")
+            continue
+
+        # ---- ITI per trial -------------------------------------------------
+        try:
+            offsets = compute_per_trial_event_offsets(
+                sess_name,
+                event_start=restrict_events[0],
+                event_end=restrict_events[1],
+                align=restrict_align,
+            )
+            iti_map = {tid: float(end - start) for tid, (start, end) in offsets.items()}
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] {sess_name}: could not compute ITI ({e})")
+            iti_map = {}
+
+        # ---- P(right) per trial -------------------------------------------
+        p_arr: Optional[np.ndarray] = None
+        try:
+            df_beh = sess.behavior_df
+            if df_beh is None:
+                raise ValueError("behavior_df is None")
+
+            ids_all = (
+                np.asarray(sess.trial_id_all_trials, dtype=int).ravel()
+                if sess.trial_id_all_trials is not None
+                else np.empty(0, dtype=int)
+            )
+
+            def _ids_from_col(col: str) -> np.ndarray:
+                if col not in df_beh.columns:
+                    return np.empty(0, dtype=int)
+                try:
+                    return np.asarray(df_beh[col].iloc[0], dtype=int).ravel()
+                except Exception:  # noqa: BLE001
+                    return np.empty(0, dtype=int)
+
+            id_pool = [ids_all]
+            for c in ("left_choice_trials", "right_choice_trials",
+                      "no_response_trials"):
+                id_pool.append(_ids_from_col(c))
+            n_trials = int(max(int(arr.max()) for arr in id_pool if arr.size) + 1)
+
+            if p_right_column is not None:
+                if p_right_column not in df_beh.columns:
+                    raise KeyError(
+                        f"column {p_right_column!r} not in behavior_df"
+                    )
+                raw = np.asarray(df_beh[p_right_column].iloc[0], dtype=float).ravel()
+                if raw.size == n_trials:
+                    p_arr = raw
+                else:
+                    responded_ids = np.sort(np.concatenate([
+                        _ids_from_col("left_choice_trials"),
+                        _ids_from_col("right_choice_trials"),
+                    ]))
+                    p_arr = np.full(n_trials, np.nan, dtype=float)
+                    n = min(raw.size, responded_ids.size)
+                    p_arr[responded_ids[:n]] = raw[:n]
+            else:
+                from behavior_utils import compute_sliding_choice_probability
+                resp_vec = _reconstruct_animal_response_from_df(df_beh, n_trials)
+                cp_out = compute_sliding_choice_probability(
+                    resp_vec,
+                    window=int(p_right_window),
+                    step=1,
+                    min_periods=1,
+                    causal=True,
+                    side="right",
+                    exclude_value=2,
+                )
+                p_arr = np.asarray(cp_out["choice_prob"], dtype=float)
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] {sess_name}: could not compute P(right) ({e})")
+
+        # ---- write back per row -------------------------------------------
+        for idx in sub.index:
+            tid = int(out.at[idx, "trial_id"])
+            if tid in iti_map:
+                out.at[idx, "iti_sec"] = iti_map[tid]
+            if p_arr is not None and 0 <= tid < p_arr.size:
+                out.at[idx, "p_right"] = float(p_arr[tid])
+
+    return out
+
+
+def plot_metrics_vs_covariate(
+    df: pd.DataFrame,
+    *,
+    metrics: Sequence[str],
+    covariate: str,
+    hue: Optional[str] = "class_name",
+    n_bins: int = 10,
+    bin_edges: Optional[Sequence[float]] = None,
+    bin_mode: Literal["quantile", "uniform"] = "quantile",
+    show_scatter: bool = True,
+    scatter_alpha: float = 0.2,
+    scatter_size: float = 8.0,
+    agg: Literal["median", "mean"] = "median",
+    show_iqr: bool = True,
+    log_x: bool = False,
+    x_clip: Optional[Tuple[float, float]] = None,
+    ncols: Optional[int] = None,
+    figsize: Optional[Tuple[float, float]] = None,
+    title: Optional[str] = None,
+) -> None:
+    """Grid of per-trial metric vs. continuous covariate.
+
+    One subplot per metric in ``metrics``. Each subplot shows:
+
+    - Light scatter of every (covariate, metric) point coloured by ``hue``.
+    - A per-class binned aggregate (median or mean) joined as a line.
+    - Optional shaded IQR band per class.
+
+    Parameters
+    ----------
+    df
+        Long DataFrame with columns ``covariate``, every name in
+        ``metrics``, and (optionally) ``hue``. Typically the output of
+        :func:`attach_trial_covariates` applied to a merged dwell + transient
+        frame.
+    metrics
+        Column names to plot. Missing columns are silently dropped.
+    covariate
+        The x-axis column (e.g. ``"iti_sec"``, ``"p_right"``,
+        ``"valid_duration_sec"``).
+    n_bins, bin_edges, bin_mode
+        Binning of the covariate for the aggregate line.
+        - ``bin_mode="quantile"`` → equal-population bins (good for skewed
+          covariates like ITI).
+        - ``bin_mode="uniform"`` → equal-width bins (natural for P(right)).
+        Pass explicit ``bin_edges`` to override both.
+    x_clip, log_x
+        Clip x to a range or render on a log scale (useful for ITIs with
+        a long tail).
+    """
+    if df is None or df.empty:
+        print("Nothing to plot.")
+        return
+    if covariate not in df.columns:
+        raise KeyError(f"covariate {covariate!r} not in DataFrame.")
+    metrics_present = [m for m in metrics if m in df.columns]
+    if not metrics_present:
+        raise ValueError("None of the requested metrics are in the DataFrame.")
+
+    work = df.dropna(subset=[covariate]).copy()
+    if x_clip is not None:
+        work = work[(work[covariate] >= x_clip[0]) & (work[covariate] <= x_clip[1])]
+    if work.empty:
+        print("Nothing to plot after dropping NaNs / clipping x.")
+        return
+
+    # --- bin edges -------------------------------------------------------
+    if bin_edges is not None:
+        edges = np.asarray(bin_edges, dtype=float)
+    elif bin_mode == "quantile":
+        qs = np.linspace(0.0, 1.0, int(n_bins) + 1)
+        edges = np.unique(np.quantile(work[covariate], qs))
+        if edges.size < 2:
+            edges = np.array([
+                float(work[covariate].min()),
+                float(work[covariate].max()) + 1e-9,
+            ])
+    elif bin_mode == "uniform":
+        lo = float(work[covariate].min())
+        hi = float(work[covariate].max())
+        edges = np.linspace(lo, hi + max(hi - lo, 1.0) * 1e-6, int(n_bins) + 1)
+    else:
+        raise ValueError("bin_mode must be 'quantile' or 'uniform'.")
+
+    work["_bin"] = pd.cut(work[covariate], edges, include_lowest=True)
+
+    # --- subplot grid ----------------------------------------------------
+    n_panels = len(metrics_present)
+    if ncols is None:
+        ncols = min(3, n_panels)
+    nrows = int(np.ceil(n_panels / ncols))
+    if figsize is None:
+        figsize = (4.6 * ncols, 3.6 * nrows)
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+
+    classes = (list(work[hue].dropna().unique())
+               if hue and hue in work.columns else [None])
+    colors = {c: f"C{i}" for i, c in enumerate(classes)}
+
+    for k, m in enumerate(metrics_present):
+        r, c = divmod(k, ncols)
+        ax = axes[r][c]
+        sub_all = work.dropna(subset=[m])
+        if sub_all.empty:
+            ax.set_visible(False)
+            continue
+
+        for cl in classes:
+            sub = sub_all if cl is None else sub_all[sub_all[hue] == cl]
+            if sub.empty:
+                continue
+            color = colors.get(cl, "C0")
+
+            if show_scatter:
+                ax.scatter(
+                    sub[covariate], sub[m],
+                    s=float(scatter_size), alpha=float(scatter_alpha),
+                    color=color, edgecolor="none",
+                )
+
+            grp = sub.groupby("_bin", observed=True)[m]
+            center_y = grp.mean() if agg == "mean" else grp.median()
+            counts = grp.count()
+            xs = np.array([(iv.left + iv.right) / 2.0
+                            for iv in center_y.index], dtype=float)
+            valid = counts.values > 0
+
+            if show_iqr:
+                lo_y = grp.quantile(0.25).reindex(center_y.index)
+                hi_y = grp.quantile(0.75).reindex(center_y.index)
+                ax.fill_between(
+                    xs[valid], lo_y.values[valid], hi_y.values[valid],
+                    color=color, alpha=0.15,
+                )
+
+            ax.plot(
+                xs[valid], center_y.values[valid],
+                color=color, lw=1.8, marker="o", ms=4,
+                label=(f"{cl} (n={int(counts.sum())})" if cl is not None
+                       else f"n={int(counts.sum())}"),
+            )
+
+        ax.set_xlabel(covariate)
+        ax.set_ylabel(m)
+        if log_x:
+            ax.set_xscale("log")
+        ax.grid(alpha=0.2)
+        if k == 0:
+            ax.legend(loc="best", fontsize=8)
+
+    # Hide unused panels.
+    for k in range(n_panels, nrows * ncols):
+        r, c = divmod(k, ncols)
+        axes[r][c].set_visible(False)
+
+    if title is None:
+        n_sess = df["session"].nunique() if "session" in df.columns else "?"
+        title = (f"Metrics vs {covariate}  "
+                 f"({len(work)} trials, {n_sess} sessions, "
+                 f"{agg} ± IQR per bin)")
+    fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
 # Scatter: average CD projection vs P(right) per trial
 # ---------------------------------------------------------------------------
 
