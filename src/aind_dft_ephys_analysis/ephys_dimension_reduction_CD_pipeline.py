@@ -1413,56 +1413,55 @@ def plot_cd_session(
     )
 
 
-def plot_cd_session_heatmap(
+@dataclass
+class _PreparedCDView:
+    """Shared per-session view returned by :func:`_prepare_cd_session_view`.
+
+    Carries the per-trial CD-projection matrices for the two classes
+    (after trial selection, NWB-event re-alignment, per-trial masking,
+    optional bump-alignment, and optional random subsampling) together
+    with the metadata needed by downstream renderers (heatmap, PSTH).
+    """
+    proj_A: np.ndarray
+    proj_B: np.ndarray
+    ids_A: np.ndarray
+    ids_B: np.ndarray
+    name_A: str
+    name_B: str
+    restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]]
+    title_suffix: str
+    split_lbl: str
+    hm_smooth: Optional[float]
+
+
+def _prepare_cd_session_view(
     sess: CDSessionData,
     *,
     split: Literal["train", "test"] = "train",
     trial_types: Optional[Sequence[str]] = None,
     smooth_gauss: float = 0.1,
     smooth_mode: Literal["gaussian", "moving"] = "gaussian",
-    sort_by: Optional[Literal["mean", "peak_time", "peak_value", "window_length", "none"]] = "mean",
-    sort_window: Optional[Tuple[float, float]] = None,
-    sort_ascending: bool = False,
     random_sample_trial_N: Optional[int] = None,
     random_sample_seed: Optional[int] = 0,
     restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
     restrict_events: Optional[Tuple[str, str]] = None,
     restrict_align: Optional[str] = None,
-    xlim: Optional[Tuple[float, float]] = None,
-    cmap: str = "RdBu_r",
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None,
-    vrange_quantile: float = 0.98,
-    symmetric_colorbar: bool = True,
-    figsize: Optional[Tuple[float, float]] = None,
-    threshold: Optional[float] = None,
-    first_bump_peak_height_frac: float = 0.3,
-    first_bump_min_peak_distance_sec: float = 0.05,
-) -> None:
-    """Single-trial CD-projection heatmap for one session.
+    bump_peak_height_frac: float = 0.3,
+    bump_min_peak_distance_sec: float = 0.05,
+) -> _PreparedCDView:
+    """Shared trial-selection / re-alignment / masking / bump-align prep.
 
-    Mirrors :func:`plot_cd_session` for trial selection (``split`` or
-    ``trial_types``), per-trial windowing (``restrict_events`` /
-    ``restrict_window_per_trial``), smoothing, and optional random
-    subsampling, but renders per-trial traces as a 2-D heatmap (one row per
-    trial). Each class becomes its own panel; rows are sorted within each
-    panel according to ``sort_by``.
+    Used by both :func:`plot_cd_session_heatmap` and
+    :func:`plot_cd_average_psth` so the two share identical semantics.
 
-    ``threshold`` : if given (>0), any sample whose absolute value is below
-    ``threshold`` is set to 0 before plotting (NaNs are preserved).
-
-    ``restrict_align='first_bump'`` triggers a per-trial alignment step
-    that detects the first bump in each trial (peak of ``|trace|`` via
-    :func:`scipy.signal.find_peaks` with
-    ``height = first_bump_peak_height_frac * max(|x|)`` and
-    ``distance = first_bump_min_peak_distance_sec / dt``) and rolls the
-    row so that bump lands at ``t=0``. When combined with
-    ``restrict_events``, the masking window is first computed in the
-    build-time align frame and applied; bumps are then searched only
-    *inside* the masked region. The per-trial mask windows are shifted
-    by the same per-trial amount so ``xlim`` auto-derivation and
-    ``sort_by='window_length'`` continue to work. Trials with no
-    detectable bump are dropped (set to NaN).
+    ``restrict_align`` accepts any NWB event name (e.g. ``'trial_start'``)
+    *plus* the special sentinels ``'first_bump'`` and ``'last_bump'``,
+    which trigger a post-mask per-trial roll so each trial's first / last
+    detected bump (peaks of ``|trace|`` from
+    :func:`scipy.signal.find_peaks`) lands at ``t=0``. Trials with no
+    detectable bump are dropped (set to NaN). The per-trial mask windows
+    are shifted by the same per-trial amount so downstream ``xlim`` and
+    ``window_length`` ordering remain correct.
     """
     # ----- Trial selection (mirrors plot_cd_session) -----
     if trial_types is not None:
@@ -1472,7 +1471,9 @@ def plot_cd_session_heatmap(
                 "to include projection_trace_all_trials."
             )
         if sess.behavior_df is None:
-            raise ValueError(f"[{sess.session}] behavior_df missing; cannot resolve trial_types.")
+            raise ValueError(
+                f"[{sess.session}] behavior_df missing; cannot resolve trial_types."
+            )
         tt_list = [trial_types] if isinstance(trial_types, str) else list(trial_types)
         if len(tt_list) not in (1, 2):
             raise ValueError("trial_types must contain 1 or 2 column names.")
@@ -1485,7 +1486,9 @@ def plot_cd_session_heatmap(
             try:
                 return np.asarray(sess.behavior_df[col].iloc[0], dtype=int).ravel()
             except Exception as e:  # noqa: BLE001
-                raise ValueError(f"[{sess.session}] could not parse {col!r}: {e}") from e
+                raise ValueError(
+                    f"[{sess.session}] could not parse {col!r}: {e}"
+                ) from e
 
         def _select(col: str) -> Tuple[np.ndarray, np.ndarray]:
             tids = _ids_from_df(col)
@@ -1498,7 +1501,10 @@ def plot_cd_session_heatmap(
             raw_B, ids_B = _select(tt_list[1])
             name_B = tt_list[1]
         else:
-            raw_B = np.empty((0, sess.proj_all_trials.shape[1]), dtype=sess.proj_all_trials.dtype)
+            raw_B = np.empty(
+                (0, sess.proj_all_trials.shape[1]),
+                dtype=sess.proj_all_trials.dtype,
+            )
             ids_B = np.empty(0, dtype=int)
             name_B = ""
         split_lbl = "All-trials CD"
@@ -1519,20 +1525,14 @@ def plot_cd_session_heatmap(
     proj_B = raw_B
     title_suffix = ""
 
-    # ----- Per-trial re-alignment from build-time align to restrict_align -----
-    # The CD zarr stores traces with time relative to the build-time `align`
-    # event (e.g. 'go_cue'). When the caller wants to view per-trial windows
-    # relative to a different event (e.g. 'trial_start'), each row must be
-    # shifted by the per-trial offset between the two events. Missing samples
-    # outside the stored PSTH range become NaN (no wrap-around).
-    #
-    # Special case: restrict_align='first_bump' is NOT an NWB event; it is
-    # handled after masking by detecting per-trial bumps. Skip the
-    # event-based shift here and compute mask windows in the build frame.
-    first_bump_align = (restrict_align == "first_bump")
+    # ----- Per-trial NWB-event re-alignment -----
+    # Skip when restrict_align is one of the post-mask bump sentinels.
+    bump_align_target: Optional[str] = (
+        restrict_align if restrict_align in ("first_bump", "last_bump") else None
+    )
     realigned = False
     if (
-        not first_bump_align
+        bump_align_target is None
         and restrict_align is not None
         and sess.build_align is not None
         and restrict_align != sess.build_align
@@ -1550,15 +1550,23 @@ def plot_cd_session_heatmap(
             )
             shifts = {}
         if shifts:
-            proj_A = _realign_traces(raw_A, ids_A, sess.dt, shifts) if raw_A.size else raw_A
-            proj_B = _realign_traces(raw_B, ids_B, sess.dt, shifts) if raw_B.size else raw_B
+            proj_A = (
+                _realign_traces(raw_A, ids_A, sess.dt, shifts)
+                if raw_A.size else raw_A
+            )
+            proj_B = (
+                _realign_traces(raw_B, ids_B, sess.dt, shifts)
+                if raw_B.size else raw_B
+            )
             raw_A = proj_A
             raw_B = proj_B
             realigned = True
 
     if restrict_window_per_trial is None and restrict_events is not None:
         ev_start, ev_end = restrict_events
-        window_align = sess.build_align if first_bump_align else restrict_align
+        # For bump-alignment, compute windows in the build_align frame
+        # (the stored trace frame); for NWB-event alignment use that event.
+        window_align = sess.build_align if bump_align_target else restrict_align
         restrict_window_per_trial = compute_per_trial_event_offsets(
             sess.session,
             event_start=ev_start,
@@ -1582,17 +1590,13 @@ def plot_cd_session_heatmap(
     if realigned:
         title_suffix += f" (re-aligned to {restrict_align})"
 
-    # ----- Optional per-trial alignment to the first detected bump -----
-    # Runs AFTER any per-trial masking so bumps are searched inside the
-    # restrict window. Each row is rolled by ``-t_first_bump`` so the first
-    # bump lands at t=0. Per-trial windows are shifted by the same amount
-    # so the auto-``xlim`` and ``sort_by='window_length'`` paths still work.
-    if first_bump_align:
+    # ----- Optional per-trial alignment to the first / last detected bump -----
+    if bump_align_target is not None:
         from scipy.signal import find_peaks
 
-        def _first_bump_shifts(
-            proj: np.ndarray, ids: np.ndarray
-        ) -> Dict[int, float]:
+        pick_index = 0 if bump_align_target == "first_bump" else -1
+
+        def _bump_shifts(proj: np.ndarray, ids: np.ndarray) -> Dict[int, float]:
             shifts_out: Dict[int, float] = {}
             if (
                 not isinstance(proj, np.ndarray)
@@ -1602,7 +1606,7 @@ def plot_cd_session_heatmap(
                 return shifts_out
             dt_local = float(sess.dt) if sess.dt else 0.0
             distance = (
-                max(1, int(round(float(first_bump_min_peak_distance_sec) / dt_local)))
+                max(1, int(round(float(bump_min_peak_distance_sec) / dt_local)))
                 if dt_local > 0
                 else 1
             )
@@ -1619,18 +1623,18 @@ def plot_cd_session_heatmap(
                 try:
                     peaks, _ = find_peaks(
                         s,
-                        height=float(first_bump_peak_height_frac) * s_max,
+                        height=float(bump_peak_height_frac) * s_max,
                         distance=distance,
                     )
                 except Exception:  # noqa: BLE001
                     peaks = np.empty(0, dtype=int)
                 if peaks.size == 0:
                     continue
-                shifts_out[int(tid)] = -float(t_valid[peaks[0]])
+                shifts_out[int(tid)] = -float(t_valid[peaks[pick_index]])
             return shifts_out
 
-        shifts_A = _first_bump_shifts(proj_A, ids_A)
-        shifts_B = _first_bump_shifts(proj_B, ids_B)
+        shifts_A = _bump_shifts(proj_A, ids_A)
+        shifts_B = _bump_shifts(proj_B, ids_B)
         if isinstance(proj_A, np.ndarray) and proj_A.size:
             proj_A = _realign_traces(proj_A, ids_A, sess.dt, shifts_A)
         if isinstance(proj_B, np.ndarray) and proj_B.size:
@@ -1653,20 +1657,15 @@ def plot_cd_session_heatmap(
         n_B_kept = len(shifts_B)
         if (n_A_total - n_A_kept) + (n_B_total - n_B_kept):
             print(
-                f"[{sess.session}] first-bump align: dropped "
+                f"[{sess.session}] {bump_align_target} align: dropped "
                 f"A={n_A_total - n_A_kept}/{n_A_total}, "
                 f"B={n_B_total - n_B_kept}/{n_B_total} trial(s) "
                 f"with no detectable bump."
             )
-        title_suffix += " (aligned to first bump)"
+        title_suffix += f" (aligned to {bump_align_target.replace('_', ' ')})"
 
-    # If per-trial restriction handled smoothing, skip it inside the heatmap.
+    # If per-trial restriction already smoothed the data, skip downstream smoothing.
     hm_smooth = None if restrict_window_per_trial is not None else smooth_gauss
-
-    if xlim is None and restrict_window_per_trial:
-        starts = np.array([w[0] for w in restrict_window_per_trial.values()])
-        ends = np.array([w[1] for w in restrict_window_per_trial.values()])
-        xlim = (float(np.quantile(starts, 0.025)), float(np.quantile(ends, 0.975)))
 
     # Optional random subsampling per class (keep ids paired with traces).
     if random_sample_trial_N is not None and random_sample_trial_N > 0:
@@ -1682,7 +1681,92 @@ def plot_cd_session_heatmap(
         proj_A, ids_A = _sample(proj_A, ids_A)
         proj_B, ids_B = _sample(proj_B, ids_B)
 
-    # Sort rows by per-trial restrict-window length (descending by default).
+    return _PreparedCDView(
+        proj_A=proj_A,
+        proj_B=proj_B,
+        ids_A=ids_A,
+        ids_B=ids_B,
+        name_A=name_A,
+        name_B=name_B,
+        restrict_window_per_trial=restrict_window_per_trial,
+        title_suffix=title_suffix,
+        split_lbl=split_lbl,
+        hm_smooth=hm_smooth,
+    )
+
+
+def plot_cd_session_heatmap(
+    sess: CDSessionData,
+    *,
+    split: Literal["train", "test"] = "train",
+    trial_types: Optional[Sequence[str]] = None,
+    smooth_gauss: float = 0.1,
+    smooth_mode: Literal["gaussian", "moving"] = "gaussian",
+    sort_by: Optional[Literal["mean", "peak_time", "peak_value", "window_length", "none"]] = "mean",
+    sort_window: Optional[Tuple[float, float]] = None,
+    sort_ascending: bool = False,
+    random_sample_trial_N: Optional[int] = None,
+    random_sample_seed: Optional[int] = 0,
+    restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
+    xlim: Optional[Tuple[float, float]] = None,
+    cmap: str = "RdBu_r",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    vrange_quantile: float = 0.98,
+    symmetric_colorbar: bool = True,
+    figsize: Optional[Tuple[float, float]] = None,
+    threshold: Optional[float] = None,
+    bump_peak_height_frac: float = 0.3,
+    bump_min_peak_distance_sec: float = 0.05,
+) -> None:
+    """Single-trial CD-projection heatmap for one session.
+
+    Mirrors :func:`plot_cd_session` for trial selection (``split`` or
+    ``trial_types``), per-trial windowing (``restrict_events`` /
+    ``restrict_window_per_trial``), smoothing, and optional random
+    subsampling, but renders per-trial traces as a 2-D heatmap (one row per
+    trial). Each class becomes its own panel; rows are sorted within each
+    panel according to ``sort_by``.
+
+    ``threshold`` : if given (>0), any sample whose absolute value is below
+    ``threshold`` is set to 0 before plotting (NaNs are preserved).
+
+    ``restrict_align`` accepts NWB event names (e.g. ``'trial_start'``)
+    plus the sentinels ``'first_bump'`` / ``'last_bump'``: when one of
+    those is passed, each trial's first / last detected bump (peak of
+    ``|trace|``) is rolled to ``t=0`` after masking. See
+    :func:`_prepare_cd_session_view` for the full alignment semantics.
+    ``bump_peak_height_frac`` and ``bump_min_peak_distance_sec`` control
+    that detection (defaults match the diagnostic at
+    :func:`compute_cd_bump_events`).
+    """
+    view = _prepare_cd_session_view(
+        sess,
+        split=split,
+        trial_types=trial_types,
+        smooth_gauss=smooth_gauss,
+        smooth_mode=smooth_mode,
+        random_sample_trial_N=random_sample_trial_N,
+        random_sample_seed=random_sample_seed,
+        restrict_window_per_trial=restrict_window_per_trial,
+        restrict_events=restrict_events,
+        restrict_align=restrict_align,
+        bump_peak_height_frac=bump_peak_height_frac,
+        bump_min_peak_distance_sec=bump_min_peak_distance_sec,
+    )
+    proj_A, proj_B = view.proj_A, view.proj_B
+    ids_A, ids_B = view.ids_A, view.ids_B
+    name_A, name_B = view.name_A, view.name_B
+    restrict_window_per_trial = view.restrict_window_per_trial
+
+    if xlim is None and restrict_window_per_trial:
+        starts = np.array([w[0] for w in restrict_window_per_trial.values()])
+        ends = np.array([w[1] for w in restrict_window_per_trial.values()])
+        xlim = (float(np.quantile(starts, 0.025)), float(np.quantile(ends, 0.975)))
+
+    # Sort rows by per-trial restrict-window length (heatmap-specific).
     # When chosen, we reorder here and tell plot_cd_heatmap not to re-sort.
     hm_sort_by: Optional[str] = sort_by
     if sort_by == "window_length":
@@ -1733,7 +1817,7 @@ def plot_cd_session_heatmap(
         sess.time,
         proj_A,
         proj_B if (isinstance(proj_B, np.ndarray) and proj_B.size) else None,
-        smooth=hm_smooth,
+        smooth=view.hm_smooth,
         smooth_mode=smooth_mode,
         dt=sess.dt,
         sort_by=hm_sort_by,
@@ -1747,8 +1831,211 @@ def plot_cd_session_heatmap(
         labels=(name_A, name_B or "(none)"),
         figsize=figsize,
         xlim=xlim,
-        title=f"[{sess.session}] {split_lbl} Single-Trial CD Heatmap{title_suffix}",
+        title=f"[{sess.session}] {view.split_lbl} Single-Trial CD Heatmap{view.title_suffix}",
     )
+
+
+def plot_cd_average_psth(
+    sess: CDSessionData,
+    *,
+    split: Literal["train", "test"] = "train",
+    trial_types: Optional[Sequence[str]] = None,
+    smooth_gauss: float = 0.1,
+    smooth_mode: Literal["gaussian", "moving"] = "gaussian",
+    random_sample_trial_N: Optional[int] = None,
+    random_sample_seed: Optional[int] = 0,
+    restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
+    bump_peak_height_frac: float = 0.3,
+    bump_min_peak_distance_sec: float = 0.05,
+    signal: Literal["signed", "abs"] = "signed",
+    error: Literal["sem", "std", "iqr", "none"] = "sem",
+    min_trials_per_bin: int = 5,
+    show_n_counts: bool = True,
+    xlim: Optional[Tuple[float, float]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
+    figsize: Tuple[float, float] = (8.0, 4.2),
+    title: Optional[str] = None,
+    colors: Optional[Dict[str, str]] = None,
+) -> None:
+    """Average CD-projection PSTH across trials for one session.
+
+    Companion to :func:`plot_cd_session_heatmap` that overlays the
+    per-time-bin **mean ± error** trace for each class on a single axis.
+    Trial selection, re-alignment, masking, smoothing, and optional
+    random subsampling are identical to the heatmap (shared
+    :func:`_prepare_cd_session_view`), so ``restrict_align='first_bump'``
+    and ``restrict_align='last_bump'`` work the same way (each trial is
+    rolled so its first / last detected bump lands at ``t=0`` before
+    averaging).
+
+    Parameters
+    ----------
+    signal : {'signed', 'abs'}, default 'signed'
+        ``'signed'`` averages the centered CD projection (preserves sign;
+        class A trace should sit above 0, class B below 0).
+        ``'abs'`` averages ``|trace|`` — useful when aligning to first /
+        last bump so the burst shape appears as a positive peak at
+        ``t=0`` instead of being averaged away by sign cancellation.
+    error : {'sem', 'std', 'iqr', 'none'}, default 'sem'
+        Shaded band around each mean trace.
+    min_trials_per_bin : int, default 5
+        Bins with fewer finite trials are set to NaN to avoid noisy
+        ragged tails after per-trial masking / bump alignment.
+    show_n_counts : bool, default True
+        Overlay the per-bin trial count as a dashed faint trace on a
+        secondary y-axis. Useful sanity check for first/last-bump-aligned
+        traces, where the window shrinks at the tails.
+    """
+    view = _prepare_cd_session_view(
+        sess,
+        split=split,
+        trial_types=trial_types,
+        smooth_gauss=smooth_gauss,
+        smooth_mode=smooth_mode,
+        random_sample_trial_N=random_sample_trial_N,
+        random_sample_seed=random_sample_seed,
+        restrict_window_per_trial=restrict_window_per_trial,
+        restrict_events=restrict_events,
+        restrict_align=restrict_align,
+        bump_peak_height_frac=bump_peak_height_frac,
+        bump_min_peak_distance_sec=bump_min_peak_distance_sec,
+    )
+
+    if signal not in ("signed", "abs"):
+        raise ValueError(f"signal must be 'signed' or 'abs', got {signal!r}")
+    if error not in ("sem", "std", "iqr", "none"):
+        raise ValueError(
+            f"error must be 'sem' | 'std' | 'iqr' | 'none', got {error!r}"
+        )
+
+    def _agg(proj: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return per-bin (mean, lo, hi, n_valid)."""
+        if (
+            not isinstance(proj, np.ndarray)
+            or proj.ndim != 2
+            or proj.size == 0
+        ):
+            return (
+                np.empty(0, dtype=float),
+                np.empty(0, dtype=float),
+                np.empty(0, dtype=float),
+                np.empty(0, dtype=int),
+            )
+        x = proj.astype(float, copy=False)
+        if signal == "abs":
+            x = np.abs(x)
+        finite = np.isfinite(x)
+        n_valid = finite.sum(axis=0).astype(int)
+        x_masked = np.where(finite, x, np.nan)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mean = np.nanmean(x_masked, axis=0)
+            if error == "std":
+                spread = np.nanstd(x_masked, axis=0, ddof=0)
+                lo, hi = mean - spread, mean + spread
+            elif error == "sem":
+                spread = np.nanstd(x_masked, axis=0, ddof=0) / np.sqrt(
+                    np.maximum(n_valid, 1)
+                )
+                lo, hi = mean - spread, mean + spread
+            elif error == "iqr":
+                lo = np.nanquantile(x_masked, 0.25, axis=0)
+                hi = np.nanquantile(x_masked, 0.75, axis=0)
+            else:  # "none"
+                lo, hi = mean.copy(), mean.copy()
+
+        keep = n_valid >= int(min_trials_per_bin)
+        mean = np.where(keep, mean, np.nan)
+        lo = np.where(keep, lo, np.nan)
+        hi = np.where(keep, hi, np.nan)
+        return mean, lo, hi, n_valid
+
+    mean_A, lo_A, hi_A, n_A = _agg(view.proj_A)
+    mean_B, lo_B, hi_B, n_B = _agg(view.proj_B)
+
+    if xlim is None and view.restrict_window_per_trial:
+        starts = np.array([w[0] for w in view.restrict_window_per_trial.values()])
+        ends = np.array([w[1] for w in view.restrict_window_per_trial.values()])
+        xlim = (
+            float(np.quantile(starts, 0.025)),
+            float(np.quantile(ends, 0.975)),
+        )
+
+    color_map: Dict[str, str] = {view.name_A: "C0"}
+    if view.name_B:
+        color_map[view.name_B] = "C1"
+    if colors:
+        color_map.update(colors)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    n_plotted = 0
+
+    if mean_A.size:
+        c = color_map.get(view.name_A, "C0")
+        n_tr = view.proj_A.shape[0] if view.proj_A.ndim == 2 else 0
+        ax.plot(sess.time, mean_A, color=c, lw=1.8,
+                label=f"{view.name_A} (n_trials={n_tr})")
+        if error != "none":
+            ax.fill_between(sess.time, lo_A, hi_A,
+                            color=c, alpha=0.25, linewidth=0)
+        n_plotted += 1
+    if mean_B.size and view.name_B:
+        c = color_map.get(view.name_B, "C1")
+        n_tr = view.proj_B.shape[0] if view.proj_B.ndim == 2 else 0
+        ax.plot(sess.time, mean_B, color=c, lw=1.8,
+                label=f"{view.name_B} (n_trials={n_tr})")
+        if error != "none":
+            ax.fill_between(sess.time, lo_B, hi_B,
+                            color=c, alpha=0.25, linewidth=0)
+        n_plotted += 1
+
+    if n_plotted == 0:
+        print(f"[{sess.session}] no trials to plot.")
+        plt.close(fig)
+        return
+
+    if signal == "signed":
+        ax.axhline(0.0, color="k", lw=0.6, alpha=0.5)
+    ax.axvline(0.0, color="k", lw=0.6, alpha=0.5, ls=":")
+
+    if xlim is not None:
+        ax.set_xlim(*xlim)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+
+    ax.set_xlabel("time (s)")
+    y_lbl = "mean |CD projection|" if signal == "abs" else "mean CD projection"
+    err_lbl = {"sem": " ± SEM", "std": " ± SD", "iqr": "  (25–75% IQR)", "none": ""}[error]
+    ax.set_ylabel(f"{y_lbl}{err_lbl}")
+    ax.set_title(
+        title
+        or f"[{sess.session}] {view.split_lbl} Average CD PSTH{view.title_suffix}"
+    )
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # Optional N-counts overlay on a faint secondary y-axis.
+    if show_n_counts and (n_A.size or n_B.size):
+        ax2 = ax.twinx()
+        if n_A.size:
+            ax2.plot(
+                sess.time, n_A,
+                color=color_map.get(view.name_A, "C0"),
+                alpha=0.30, lw=0.8, ls="--",
+            )
+        if n_B.size and view.name_B:
+            ax2.plot(
+                sess.time, n_B,
+                color=color_map.get(view.name_B, "C1"),
+                alpha=0.30, lw=0.8, ls="--",
+            )
+        ax2.set_ylabel("n trials (dashed)", color="0.4", fontsize=8)
+        ax2.tick_params(axis="y", labelcolor="0.4", labelsize=8)
+        ax2.set_ylim(bottom=0)
+
+    fig.tight_layout()
+    plt.show()
 
 
 def plot_cd_session_bumps(
