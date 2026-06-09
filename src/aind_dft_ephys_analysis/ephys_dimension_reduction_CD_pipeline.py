@@ -2463,6 +2463,573 @@ def plot_persistency_vs_iti(
 
 
 # ---------------------------------------------------------------------------
+# Single-trial transient-vs-persistent metrics
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _PreparedCDClasses:
+    """Output of :func:`_prepare_cd_session_for_scoring`."""
+    proj_A: np.ndarray
+    ids_A: np.ndarray
+    name_A: str
+    sign_A: int
+    proj_B: np.ndarray
+    ids_B: np.ndarray
+    name_B: str
+    sign_B: int
+    center_val: float
+
+
+def _prepare_cd_session_for_scoring(
+    sess: CDSessionData,
+    *,
+    trial_types: Optional[Sequence[str]] = None,
+    split: Literal["train", "test"] = "test",
+    time_window: Tuple[float, float] = (0.0, 5.0),
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
+    restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
+    smooth_gauss: float = 0.1,
+    smooth_mode: Literal["gaussian", "moving"] = "gaussian",
+    projection_source: Literal["unbiased", "all"] = "unbiased",
+    center: float | Literal["cross_class_median"] = 0.0,
+    class_signs: Tuple[int, int] = (1, -1),
+) -> _PreparedCDClasses:
+    """Prepare per-class projection traces for any single-trial scorer.
+
+    Encapsulates the trial-prep used by :func:`compute_cd_dwell_metrics`
+    (trial selection, per-trial re-alignment, per-trial masking +
+    smoothing, and center selection) so that other per-trial metric
+    functions (e.g. :func:`compute_cd_transient_metrics`) can reuse the
+    same logic and produce rows that join row-for-row with the dwell
+    output on ``(session, trial_id, class_index)``.
+    """
+    # --- Trial selection ---------------------------------------------------
+    if trial_types is not None:
+        proj_all_arr = _pick_proj_all(sess, projection_source)
+        if proj_all_arr.size == 0:
+            raise ValueError(
+                f"[{sess.session}] proj_all_trials is empty; rebuild CD zarr "
+                "to include projection_trace_all_trials."
+            )
+        if sess.behavior_df is None:
+            raise ValueError(
+                f"[{sess.session}] behavior_df missing; cannot resolve trial_types."
+            )
+        tt_list = [trial_types] if isinstance(trial_types, str) else list(trial_types)
+        if len(tt_list) not in (1, 2):
+            raise ValueError("trial_types must contain 1 or 2 column names.")
+
+        def _ids_from_df(col: str) -> np.ndarray:
+            if col not in sess.behavior_df.columns:
+                raise KeyError(
+                    f"[{sess.session}] column {col!r} not found in behavior CSV."
+                )
+            try:
+                return np.asarray(sess.behavior_df[col].iloc[0], dtype=int).ravel()
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"[{sess.session}] could not parse {col!r}: {e}") from e
+
+        def _select(col: str) -> Tuple[np.ndarray, np.ndarray]:
+            tids = _ids_from_df(col)
+            mask = np.isin(sess.trial_id_all_trials, tids)
+            return proj_all_arr[mask], sess.trial_id_all_trials[mask]
+
+        raw_A, ids_A = _select(tt_list[0])
+        name_A = tt_list[0]
+        if len(tt_list) == 2:
+            raw_B, ids_B = _select(tt_list[1])
+            name_B = tt_list[1]
+        else:
+            raw_B = np.empty((0, proj_all_arr.shape[1]), dtype=proj_all_arr.dtype)
+            ids_B = np.empty(0, dtype=int)
+            name_B = ""
+    else:
+        if split == "train":
+            raw_A, raw_B = sess.proj_train_A, sess.proj_train_B
+            ids_A, ids_B = sess.trial_id_train_A, sess.trial_id_train_B
+        elif split == "test":
+            raw_A, raw_B = sess.proj_test_A, sess.proj_test_B
+            ids_A, ids_B = sess.trial_id_test_A, sess.trial_id_test_B
+        else:
+            raise ValueError(f"split must be 'train' or 'test', got {split!r}")
+        name_A, name_B = sess.trial_types
+
+    proj_A = raw_A
+    proj_B = raw_B
+
+    # --- Per-trial re-alignment (build_align -> restrict_align) ------------
+    if (
+        restrict_align is not None
+        and sess.build_align is not None
+        and restrict_align != sess.build_align
+    ):
+        try:
+            shifts = compute_per_trial_align_shifts(
+                sess.session,
+                from_align=sess.build_align,
+                to_align=restrict_align,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[warn] could not re-align {sess.session} "
+                f"({sess.build_align}->{restrict_align}): {e}"
+            )
+            shifts = {}
+        if shifts:
+            proj_A = _realign_traces(raw_A, ids_A, sess.dt, shifts) if raw_A.size else raw_A
+            proj_B = _realign_traces(raw_B, ids_B, sess.dt, shifts) if raw_B.size else raw_B
+            raw_A = proj_A
+            raw_B = proj_B
+
+    # --- Per-trial eligibility masking + smoothing -------------------------
+    if restrict_window_per_trial is None and restrict_events is not None:
+        ev_start, ev_end = restrict_events
+        restrict_window_per_trial = compute_per_trial_event_offsets(
+            sess.session,
+            event_start=ev_start,
+            event_end=ev_end,
+            align=restrict_align,
+        )
+
+    if restrict_window_per_trial is not None:
+        proj_A = _mask_trace_per_trial(
+            raw_A, ids_A, sess.time, restrict_window_per_trial,
+            smooth_seconds=smooth_gauss, dt=sess.dt, smooth_mode=smooth_mode,
+        ) if raw_A.size else raw_A
+        proj_B = _mask_trace_per_trial(
+            raw_B, ids_B, sess.time, restrict_window_per_trial,
+            smooth_seconds=smooth_gauss, dt=sess.dt, smooth_mode=smooth_mode,
+        ) if raw_B.size else raw_B
+    elif smooth_gauss is not None and smooth_gauss > 0:
+        from scipy.ndimage import gaussian_filter1d, uniform_filter1d
+        kp = max(1, int(round(float(smooth_gauss) / (sess.dt or 1.0))))
+
+        def _smooth_rows(arr: np.ndarray) -> np.ndarray:
+            if arr.size == 0:
+                return arr
+            out = arr.astype(float, copy=True)
+            for i in range(out.shape[0]):
+                row = out[i]
+                valid = np.isfinite(row)
+                if not np.any(valid):
+                    continue
+                seg = row[valid]
+                if seg.size > 1:
+                    if smooth_mode == "gaussian":
+                        seg = gaussian_filter1d(seg, sigma=kp, mode="nearest")
+                    else:
+                        seg = uniform_filter1d(seg, size=kp, mode="nearest")
+                out[i, valid] = seg
+            return out
+
+        proj_A = _smooth_rows(proj_A)
+        proj_B = _smooth_rows(proj_B)
+
+    # --- Center selection --------------------------------------------------
+    if isinstance(center, str):
+        if center != "cross_class_median":
+            raise ValueError(
+                f"center must be a float or 'cross_class_median', got {center!r}"
+            )
+        tmask = (sess.time >= float(time_window[0])) & (sess.time <= float(time_window[1]))
+        pool = []
+        if proj_A.size and proj_A.ndim == 2:
+            pool.append(proj_A[:, tmask].ravel())
+        if proj_B.size and proj_B.ndim == 2:
+            pool.append(proj_B[:, tmask].ravel())
+        if pool:
+            all_pool = np.concatenate(pool)
+            finite = all_pool[np.isfinite(all_pool)]
+            center_val = float(np.median(finite)) if finite.size else 0.0
+        else:
+            center_val = 0.0
+    else:
+        center_val = float(center)
+
+    sign_A, sign_B = int(class_signs[0]), int(class_signs[1])
+    return _PreparedCDClasses(
+        proj_A=proj_A, ids_A=ids_A, name_A=name_A, sign_A=sign_A,
+        proj_B=proj_B, ids_B=ids_B, name_B=name_B, sign_B=sign_B,
+        center_val=center_val,
+    )
+
+
+def _transient_metrics_from_trace(
+    trace: np.ndarray,
+    time: np.ndarray,
+    *,
+    t0: float,
+    t1: float,
+    center: float,
+    class_sign: int,
+    signal_mode: Literal["abs", "rectified_on_class", "centered_squared"] = "abs",
+    peak_height_frac: float = 0.5,
+    min_peak_distance_sec: float = 0.05,
+) -> Dict[str, float]:
+    """Per-trial transient-vs-persistent metrics for one 1-D trace.
+
+    Returns a dict of scalar metrics computed on a non-negative signal
+    ``s(t)`` derived from the centered trace ``x(t) = trace - center``:
+
+    - **L_eff_sec**: effective lifetime,
+      :math:`L_\\text{eff} = (\\sum s^2)^2 / \\sum s^4 \\cdot dt` (seconds).
+      Flat plateau of length T → L_eff = T. Delta-like spike of width δ
+      → L_eff ≈ δ.
+    - **L_eff_frac**: ``L_eff_sec / valid_duration_sec``, clipped to
+      ``(0, 1]``. 1 = fully persistent, → 0 = single transient bump.
+    - **temporal_gini**: Gini concentration of |x|. 0 = uniform across
+      time (persistent), 1 = all mass at one sample. Scale-invariant.
+    - **peak_to_mean**: ``max(s) / mean(s)`` (≥ 1). Large = bumpy,
+      ≈ 1 = flat.
+    - **dominant_bump_fwhm_sec**: FWHM (seconds) of the tallest peak in
+      ``s`` at half its height.
+    - **n_bumps**: number of peaks in ``s`` above
+      ``peak_height_frac * max(s)``, with minimum spacing
+      ``min_peak_distance_sec``.
+
+    Parameters
+    ----------
+    signal_mode
+        How to convert the centered trace into the non-negative scoring
+        signal ``s``:
+        - ``"abs"`` (default): ``s = |x|`` (energy on either side).
+        - ``"rectified_on_class"``: ``s = max(0, class_sign * x)`` — only
+          on-class excursions contribute. ``class_sign=0`` falls back to
+          ``"abs"``.
+        - ``"centered_squared"``: ``s = x**2`` (emphasises big excursions).
+    """
+    nan = float("nan")
+    blank = {
+        "valid_duration_sec": 0.0, "n_valid_samples": 0,
+        "L_eff_sec": nan, "L_eff_frac": nan,
+        "temporal_gini": nan,
+        "peak_to_mean": nan,
+        "dominant_bump_fwhm_sec": nan,
+        "n_bumps": 0,
+    }
+    if trace.size == 0 or time.size == 0:
+        return dict(blank)
+
+    sel = (time >= t0) & (time <= t1)
+    x = trace[sel].astype(float, copy=False)
+    t = time[sel]
+    valid = np.isfinite(x)
+    if not np.any(valid):
+        return dict(blank)
+    x = x[valid] - float(center)
+    t = t[valid]
+
+    if t.size >= 2:
+        dt = float(np.median(np.diff(t)))
+        if not np.isfinite(dt) or dt <= 0:
+            dt = float((t[-1] - t[0]) / max(t.size - 1, 1))
+    else:
+        dt = 0.0
+    valid_dur = float(dt * x.size)
+
+    if signal_mode == "abs":
+        s = np.abs(x)
+    elif signal_mode == "rectified_on_class":
+        cs = int(np.sign(class_sign)) if class_sign != 0 else 0
+        s = np.maximum(0.0, cs * x) if cs != 0 else np.abs(x)
+    elif signal_mode == "centered_squared":
+        s = x * x
+    else:
+        raise ValueError(
+            "signal_mode must be 'abs' | 'rectified_on_class' | 'centered_squared', "
+            f"got {signal_mode!r}"
+        )
+
+    s_max = float(np.max(s)) if s.size else 0.0
+    if not np.isfinite(s_max) or s_max <= 0.0:
+        out = dict(blank)
+        out["valid_duration_sec"] = valid_dur
+        out["n_valid_samples"] = int(s.size)
+        return out
+
+    # --- 1. Effective lifetime --------------------------------------------
+    s2 = s * s
+    s4 = s2 * s2
+    num = float(s2.sum()) ** 2
+    den = float(s4.sum())
+    if den > 0 and dt > 0:
+        L_eff_sec = num / den * dt
+        if valid_dur > 0:
+            L_eff_frac = min(L_eff_sec / valid_dur, 1.0)
+        else:
+            L_eff_frac = nan
+    else:
+        L_eff_sec = nan
+        L_eff_frac = nan
+
+    # --- 2. Temporal Gini of |x| ------------------------------------------
+    abs_x = np.abs(x)
+    abs_total = float(abs_x.sum())
+    if abs_total > 0 and abs_x.size > 0:
+        sorted_abs = np.sort(abs_x)
+        n_g = sorted_abs.size
+        idx = np.arange(1, n_g + 1, dtype=float)
+        gini = float(
+            (2.0 * (idx * sorted_abs).sum()) / (n_g * abs_total)
+            - (n_g + 1.0) / n_g
+        )
+    else:
+        gini = nan
+
+    # --- 3. Peak-to-mean ratio --------------------------------------------
+    mean_s = float(np.mean(s)) if s.size else 0.0
+    pmr = float(s_max / mean_s) if mean_s > 0 else nan
+
+    # --- 4 & 5. Peak finding ----------------------------------------------
+    from scipy.signal import find_peaks, peak_widths
+    height_thr = float(peak_height_frac) * s_max
+    distance = max(1, int(round(float(min_peak_distance_sec) / dt))) if dt > 0 else 1
+    try:
+        peaks, _props = find_peaks(s, height=height_thr, distance=distance)
+    except Exception:  # noqa: BLE001
+        peaks = np.empty(0, dtype=int)
+
+    n_bumps = int(peaks.size)
+    if peaks.size > 0 and dt > 0:
+        tallest = int(peaks[int(np.argmax(s[peaks]))])
+        try:
+            widths, _, _, _ = peak_widths(s, [tallest], rel_height=0.5)
+            fwhm = float(widths[0]) * dt
+        except Exception:  # noqa: BLE001
+            fwhm = nan
+    else:
+        fwhm = nan
+
+    return {
+        "valid_duration_sec": valid_dur,
+        "n_valid_samples": int(s.size),
+        "L_eff_sec": float(L_eff_sec),
+        "L_eff_frac": float(L_eff_frac),
+        "temporal_gini": float(gini),
+        "peak_to_mean": float(pmr),
+        "dominant_bump_fwhm_sec": float(fwhm),
+        "n_bumps": int(n_bumps),
+    }
+
+
+def compute_cd_transient_metrics(
+    sess: CDSessionData,
+    *,
+    trial_types: Optional[Sequence[str]] = None,
+    split: Literal["train", "test"] = "test",
+    time_window: Tuple[float, float] = (0.0, 5.0),
+    restrict_events: Optional[Tuple[str, str]] = None,
+    restrict_align: Optional[str] = None,
+    restrict_window_per_trial: Optional[Dict[int, Tuple[float, float]]] = None,
+    smooth_gauss: float = 0.1,
+    smooth_mode: Literal["gaussian", "moving"] = "gaussian",
+    projection_source: Literal["unbiased", "all"] = "unbiased",
+    center: float | Literal["cross_class_median"] = 0.0,
+    class_signs: Tuple[int, int] = (1, -1),
+    signal_mode: Literal["abs", "rectified_on_class", "centered_squared"] = "abs",
+    peak_height_frac: float = 0.5,
+    min_peak_distance_sec: float = 0.05,
+) -> pd.DataFrame:
+    """Per-trial transient-vs-persistent metrics for one CD session.
+
+    Computes five scalar metrics per trial that quantify how *temporally
+    concentrated* the single-trial CD projection is. Complements the
+    sign-based :func:`compute_cd_dwell_metrics`. Trial selection,
+    re-alignment, masking, smoothing and centering match that function,
+    so output rows join row-for-row with the dwell output on
+    ``(session, trial_id, class_index)``.
+
+    Metric definitions (see :func:`_transient_metrics_from_trace`):
+
+    - ``L_eff_sec``, ``L_eff_frac`` — effective lifetime (s) and its
+      fraction of the per-trial valid window. **``L_eff_frac → 1``
+      = persistent, ``L_eff_frac → 0`` = transient.**
+    - ``temporal_gini`` — concentration of ``|x|`` over time
+      (0 = spread, 1 = single-sample spike).
+    - ``peak_to_mean`` — ``max(s) / mean(s)`` (≥ 1).
+    - ``dominant_bump_fwhm_sec`` — physical width of the tallest peak.
+    - ``n_bumps`` — peaks above ``peak_height_frac * max(s)``.
+
+    Pairs naturally with :func:`plot_transient_vs_persistency` for the
+    standard 2-D scatter ``persistency_index × L_eff_frac``.
+    """
+    prep = _prepare_cd_session_for_scoring(
+        sess,
+        trial_types=trial_types,
+        split=split,
+        time_window=time_window,
+        restrict_events=restrict_events,
+        restrict_align=restrict_align,
+        restrict_window_per_trial=restrict_window_per_trial,
+        smooth_gauss=smooth_gauss,
+        smooth_mode=smooth_mode,
+        projection_source=projection_source,
+        center=center,
+        class_signs=class_signs,
+    )
+
+    t0, t1 = float(time_window[0]), float(time_window[1])
+    rows: List[Dict[str, Any]] = []
+
+    def _emit(proj: np.ndarray, ids: np.ndarray, name: str, class_idx: int,
+              class_sign: int) -> None:
+        if proj.size == 0 or proj.ndim != 2 or not name:
+            return
+        for i, tid in enumerate(ids):
+            m = _transient_metrics_from_trace(
+                proj[i], sess.time,
+                t0=t0, t1=t1,
+                center=prep.center_val,
+                class_sign=class_sign,
+                signal_mode=signal_mode,
+                peak_height_frac=float(peak_height_frac),
+                min_peak_distance_sec=float(min_peak_distance_sec),
+            )
+            m.update({
+                "session": sess.session,
+                "trial_id": int(tid),
+                "class_name": name,
+                "class_index": class_idx,
+                "class_sign": class_sign,
+                "center": prep.center_val,
+                "t_start": t0,
+                "t_end": t1,
+                "signal_mode": signal_mode,
+            })
+            rows.append(m)
+
+    _emit(prep.proj_A, prep.ids_A, prep.name_A, 0, prep.sign_A)
+    _emit(prep.proj_B, prep.ids_B, prep.name_B, 1, prep.sign_B)
+
+    if not rows:
+        return pd.DataFrame()
+
+    cols_first = [
+        "session", "trial_id", "class_name", "class_index", "class_sign",
+        "t_start", "t_end", "center", "signal_mode",
+    ]
+    df = pd.DataFrame(rows)
+    rest = [c for c in df.columns if c not in cols_first]
+    return df[cols_first + rest]
+
+
+def compute_cd_transient_metrics_multi(
+    sessions_data: Iterable[CDSessionData],
+    **kwargs: Any,
+) -> pd.DataFrame:
+    """Run :func:`compute_cd_transient_metrics` on many sessions; concat rows.
+
+    Sessions that raise are skipped with a printed warning. Returns an
+    empty DataFrame if nothing succeeded.
+    """
+    frames: List[pd.DataFrame] = []
+    for sess in sessions_data:
+        try:
+            df = compute_cd_transient_metrics(sess, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            print(f"[skip] {getattr(sess, 'session', '?')}: {e}")
+            continue
+        if not df.empty:
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def plot_transient_vs_persistency(
+    transient_df: pd.DataFrame,
+    dwell_df: Optional[pd.DataFrame] = None,
+    *,
+    x: str = "persistency_index",
+    y: str = "L_eff_frac",
+    hue: str = "class_name",
+    alpha: float = 0.4,
+    point_size: float = 18.0,
+    figsize: Tuple[float, float] = (7, 6),
+    xlim: Optional[Tuple[float, float]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
+    title: Optional[str] = None,
+) -> None:
+    """Scatter of a transient metric against a persistency metric.
+
+    Defaults to ``persistency_index`` (x) vs ``L_eff_frac`` (y). If
+    ``dwell_df`` is given, it is inner-joined to ``transient_df`` on
+    ``(session, trial_id, class_index)`` so the standard pair works
+    without manual merging.
+
+    Reading guide (for the default axes):
+
+    - **Top-right** (high persistency, high ``L_eff_frac``)
+      ⇒ genuinely **persistent** (plateau on the correct side).
+    - **Top-left** (high persistency, low ``L_eff_frac``)
+      ⇒ **transient** bump but on the correct side.
+    - **Bottom-right** (low persistency, high ``L_eff_frac``)
+      ⇒ spread out but oscillating across the boundary.
+    - **Bottom-left** (low persistency, low ``L_eff_frac``)
+      ⇒ short off-class spike with little useful encoding.
+    """
+    df = transient_df
+    if dwell_df is not None and not dwell_df.empty:
+        merge_keys = ["session", "trial_id", "class_index"]
+        right_cols = [
+            c for c in dwell_df.columns
+            if c in merge_keys or c not in transient_df.columns
+        ]
+        df = pd.merge(
+            transient_df, dwell_df[right_cols],
+            on=merge_keys, how="inner",
+        )
+
+    if df is None or df.empty:
+        print("Nothing to plot.")
+        return
+    missing = [c for c in (x, y) if c not in df.columns]
+    if missing:
+        raise KeyError(f"Required columns missing from the joined frame: {missing}")
+
+    plot_df = df.dropna(subset=[x, y]).copy()
+    if plot_df.empty:
+        print("Nothing to plot after dropping NaNs.")
+        return
+
+    fig, ax = plt.subplots(figsize=figsize)
+    classes = list(plot_df[hue].unique()) if hue in plot_df.columns else [None]
+    colors = {c: f"C{i}" for i, c in enumerate(classes)}
+
+    for c in classes:
+        sub = plot_df if c is None else plot_df[plot_df[hue] == c]
+        if sub.empty:
+            continue
+        ax.scatter(
+            sub[x], sub[y],
+            s=float(point_size), alpha=float(alpha),
+            color=colors.get(c, "C0"),
+            edgecolor="none",
+            label=(f"{c} (n={len(sub)})" if c is not None else f"n={len(sub)}"),
+        )
+
+    if xlim is not None:
+        ax.set_xlim(*xlim)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+
+    # Reference lines for the canonical (persistency_index × L_eff_frac) view.
+    if x == "persistency_index":
+        ax.axvline(0.0, color="k", lw=0.6, alpha=0.5)
+    if y == "L_eff_frac":
+        ax.axhline(0.5, color="k", lw=0.6, alpha=0.5, ls="--")
+
+    ax.set_xlabel(x)
+    ax.set_ylabel(y)
+    n_sess = plot_df["session"].nunique() if "session" in plot_df.columns else "?"
+    ax.set_title(title or f"{y} vs {x}  ({len(plot_df)} trials, {n_sess} sessions)")
+    ax.legend(loc="best", fontsize=9)
+    fig.tight_layout()
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
 # Scatter: average CD projection vs P(right) per trial
 # ---------------------------------------------------------------------------
 
