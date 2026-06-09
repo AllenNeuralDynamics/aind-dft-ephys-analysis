@@ -1436,6 +1436,8 @@ def plot_cd_session_heatmap(
     symmetric_colorbar: bool = True,
     figsize: Optional[Tuple[float, float]] = None,
     threshold: Optional[float] = None,
+    first_bump_peak_height_frac: float = 0.3,
+    first_bump_min_peak_distance_sec: float = 0.05,
 ) -> None:
     """Single-trial CD-projection heatmap for one session.
 
@@ -1448,6 +1450,19 @@ def plot_cd_session_heatmap(
 
     ``threshold`` : if given (>0), any sample whose absolute value is below
     ``threshold`` is set to 0 before plotting (NaNs are preserved).
+
+    ``restrict_align='first_bump'`` triggers a per-trial alignment step
+    that detects the first bump in each trial (peak of ``|trace|`` via
+    :func:`scipy.signal.find_peaks` with
+    ``height = first_bump_peak_height_frac * max(|x|)`` and
+    ``distance = first_bump_min_peak_distance_sec / dt``) and rolls the
+    row so that bump lands at ``t=0``. When combined with
+    ``restrict_events``, the masking window is first computed in the
+    build-time align frame and applied; bumps are then searched only
+    *inside* the masked region. The per-trial mask windows are shifted
+    by the same per-trial amount so ``xlim`` auto-derivation and
+    ``sort_by='window_length'`` continue to work. Trials with no
+    detectable bump are dropped (set to NaN).
     """
     # ----- Trial selection (mirrors plot_cd_session) -----
     if trial_types is not None:
@@ -1510,9 +1525,15 @@ def plot_cd_session_heatmap(
     # relative to a different event (e.g. 'trial_start'), each row must be
     # shifted by the per-trial offset between the two events. Missing samples
     # outside the stored PSTH range become NaN (no wrap-around).
+    #
+    # Special case: restrict_align='first_bump' is NOT an NWB event; it is
+    # handled after masking by detecting per-trial bumps. Skip the
+    # event-based shift here and compute mask windows in the build frame.
+    first_bump_align = (restrict_align == "first_bump")
     realigned = False
     if (
-        restrict_align is not None
+        not first_bump_align
+        and restrict_align is not None
         and sess.build_align is not None
         and restrict_align != sess.build_align
     ):
@@ -1537,11 +1558,12 @@ def plot_cd_session_heatmap(
 
     if restrict_window_per_trial is None and restrict_events is not None:
         ev_start, ev_end = restrict_events
+        window_align = sess.build_align if first_bump_align else restrict_align
         restrict_window_per_trial = compute_per_trial_event_offsets(
             sess.session,
             event_start=ev_start,
             event_end=ev_end,
-            align=restrict_align,
+            align=window_align,
         )
 
     if restrict_window_per_trial is not None:
@@ -1559,6 +1581,84 @@ def plot_cd_session_heatmap(
             title_suffix = " [per-trial window]"
     if realigned:
         title_suffix += f" (re-aligned to {restrict_align})"
+
+    # ----- Optional per-trial alignment to the first detected bump -----
+    # Runs AFTER any per-trial masking so bumps are searched inside the
+    # restrict window. Each row is rolled by ``-t_first_bump`` so the first
+    # bump lands at t=0. Per-trial windows are shifted by the same amount
+    # so the auto-``xlim`` and ``sort_by='window_length'`` paths still work.
+    if first_bump_align:
+        from scipy.signal import find_peaks
+
+        def _first_bump_shifts(
+            proj: np.ndarray, ids: np.ndarray
+        ) -> Dict[int, float]:
+            shifts_out: Dict[int, float] = {}
+            if (
+                not isinstance(proj, np.ndarray)
+                or proj.ndim != 2
+                or proj.size == 0
+            ):
+                return shifts_out
+            dt_local = float(sess.dt) if sess.dt else 0.0
+            distance = (
+                max(1, int(round(float(first_bump_min_peak_distance_sec) / dt_local)))
+                if dt_local > 0
+                else 1
+            )
+            for i, tid in enumerate(ids):
+                row = proj[i].astype(float, copy=False)
+                valid = np.isfinite(row)
+                if not np.any(valid):
+                    continue
+                t_valid = sess.time[valid]
+                s = np.abs(row[valid])
+                s_max = float(np.max(s)) if s.size else 0.0
+                if not np.isfinite(s_max) or s_max <= 0.0:
+                    continue
+                try:
+                    peaks, _ = find_peaks(
+                        s,
+                        height=float(first_bump_peak_height_frac) * s_max,
+                        distance=distance,
+                    )
+                except Exception:  # noqa: BLE001
+                    peaks = np.empty(0, dtype=int)
+                if peaks.size == 0:
+                    continue
+                shifts_out[int(tid)] = -float(t_valid[peaks[0]])
+            return shifts_out
+
+        shifts_A = _first_bump_shifts(proj_A, ids_A)
+        shifts_B = _first_bump_shifts(proj_B, ids_B)
+        if isinstance(proj_A, np.ndarray) and proj_A.size:
+            proj_A = _realign_traces(proj_A, ids_A, sess.dt, shifts_A)
+        if isinstance(proj_B, np.ndarray) and proj_B.size:
+            proj_B = _realign_traces(proj_B, ids_B, sess.dt, shifts_B)
+
+        if restrict_window_per_trial is not None:
+            shifted_window: Dict[int, Tuple[float, float]] = {}
+            for tid, (w0, w1) in restrict_window_per_trial.items():
+                s = shifts_A.get(int(tid))
+                if s is None:
+                    s = shifts_B.get(int(tid))
+                if s is None:
+                    continue
+                shifted_window[int(tid)] = (w0 + s, w1 + s)
+            restrict_window_per_trial = shifted_window
+
+        n_A_total = int(len(ids_A)) if isinstance(ids_A, np.ndarray) else 0
+        n_B_total = int(len(ids_B)) if isinstance(ids_B, np.ndarray) else 0
+        n_A_kept = len(shifts_A)
+        n_B_kept = len(shifts_B)
+        if (n_A_total - n_A_kept) + (n_B_total - n_B_kept):
+            print(
+                f"[{sess.session}] first-bump align: dropped "
+                f"A={n_A_total - n_A_kept}/{n_A_total}, "
+                f"B={n_B_total - n_B_kept}/{n_B_total} trial(s) "
+                f"with no detectable bump."
+            )
+        title_suffix += " (aligned to first bump)"
 
     # If per-trial restriction handled smoothing, skip it inside the heatmap.
     hm_smooth = None if restrict_window_per_trial is not None else smooth_gauss
