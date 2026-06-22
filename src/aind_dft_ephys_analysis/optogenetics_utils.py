@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Iterable, List, Union, Optional
 from typing import List, Any, Union, Optional, Dict
 
-from behavior_utils import extract_fitted_data
+from behavior_utils import extract_fitted_data, compute_response_time
 from nwb_utils import NWBUtils
 
 
@@ -207,6 +207,7 @@ def create_opto_data_frame(nwb_data: Any) -> pd.DataFrame:
 
     # --- other parameters ---
     df['ITI_delay_sum'] = nwb_data.trials['goCue_start_time'][:]-nwb_data.trials['start_time'][:]
+    df['response_time'] = compute_response_time(nwb_data)
 
     full_session_name = getattr(nwb_data, 'session_id', None)
 

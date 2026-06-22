@@ -263,6 +263,70 @@ def extract_event_timestamps(
     raise ValueError(f"Unsupported event '{event_name}'")
 
 
+def compute_response_time(
+    nwb_behavior_data: Any,
+    max_latency: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Compute per-trial response time as the latency from go cue to the first lick.
+
+    For each trial i with at least one lick (left or right) at or after
+    ``goCue_start_time[i]`` (and within ``max_latency`` if given), the
+    response time is::
+
+        response_time[i] = first_lick_time[i] - goCue_start_time[i]
+
+    Trials with no qualifying lick (or no response at all) get ``NaN``.
+
+    This is a thin wrapper around :func:`extract_event_timestamps` with
+    ``event_name='after_go_cue_first_lick'``; each returned first-lick
+    timestamp is mapped back to its trial via the most recent
+    ``goCue_start_time``.
+
+    Parameters
+    ----------
+    nwb_behavior_data : Any
+        NWB behavior object exposing ``nwb_behavior_data.trials['goCue_start_time']``
+        and the ``left_lick_time`` / ``right_lick_time`` acquisitions.
+    max_latency : float or None, optional
+        If given, only licks within ``[goCue, goCue + max_latency)`` count.
+        ``None`` (default) means no upper bound.
+
+    Returns
+    -------
+    np.ndarray
+        1D array of shape ``(n_trials,)`` with per-trial response time in
+        seconds (``NaN`` for trials with no qualifying lick).
+    """
+    go_times = np.asarray(
+        nwb_behavior_data.trials["goCue_start_time"][:], dtype=float
+    )
+    n_trials = go_times.size
+
+    lick_window = float(max_latency) if max_latency is not None else float("inf")
+
+    first_licks = np.asarray(
+        extract_event_timestamps(
+            nwb_behavior_data,
+            "after_go_cue_first_lick",
+            lick_time_window=lick_window,
+        ),
+        dtype=float,
+    )
+
+    response_times = np.full(n_trials, np.nan, dtype=float)
+    if first_licks.size:
+        # Each first-lick timestamp belongs to the most recent trial whose
+        # goCue precedes it; side='right' assigns licks at a go-cue boundary
+        # to that trial.
+        trial_idx = np.searchsorted(go_times, first_licks, side="right") - 1
+        valid = (trial_idx >= 0) & (trial_idx < n_trials)
+        response_times[trial_idx[valid]] = (
+            first_licks[valid] - go_times[trial_idx[valid]]
+        )
+
+    return response_times
+
 
 def get_fitted_model_names(
     session_name: str,
