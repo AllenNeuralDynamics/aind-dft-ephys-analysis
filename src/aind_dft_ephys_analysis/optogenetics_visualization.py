@@ -1206,8 +1206,6 @@ def plot_lick_raster_over_window(
     figsize_per_panel: Tuple[float, float] = (3.6, 5.0),
     return_table: bool = False,
     verbose: bool = True,
-    align_lick_timebase: bool = True,
-    lick_time_offset: Optional[Union[float, Dict[str, float]]] = None,
 ):
     """
     Plot lick rasters for opto-anchor trials and their +/-k neighbors.
@@ -1381,30 +1379,6 @@ def plot_lick_raster_over_window(
                 print(f"[lick_raster] Missing trials/licks in NWB for '{sess_id}': {exc}")
                 nwb_cache[sess_id] = None
                 continue
-
-            # Align lick timebase to the go-cue clock if requested.
-            offset_applied = 0.0
-            if lick_time_offset is not None:
-                if isinstance(lick_time_offset, dict):
-                    offset_applied = float(lick_time_offset.get(sess_id, 0.0))
-                else:
-                    offset_applied = float(lick_time_offset)
-            elif align_lick_timebase and go_cue.size and (left_licks.size or right_licks.size):
-                all_licks = np.concatenate([left_licks, right_licks])
-                gc_lo, gc_hi = float(go_cue.min()), float(go_cue.max())
-                lk_lo, lk_hi = float(all_licks.min()), float(all_licks.max())
-                # Only shift if the two ranges do not overlap at all.
-                if lk_hi < gc_lo or lk_lo > gc_hi:
-                    offset_applied = float(np.median(go_cue) - np.median(all_licks))
-                    if verbose:
-                        print(
-                            f"[lick_raster]   {sess_id}: lick/go-cue clocks differ by "
-                            f"{offset_applied:.3f}s; auto-shifting lick timestamps."
-                        )
-            if offset_applied != 0.0:
-                left_licks = left_licks + offset_applied
-                right_licks = right_licks + offset_applied
-
             nwb_cache[sess_id] = (go_cue, left_licks, right_licks)
             sessions_loaded += 1
             if verbose:
