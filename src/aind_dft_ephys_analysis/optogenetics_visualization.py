@@ -4,6 +4,32 @@ import matplotlib.pyplot as plt
 from typing import List, Dict, Any, Tuple, Optional, Union
 
 
+# Metrics treated as continuous (per-trial real values) rather than boolean
+# rates. For these, the aggregator returns (sum, count) so that the existing
+# downstream pooling -- which sums numerators/denominators and divides -- yields
+# a trial-weighted mean.
+_CONTINUOUS_METRICS = {"response_time"}
+
+
+def _aggregate_metric(vals: "pd.Series", metric: str) -> Tuple[float, int]:
+    """Return (numerator, denominator) such that numerator / denominator gives:
+
+    - the fraction of True values for boolean metrics (existing behavior), or
+    - the trial-weighted mean for continuous metrics (e.g. ``response_time``).
+
+    NaN values are excluded from the denominator.
+    """
+    if metric in _CONTINUOUS_METRICS:
+        numeric = pd.to_numeric(vals, errors="coerce").to_numpy(dtype=float)
+        valid = np.isfinite(numeric)
+        n = int(valid.sum())
+        s = float(numeric[valid].sum()) if n > 0 else 0.0
+        return s, n
+    n = int(vals.notna().sum())
+    s = int(vals.fillna(False).astype(bool).sum())
+    return s, n
+
+
 def _drop_excluded(
     df: pd.DataFrame,
     exclude: Optional[Dict[str, Any]],
@@ -55,6 +81,7 @@ def plot_stay_switch_over_window(
     exclude: Optional[Dict[str, Any]] = None,
     share_y: bool = True,
     return_table: bool = False,
+    max_response_time: Optional[float] = None,
     figsize: Tuple[float, float] = (6.0, 4.5),
 ):
     """
@@ -154,7 +181,7 @@ def plot_stay_switch_over_window(
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    valid_metrics = {"stay", "switch", "win_stay", "lose_switch", "response"}
+    valid_metrics = {"stay", "switch", "win_stay", "lose_switch", "response", "response_time"}
     vis_types = list(vis_types)
     bad = sorted(set(vis_types) - valid_metrics)
     if bad:
@@ -237,7 +264,12 @@ def plot_stay_switch_over_window(
     df["_trial_idx"] = df.groupby(session_col).cumcount()
 
     for m in vis_types:
-        df[m] = _as_bool_series(df[m])
+        if m in _CONTINUOUS_METRICS:
+            df[m] = pd.to_numeric(df[m], errors="coerce")
+            if m == "response_time" and max_response_time is not None:
+                df.loc[df[m] > float(max_response_time), m] = np.nan
+        else:
+            df[m] = _as_bool_series(df[m])
 
     # ---------- offsets ----------
     if isinstance(window, int):
@@ -278,8 +310,7 @@ def plot_stay_switch_over_window(
 
             for metric in vis_types:
                 vals = cand_df[metric]
-                n_used = int(vals.notna().sum())
-                n_success = int(vals.fillna(False).sum())
+                n_success, n_used = _aggregate_metric(vals, metric)
                 rate = (n_success / n_used) if n_used > 0 else np.nan
                 rows.append({
                     "session": str(sess_id),
@@ -353,10 +384,12 @@ def plot_stay_switch_over_window(
             )
 
         title_map = {"session": "Per-session", "subject": "Subject-pooled", "all": "All-data pooled"}
-        ax.set_title(f"{title_map[line_by]}: {metric.replace('_',' ').title()} rate vs. offset")
+        is_continuous = metric in _CONTINUOUS_METRICS
+        stat_word = "mean" if is_continuous else "rate"
+        ax.set_title(f"{title_map[line_by]}: {metric.replace('_',' ').title()} {stat_word} vs. offset")
         ax.set_xlabel("Offset (trials) relative to opto anchors (0 = opto)")
-        ax.set_ylabel("Rate")
-        if share_y:
+        ax.set_ylabel(f"Mean {metric.replace('_', ' ')}" if is_continuous else "Rate")
+        if share_y and not is_continuous:
             ax.set_ylim(0.0, 1.0)
         ax.set_xticks(xticks)
         ax.grid(True, axis="y", alpha=0.25)
@@ -394,6 +427,7 @@ def plot_rates_vs_latent(
     response_latent_fill: str = "ffill",  # {"ffill","bfill","nearest","none"}
     share_y: bool = True,
     return_table: bool = False,
+    max_response_time: Optional[float] = None,
     figsize: Tuple[float, float] = (6.0, 4.5),
 ):
     """
@@ -508,7 +542,7 @@ def plot_rates_vs_latent(
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    valid_metrics = {"stay", "switch", "win_stay", "lose_switch", "response"}
+    valid_metrics = {"stay", "switch", "win_stay", "lose_switch", "response", "response_time"}
     vis_types = list(vis_types)
     bad = sorted(set(vis_types) - valid_metrics)
     if bad:
@@ -590,9 +624,14 @@ def plot_rates_vs_latent(
     df = df.sort_values(order_cols).reset_index(drop=True)
     df["_trial_idx"] = df.groupby(session_col).cumcount()
 
-    # Cast metric columns to nullable boolean
+    # Cast metric columns to nullable boolean (or numeric for continuous metrics)
     for m in vis_types:
-        df[m] = _as_bool_series(df[m])
+        if m in _CONTINUOUS_METRICS:
+            df[m] = pd.to_numeric(df[m], errors="coerce")
+            if m == "response_time" and max_response_time is not None:
+                df.loc[df[m] > float(max_response_time), m] = np.nan
+        else:
+            df[m] = _as_bool_series(df[m])
 
     # Latent numeric
     df[latent_col] = pd.to_numeric(df[latent_col], errors="coerce")
@@ -710,6 +749,15 @@ def plot_rates_vs_latent(
                         n_trials="size",
                         n_success=lambda s: int(s.sum())
                     )
+                elif metric in _CONTINUOUS_METRICS:
+                    tmp = pd.DataFrame({
+                        "_latent_bin": cand_df["_latent_bin"],
+                        "_val": pd.to_numeric(cand_df[metric], errors="coerce"),
+                    })
+                    grp = tmp.groupby("_latent_bin", observed=True)["_val"].agg(
+                        n_trials=lambda s: int(np.isfinite(s.to_numpy(dtype=float)).sum()),
+                        n_success=lambda s: float(np.nansum(s.to_numpy(dtype=float))),
+                    )
                 else:
                     # Denominator excludes NA (metric undefined)
                     tmp = pd.DataFrame({
@@ -721,15 +769,16 @@ def plot_rates_vs_latent(
                         n_success=lambda s: int(pd.Series(s).fillna(False).astype(bool).sum())
                     )
 
+                is_continuous = metric in _CONTINUOUS_METRICS
                 # Emit rows for all bins (keep structure)
                 for iv, c in zip(canonical_bins, bin_centers):
                     if iv in grp.index:
                         n_used = int(grp.loc[iv, "n_trials"])
-                        n_success = int(grp.loc[iv, "n_success"])
+                        n_success = float(grp.loc[iv, "n_success"]) if is_continuous else int(grp.loc[iv, "n_success"])
                         rate = (n_success / n_used) if n_used > 0 else np.nan
                     else:
                         n_used = 0
-                        n_success = 0
+                        n_success = 0.0 if is_continuous else 0
                         rate = np.nan
                     rows.append({
                         "session": str(sess_id),
@@ -804,10 +853,12 @@ def plot_rates_vs_latent(
                 )
 
         title_map = {"session": "Per-session", "subject": "Subject-pooled", "all": "All-data pooled"}
-        ax.set_title(f"{title_map[line_by]}: {metric.replace('_',' ').title()} rate vs. {latent_col} (binned)")
+        is_continuous = metric in _CONTINUOUS_METRICS
+        stat_word = "mean" if is_continuous else "rate"
+        ax.set_title(f"{title_map[line_by]}: {metric.replace('_',' ').title()} {stat_word} vs. {latent_col} (binned)")
         ax.set_xlabel(f"{latent_col} (bin centers)")
-        ax.set_ylabel("Rate")
-        if share_y:
+        ax.set_ylabel(f"Mean {metric.replace('_', ' ')}" if is_continuous else "Rate")
+        if share_y and not is_continuous:
             ax.set_ylim(0.0, 1.0)
         ax.grid(True, axis="y", alpha=0.25)
 
@@ -836,6 +887,7 @@ def plot_on_off_block_rates(
     exclude: Optional[Dict[str, Any]] = None,
     share_y: bool = True,
     return_table: bool = False,
+    max_response_time: Optional[float] = None,
     figsize: Tuple[float, float] = (5.0, 4.5),
 ):
     """
@@ -910,7 +962,7 @@ def plot_on_off_block_rates(
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    valid_metrics = {"stay", "switch", "win_stay", "lose_switch", "response"}
+    valid_metrics = {"stay", "switch", "win_stay", "lose_switch", "response", "response_time"}
     vis_types = list(vis_types)
     bad = sorted(set(vis_types) - valid_metrics)
     if bad:
@@ -991,7 +1043,12 @@ def plot_on_off_block_rates(
     df[trial_id_col] = df[trial_id_col].astype(int)
 
     for m in vis_types:
-        df[m] = _as_bool_series(df[m])
+        if m in _CONTINUOUS_METRICS:
+            df[m] = pd.to_numeric(df[m], errors="coerce")
+            if m == "response_time" and max_response_time is not None:
+                df.loc[df[m] > float(max_response_time), m] = np.nan
+        else:
+            df[m] = _as_bool_series(df[m])
 
     # ---------- per-session block computation ----------
     rows = []
@@ -1034,8 +1091,7 @@ def plot_on_off_block_rates(
         for block_name, block_df in (("on", on_df), ("off", off_df)):
             for metric in vis_types:
                 vals = block_df[metric]
-                n_used = int(vals.notna().sum())
-                n_success = int(vals.fillna(False).sum())
+                n_success, n_used = _aggregate_metric(vals, metric)
                 rate = (n_success / n_used) if n_used > 0 else np.nan
                 rows.append({
                     "session": str(sess_id),
@@ -1110,9 +1166,11 @@ def plot_on_off_block_rates(
         ax.set_xticklabels([f"opto {b}" for b in block_order])
         ax.set_xlim(-0.5, len(block_order) - 0.5)
         title_map = {"session": "Per-session", "subject": "Subject-pooled", "all": "All-data pooled"}
-        ax.set_title(f"{title_map[line_by]}: {metric.replace('_', ' ').title()} (gap={gap})")
-        ax.set_ylabel("Rate")
-        if share_y:
+        is_continuous = metric in _CONTINUOUS_METRICS
+        suffix = " (mean)" if is_continuous else ""
+        ax.set_title(f"{title_map[line_by]}: {metric.replace('_', ' ').title()}{suffix} (gap={gap})")
+        ax.set_ylabel(f"Mean {metric.replace('_', ' ')}" if is_continuous else "Rate")
+        if share_y and not is_continuous:
             ax.set_ylim(0.0, 1.0)
         ax.grid(True, axis="y", alpha=0.25)
 
