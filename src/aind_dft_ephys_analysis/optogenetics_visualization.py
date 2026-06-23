@@ -1382,10 +1382,34 @@ def plot_lick_raster_over_window(
             nwb_cache[sess_id] = (go_cue, left_licks, right_licks)
             sessions_loaded += 1
             if verbose:
+                # Time-base sanity probe
+                gc_lo = float(np.nanmin(go_cue)) if go_cue.size else np.nan
+                gc_hi = float(np.nanmax(go_cue)) if go_cue.size else np.nan
+                all_licks = np.concatenate([left_licks, right_licks]) if (left_licks.size or right_licks.size) else np.array([])
+                lk_lo = float(np.nanmin(all_licks)) if all_licks.size else np.nan
+                lk_hi = float(np.nanmax(all_licks)) if all_licks.size else np.nan
+                a0 = int(anchors[trial_id_col].astype(int).iloc[0])
+                first_gc = float(go_cue[a0]) if 0 <= a0 < go_cue.size else np.nan
+                if all_licks.size and np.isfinite(first_gc):
+                    diffs = all_licks - first_gc
+                    after = diffs[diffs >= 0.0]
+                    before = diffs[diffs < 0.0]
+                    nearest_after = float(after.min()) if after.size else np.nan
+                    nearest_before = float(before.max()) if before.size else np.nan
+                else:
+                    nearest_after = nearest_before = np.nan
                 print(
                     f"[lick_raster]   {sess_id}: trials={go_cue.size}, "
                     f"left_licks={left_licks.size}, right_licks={right_licks.size}, "
                     f"anchors={len(anchors)}"
+                )
+                print(
+                    f"[lick_raster]     go_cue range=[{gc_lo:.2f}, {gc_hi:.2f}], "
+                    f"lick range=[{lk_lo:.2f}, {lk_hi:.2f}]"
+                )
+                print(
+                    f"[lick_raster]     first anchor trial_num={a0}, go_cue={first_gc:.3f}; "
+                    f"nearest lick: before={nearest_before:.3f}s, after={nearest_after:.3f}s"
                 )
 
         cached = nwb_cache.get(sess_id)
