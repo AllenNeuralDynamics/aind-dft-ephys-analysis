@@ -1205,6 +1205,7 @@ def plot_lick_raster_over_window(
     show_go_cue: bool = True,
     figsize_per_panel: Tuple[float, float] = (3.6, 5.0),
     return_table: bool = False,
+    verbose: bool = True,
 ):
     """
     Plot lick rasters for opto-anchor trials and their +/-k neighbors.
@@ -1339,6 +1340,10 @@ def plot_lick_raster_over_window(
         read_kwargs["folder_path"] = nwb_folder
 
     sessions_in_df = list(df[session_col].dropna().astype(str).unique())
+    if verbose:
+        print(f"[lick_raster] {len(sessions_in_df)} session(s) in dataframe after filters.")
+    sessions_with_anchors = 0
+    sessions_loaded = 0
     for sess_id in sessions_in_df:
         g = df[df[session_col].astype(str) == sess_id]
         if g.empty:
@@ -1348,6 +1353,7 @@ def plot_lick_raster_over_window(
         anchors = _match_criteria(g[g["_is_opto"]], criteria)
         if anchors.empty:
             continue
+        sessions_with_anchors += 1
 
         if sess_id not in nwb_cache:
             buf = _io.StringIO()
@@ -1374,6 +1380,13 @@ def plot_lick_raster_over_window(
                 nwb_cache[sess_id] = None
                 continue
             nwb_cache[sess_id] = (go_cue, left_licks, right_licks)
+            sessions_loaded += 1
+            if verbose:
+                print(
+                    f"[lick_raster]   {sess_id}: trials={go_cue.size}, "
+                    f"left_licks={left_licks.size}, right_licks={right_licks.size}, "
+                    f"anchors={len(anchors)}"
+                )
 
         cached = nwb_cache.get(sess_id)
         if cached is None:
@@ -1416,6 +1429,24 @@ def plot_lick_raster_over_window(
             "No trials matched criteria/window across the available sessions. "
             "Check that NWB files for the relevant sessions are reachable."
         )
+
+    if verbose:
+        total_left = sum(int(r["left_licks"].size) for o in offsets for r in panels[o])
+        total_right = sum(int(r["right_licks"].size) for o in offsets for r in panels[o])
+        print(
+            f"[lick_raster] sessions: {sessions_with_anchors} with anchors, "
+            f"{sessions_loaded} NWB(s) loaded successfully. "
+            f"Licks falling in peri_window: left={total_left}, right={total_right}."
+        )
+        if total_left + total_right == 0:
+            print(
+                "[lick_raster] WARNING: trials were collected but no lick "
+                "timestamps fell into peri_window. Common causes:\n"
+                "  - wrong NWB picked up by session-name search (pass `nwb_full_paths=` "
+                "or restrict `nwb_folder=`),\n"
+                "  - acquisition['left_lick_time'/'right_lick_time'].timestamps is empty,\n"
+                "  - lick timestamps are in a different time base than goCue_start_time."
+            )
 
     n_panels = len(offsets)
     fig, axes = plt.subplots(
