@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 from typing import List, Dict, Any, Tuple, Optional, Union
 
 
@@ -1187,6 +1188,91 @@ def plot_on_off_block_rates(
     return (figs, summary_df) if return_table else figs
 
 
+def _diagnose_nwb_clocks(
+    nwb: Any,
+    sess_id: str,
+    go_cue: "np.ndarray",
+    left_licks: "np.ndarray",
+    right_licks: "np.ndarray",
+) -> None:
+    """Print enough NWB metadata to diagnose lick / go-cue time-base mismatches.
+
+    Lists every TimeSeries / TimeIntervals object found in ``acquisition``,
+    ``processing``, ``stimulus`` and ``intervals``, with its
+    ``timestamps_reference_time`` (or ``starting_time_reference``) and the
+    min/max timestamps. Anything whose range overlaps ``goCue_start_time`` is
+    flagged as a likely lick source.
+    """
+
+    def _ts_meta(obj: Any) -> Tuple[Optional[float], Optional[float], Optional[Any], int]:
+        try:
+            ts = np.asarray(obj.timestamps[:], dtype=float)
+        except Exception:
+            return None, None, None, 0
+        if ts.size == 0:
+            return None, None, getattr(obj, "timestamps_reference_time", None), 0
+        return float(ts.min()), float(ts.max()), getattr(obj, "timestamps_reference_time", None), int(ts.size)
+
+    print(f"[lick_raster]   {sess_id}: NWB clock probe")
+    sst = getattr(nwb, "session_start_time", None)
+    print(f"[lick_raster]     session_start_time = {sst}")
+    try:
+        tref = getattr(nwb, "timestamps_reference_time", None)
+        print(f"[lick_raster]     timestamps_reference_time = {tref}")
+    except Exception:
+        pass
+
+    print(
+        f"[lick_raster]     trials['goCue_start_time'] "
+        f"range=[{float(go_cue.min()):.2f}, {float(go_cue.max()):.2f}] "
+        f"(n={go_cue.size})"
+    )
+
+    gc_lo, gc_hi = float(go_cue.min()), float(go_cue.max())
+    candidates: List[Tuple[str, str, float, float, int, Any]] = []
+
+    def _scan(group_label: str, mapping: Any) -> None:
+        if mapping is None:
+            return
+        try:
+            keys = list(mapping.keys())
+        except Exception:
+            return
+        for k in keys:
+            try:
+                obj = mapping[k]
+            except Exception:
+                continue
+            t_lo, t_hi, ref, n = _ts_meta(obj)
+            if t_lo is None:
+                continue
+            overlaps = (t_lo <= gc_hi) and (t_hi >= gc_lo)
+            candidates.append((group_label, str(k), t_lo, t_hi, n, ref))
+            flag = " <-- overlaps go-cue clock" if overlaps else ""
+            print(
+                f"[lick_raster]     {group_label}['{k}'] range=[{t_lo:.2f}, {t_hi:.2f}] "
+                f"n={n} ref={ref}{flag}"
+            )
+
+    _scan("acquisition", getattr(nwb, "acquisition", None))
+
+    proc = getattr(nwb, "processing", None)
+    if proc is not None:
+        try:
+            mod_keys = list(proc.keys())
+        except Exception:
+            mod_keys = []
+        for mk in mod_keys:
+            try:
+                mod = proc[mk]
+                children = getattr(mod, "data_interfaces", None) or mod
+                _scan(f"processing['{mk}']", children)
+            except Exception:
+                continue
+
+    _ = candidates  # kept for future programmatic use
+
+
 def plot_lick_raster_over_window(
     combined_dataframe: pd.DataFrame,
     criteria: Optional[Dict[str, Any]] = None,
@@ -1396,6 +1482,12 @@ def plot_lick_raster_over_window(
                 nwb_cache[sess_id] = None
                 continue
             nwb_cache[sess_id] = (go_cue, left_licks, right_licks)
+
+            if verbose:
+                try:
+                    _diagnose_nwb_clocks(nwb, sess_id, go_cue, left_licks, right_licks)
+                except Exception as exc:
+                    print(f"[lick_raster]   {sess_id}: clock-diagnostic failed: {exc}")
             sessions_loaded += 1
             if verbose:
                 # Time-base sanity probe
@@ -1553,6 +1645,7 @@ def plot_lick_raster_over_window(
         ax.set_xlabel("Time from go cue (s)")
         if ax is axes[0]:
             ax.set_ylabel("Trial (rows)")
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
         ax.grid(True, axis="x", alpha=0.2)
 
     from matplotlib.lines import Line2D
