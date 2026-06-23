@@ -1186,3 +1186,319 @@ def plot_on_off_block_rates(
 
     return (figs, summary_df) if return_table else figs
 
+
+def plot_lick_raster_over_window(
+    combined_dataframe: pd.DataFrame,
+    criteria: Optional[Dict[str, Any]] = None,
+    window: Union[int, Tuple[int, int]] = (-2, 2),
+    peri_window: Tuple[float, float] = (-1.0, 3.0),
+    session_col: str = "session",
+    subject_col: str = "subject_id",
+    laser_col: str = "laser_on_trial",
+    trial_id_col: str = "trial_num",
+    subject: Optional[str] = None,
+    session: Optional[str] = None,
+    exclude: Optional[Dict[str, Any]] = None,
+    nwb_full_paths: Optional[Dict[str, str]] = None,
+    nwb_folder: Optional[Union[str, List[str]]] = None,
+    sort_by: str = "trial",  # {"trial", "response_time", "session"}
+    show_go_cue: bool = True,
+    figsize_per_panel: Tuple[float, float] = (3.6, 5.0),
+    return_table: bool = False,
+):
+    """
+    Plot lick rasters for opto-anchor trials and their +/-k neighbors.
+
+    For each integer offset in ``window`` a separate panel is drawn:
+
+      - offset = 0   -> the selected **opto** trials themselves (anchors that
+        match ``criteria``)
+      - offset = +/-k -> **non-opto** trials at k trials before/after each
+        anchor within the same session
+
+    Within each panel one row is drawn per qualifying trial. Left licks are
+    rendered in blue, right licks in red. The x-axis is time relative to the
+    trial's own ``goCue_start_time``.
+
+    Lick timestamps are pulled directly from each session's behavior NWB
+    (``acquisition['left_lick_time']`` / ``acquisition['right_lick_time']``).
+    NWBs are loaded lazily and cached per session, so repeated offsets do not
+    re-read the file.
+
+    Parameters
+    ----------
+    combined_dataframe : pandas.DataFrame
+        Trial-level DataFrame produced by ``create_opto_data_frame_combined``.
+    criteria : dict, optional
+        Anchor selection (same semantics as ``plot_stay_switch_over_window``).
+    window : int or (int, int), default (-2, 2)
+        Offsets relative to opto anchors (inclusive).
+    peri_window : (float, float), default (-1.0, 3.0)
+        Time window around each trial's go cue, in seconds.
+    nwb_full_paths : dict, optional
+        Mapping ``session_name -> full NWB file path``.
+    nwb_folder : str or list of str, optional
+        Forwarded to ``NWBUtils.read_behavior_nwb(folder_path=...)``.
+    sort_by : {"trial", "response_time", "session"}, default "trial"
+        Row ordering within each panel.
+    show_go_cue : bool, default True
+        Draw a vertical line at t=0 in every panel.
+    return_table : bool, default False
+        If True, also return a long-form DataFrame describing every plotted row.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    table : pandas.DataFrame, optional
+        Returned when ``return_table=True``.
+    """
+    import contextlib
+    import io as _io
+    from nwb_utils import NWBUtils
+
+    if combined_dataframe is None or combined_dataframe.empty:
+        raise ValueError("combined_dataframe is empty.")
+
+    required = {session_col, subject_col, laser_col, trial_id_col}
+    missing = required - set(combined_dataframe.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    if sort_by not in {"trial", "response_time", "session"}:
+        raise ValueError("sort_by must be 'trial', 'response_time', or 'session'.")
+
+    pre, post = float(peri_window[0]), float(peri_window[1])
+    if pre >= post:
+        raise ValueError("peri_window must be (lo, hi) with lo < hi.")
+
+    df = combined_dataframe.copy()
+    if subject is not None:
+        df = df[df[subject_col].astype(str) == str(subject)]
+    if session is not None:
+        df = df[df[session_col].astype(str) == str(session)]
+    df = _drop_excluded(df, exclude)
+    if df.empty:
+        raise ValueError("No data left after applying subject/session/exclude filters.")
+
+    def _to_opto_bool(s: pd.Series) -> pd.Series:
+        if pd.api.types.is_bool_dtype(s):
+            return s.fillna(False)
+        truthy = {"1", "true", "yes", "on", "y", "t", 1}
+        falsy = {"0", "false", "no", "off", "n", "f", "", 0}
+        def parse(x):
+            if x is None or (isinstance(x, float) and pd.isna(x)) or pd.isna(x):
+                return False
+            if isinstance(x, (bool, np.bool_)):
+                return bool(x)
+            if isinstance(x, (int, np.integer)):
+                return x != 0
+            if isinstance(x, (float, np.floating)):
+                return int(x) != 0
+            if isinstance(x, str):
+                xs = x.strip().lower()
+                if xs in truthy:
+                    return True
+                if xs in falsy:
+                    return False
+            return False
+        return s.map(parse)
+
+    df["_is_opto"] = _to_opto_bool(df[laser_col])
+    df[trial_id_col] = pd.to_numeric(df[trial_id_col], errors="coerce")
+    df = df.dropna(subset=[trial_id_col]).copy()
+    df[trial_id_col] = df[trial_id_col].astype(int)
+
+    if isinstance(window, int):
+        lo, hi = -abs(window), abs(window)
+    else:
+        lo, hi = window
+        if lo > hi:
+            lo, hi = hi, lo
+    offsets = list(range(int(lo), int(hi) + 1))
+
+    def _match_criteria(x: pd.DataFrame, crit: Optional[Dict[str, Any]]) -> pd.DataFrame:
+        if not crit:
+            return x
+        mask = pd.Series(True, index=x.index)
+        for k, v in crit.items():
+            if k not in x.columns:
+                continue
+            if v is None:
+                mask &= x[k].isna()
+            elif isinstance(v, (list, tuple, set)):
+                mask &= x[k].isin(list(v))
+            else:
+                mask &= (x[k] == v)
+        return x[mask]
+
+    panels: Dict[int, List[Dict[str, Any]]] = {off: [] for off in offsets}
+    nwb_cache: Dict[str, Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
+
+    read_kwargs: Dict[str, Any] = {}
+    if nwb_folder is not None:
+        read_kwargs["folder_path"] = nwb_folder
+
+    sessions_in_df = list(df[session_col].dropna().astype(str).unique())
+    for sess_id in sessions_in_df:
+        g = df[df[session_col].astype(str) == sess_id]
+        if g.empty:
+            continue
+        subj_id = str(g[subject_col].iloc[0])
+
+        anchors = _match_criteria(g[g["_is_opto"]], criteria)
+        if anchors.empty:
+            continue
+
+        if sess_id not in nwb_cache:
+            buf = _io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    if nwb_full_paths and sess_id in nwb_full_paths:
+                        nwb = NWBUtils.read_behavior_nwb(nwb_full_path=nwb_full_paths[sess_id])
+                    else:
+                        nwb = NWBUtils.read_behavior_nwb(session_name=sess_id, **read_kwargs)
+            except Exception as exc:
+                print(f"[lick_raster] Failed to load NWB for session '{sess_id}': {exc}")
+                nwb_cache[sess_id] = None
+                continue
+            if nwb is None:
+                print(f"[lick_raster] Could not read NWB for session '{sess_id}'.")
+                nwb_cache[sess_id] = None
+                continue
+            try:
+                go_cue = np.asarray(nwb.trials["goCue_start_time"][:], dtype=float)
+                left_licks = np.asarray(nwb.acquisition["left_lick_time"].timestamps[:], dtype=float)
+                right_licks = np.asarray(nwb.acquisition["right_lick_time"].timestamps[:], dtype=float)
+            except Exception as exc:
+                print(f"[lick_raster] Missing trials/licks in NWB for '{sess_id}': {exc}")
+                nwb_cache[sess_id] = None
+                continue
+            nwb_cache[sess_id] = (go_cue, left_licks, right_licks)
+
+        cached = nwb_cache.get(sess_id)
+        if cached is None:
+            continue
+        go_cue, left_licks, right_licks = cached
+        n_trials_sess = int(go_cue.size)
+
+        opto_idx_set = set(int(t) for t in g.loc[g["_is_opto"], trial_id_col].values)
+        anchor_idx = anchors[trial_id_col].astype(int).values
+
+        for off in offsets:
+            for a in anchor_idx:
+                tgt = int(a) + int(off)
+                if tgt < 0 or tgt >= n_trials_sess:
+                    continue
+                if off != 0 and tgt in opto_idx_set:
+                    continue
+                gc = float(go_cue[tgt])
+                lo_t, hi_t = gc + pre, gc + post
+                lm = (left_licks >= lo_t) & (left_licks < hi_t)
+                rm = (right_licks >= lo_t) & (right_licks < hi_t)
+                lts = left_licks[lm] - gc
+                rts = right_licks[rm] - gc
+                post_cue = np.concatenate([lts[lts >= 0.0], rts[rts >= 0.0]])
+                rt = float(post_cue.min()) if post_cue.size else np.nan
+                panels[off].append({
+                    "session": sess_id,
+                    "subject_id": subj_id,
+                    "trial_idx": int(tgt),
+                    "anchor_idx": int(a),
+                    "offset": int(off),
+                    "go_cue_time": gc,
+                    "response_time": rt,
+                    "left_licks": lts,
+                    "right_licks": rts,
+                })
+
+    if not any(panels[o] for o in offsets):
+        raise ValueError(
+            "No trials matched criteria/window across the available sessions. "
+            "Check that NWB files for the relevant sessions are reachable."
+        )
+
+    n_panels = len(offsets)
+    fig, axes = plt.subplots(
+        1,
+        n_panels,
+        sharex=True,
+        sharey=False,
+        figsize=(figsize_per_panel[0] * n_panels, figsize_per_panel[1]),
+    )
+    if n_panels == 1:
+        axes = [axes]
+
+    table_rows: List[Dict[str, Any]] = []
+    for ax, off in zip(axes, offsets):
+        rows = panels[off]
+        if sort_by == "response_time":
+            rows = sorted(
+                rows,
+                key=lambda r: (np.isnan(r["response_time"]), r["response_time"]),
+            )
+        elif sort_by == "session":
+            rows = sorted(rows, key=lambda r: (r["session"], r["anchor_idx"]))
+
+        xs_left, ys_left, xs_right, ys_right = [], [], [], []
+        for i, r in enumerate(rows):
+            if r["left_licks"].size:
+                xs_left.append(r["left_licks"])
+                ys_left.append(np.full(r["left_licks"].shape, i, dtype=float))
+            if r["right_licks"].size:
+                xs_right.append(r["right_licks"])
+                ys_right.append(np.full(r["right_licks"].shape, i, dtype=float))
+            if return_table:
+                table_rows.append({
+                    "session": r["session"],
+                    "subject_id": r["subject_id"],
+                    "offset": r["offset"],
+                    "trial_idx": r["trial_idx"],
+                    "anchor_idx": r["anchor_idx"],
+                    "go_cue_time": r["go_cue_time"],
+                    "response_time": r["response_time"],
+                    "n_left": int(r["left_licks"].size),
+                    "n_right": int(r["right_licks"].size),
+                    "row": i,
+                })
+
+        if xs_left:
+            x_l = np.concatenate(xs_left)
+            y_l = np.concatenate(ys_left)
+            ax.vlines(x_l, y_l - 0.4, y_l + 0.4, colors="steelblue", linewidths=0.8)
+        if xs_right:
+            x_r = np.concatenate(xs_right)
+            y_r = np.concatenate(ys_right)
+            ax.vlines(x_r, y_r - 0.4, y_r + 0.4, colors="firebrick", linewidths=0.8)
+
+        if show_go_cue:
+            ax.axvline(0.0, color="k", lw=0.8, alpha=0.6)
+
+        ax.set_xlim(pre, post)
+        n_rows = max(1, len(rows))
+        ax.set_ylim(-0.5, n_rows - 0.5)
+        ax.invert_yaxis()
+        title_suffix = "opto" if off == 0 else f"{off:+d}"
+        ax.set_title(f"offset {title_suffix}  (n={len(rows)})")
+        ax.set_xlabel("Time from go cue (s)")
+        if ax is axes[0]:
+            ax.set_ylabel("Trial (rows)")
+        ax.grid(True, axis="x", alpha=0.2)
+
+    from matplotlib.lines import Line2D
+    legend_handles = [
+        Line2D([0], [0], color="steelblue", lw=2, label="left lick"),
+        Line2D([0], [0], color="firebrick", lw=2, label="right lick"),
+    ]
+    axes[-1].legend(
+        handles=legend_handles,
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left",
+        frameon=False,
+    )
+    fig.tight_layout()
+
+    if return_table:
+        table = pd.DataFrame(table_rows)
+        return fig, table
+    return fig
+
