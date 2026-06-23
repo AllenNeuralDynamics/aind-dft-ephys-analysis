@@ -1341,7 +1341,10 @@ def plot_lick_raster_over_window(
 
     sessions_in_df = list(df[session_col].dropna().astype(str).unique())
     if verbose:
-        print(f"[lick_raster] {len(sessions_in_df)} session(s) in dataframe after filters.")
+        print(
+            f"[lick_raster] {len(df)} row(s), {len(sessions_in_df)} session(s), "
+            f"{int(df['_is_opto'].sum())} opto trial(s) in dataframe after filters."
+        )
     sessions_with_anchors = 0
     sessions_loaded = 0
     for sess_id in sessions_in_df:
