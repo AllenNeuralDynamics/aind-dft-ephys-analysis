@@ -1371,9 +1371,22 @@ def plot_lick_raster_over_window(
                 nwb_cache[sess_id] = None
                 continue
             if nwb is None:
-                print(f"[lick_raster] Could not read NWB for session '{sess_id}'.")
+                # Surface the loader's own diagnostic (multiple matches, no
+                # match, etc.) so the user can tell why nothing was loaded.
+                if verbose and buf.getvalue().strip():
+                    for line in buf.getvalue().splitlines():
+                        print(f"[lick_raster]   {sess_id}: {line}")
+                else:
+                    print(f"[lick_raster] Could not read NWB for session '{sess_id}'.")
                 nwb_cache[sess_id] = None
                 continue
+            if verbose:
+                # Print which file was actually loaded so wrong-NWB mismatches
+                # are immediately visible.
+                for line in buf.getvalue().splitlines():
+                    if "Found behavior NWB" in line or "Successfully read behavior NWB" in line:
+                        print(f"[lick_raster]   {sess_id}: {line.strip()}")
+                        break
             try:
                 go_cue = np.asarray(nwb.trials["goCue_start_time"][:], dtype=float)
                 left_licks = np.asarray(nwb.acquisition["left_lick_time"].timestamps[:], dtype=float)
