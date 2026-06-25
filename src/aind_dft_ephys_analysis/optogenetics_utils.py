@@ -36,8 +36,9 @@ DEFAULT_VALUE_MAPPINGS: Dict[str, Dict[str, str]] = {
         # mPFC
         "mPFC inactivation": "left mPFC inactivation",
         # VP glutamatergic neurons
-        "Left VP Glutamatergicneuron terminals": "left VP Glutamatergic neuron",
-        "Left VP Glutamatergic neuron": "left VP Glutamatergic neuron"
+        "Left VP Glutamatergicneuron terminals": "left VP Glutamatergic neuron stimulation",
+        "Left VP Glutamatergic neuron": "left VP Glutamatergic neuron stimulation",
+        "left VP glutamatergic neurons": "left VP Glutamatergic neuron stimulation",
         
     },
     "laser_2_target_areas": {
@@ -60,7 +61,8 @@ DEFAULT_VALUE_MAPPINGS: Dict[str, Dict[str, str]] = {
         "mPFC inactivation": "right mPFC inactivation",
         # VP glutamatergic neurons
         "Right VP Glutamatergicneuron terminals": "right VP Glutamatergic neuron",
-        "Right VP Glutamatergic neuron": "right VP Glutamatergic neuron"
+        "Right VP Glutamatergic neuron": "right VP Glutamatergic neuron stimulation",
+        "right VP glutamatergic neurons": "right VP Glutamatergic neuron stimulation"
     },
 }
 

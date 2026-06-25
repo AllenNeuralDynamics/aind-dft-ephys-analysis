@@ -68,7 +68,7 @@ def _drop_excluded(
 
 def plot_stay_switch_over_window(
     combined_dataframe: pd.DataFrame,
-    vis_types: List[str] = ("stay", "switch", "win_stay", "lose_switch", "response"),
+    vis_types: List[str] = ("stay", "switch", "win_stay", "lose_switch", "response","response_time"),
     window: Union[int, Tuple[int, int]] = (-2, 2),
     criteria: Optional[Dict[str, Any]] = None,
     session_col: str = "session",
@@ -875,7 +875,7 @@ def plot_rates_vs_latent(
 
 def plot_on_off_block_rates(
     combined_dataframe: pd.DataFrame,
-    vis_types: List[str] = ("stay", "switch", "win_stay", "lose_switch", "response"),
+    vis_types: List[str] = ("stay", "switch", "win_stay", "lose_switch", "response","response_time"),
     gap: int = 100,
     criteria: Optional[Dict[str, Any]] = None,
     session_col: str = "session",
