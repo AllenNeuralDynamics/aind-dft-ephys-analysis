@@ -889,6 +889,7 @@ def plot_on_off_block_rates(
     share_y: bool = True,
     return_table: bool = False,
     max_response_time: Optional[float] = None,
+    exclude_opto_trials: bool = False,
     figsize: Tuple[float, float] = (5.0, 4.5),
 ):
     """
@@ -942,6 +943,11 @@ def plot_on_off_block_rates(
         Fix y-axis to [0, 1] for all metric figures.
     return_table : bool, default False
         Also return the per-session per-metric counts table.
+    exclude_opto_trials : bool, default False
+        When True, drop rows where ``laser_col`` is truthy before aggregating
+        rates in **both** on- and off-blocks. Blocks are still defined by opto
+        anchors, but their rates then reflect only the non-opto trials falling
+        inside vs. outside the on-intervals (i.e., neighbor-only comparison).
     figsize : (float, float)
         Figure size for each metric.
 
@@ -1088,6 +1094,10 @@ def plot_on_off_block_rates(
 
         on_df = g.iloc[in_on]
         off_df = g.iloc[~in_on]
+
+        if exclude_opto_trials:
+            on_df = on_df[~on_df["_is_opto"]]
+            off_df = off_df[~off_df["_is_opto"]]
 
         for block_name, block_df in (("on", on_df), ("off", off_df)):
             for metric in vis_types:
