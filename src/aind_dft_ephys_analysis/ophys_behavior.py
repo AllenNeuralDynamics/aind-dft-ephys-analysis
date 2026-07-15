@@ -19,7 +19,7 @@ from scipy.ndimage import gaussian_filter1d
 from aind_spurious_correlation import methods
 from scipy.stats import pearsonr
 from matplotlib.lines import Line2D
-from model_fitting_deprecated import ModelFitting
+from model_fitting import ModelFitting
 from typing import Optional, Tuple
 
 
