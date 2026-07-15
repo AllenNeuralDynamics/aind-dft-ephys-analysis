@@ -5,7 +5,11 @@ import itertools
 import numpy as np
 from hdmf_zarr import NWBZarrIO
 from pynwb import NWBHDF5IO
-from behavior_utils import get_fitted_model_names,get_fitted_latent
+from behavior_utils import (
+    get_fitted_model_names as _get_fitted_model_names,
+    get_fitted_latent as _get_fitted_latent,
+    extract_fitted_data as _extract_fitted_data,
+)
 from aind_dynamic_foraging_basic_analysis.plot import plot_foraging_session
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -19,11 +23,12 @@ from scipy.ndimage import gaussian_filter1d
 from aind_spurious_correlation import methods
 from scipy.stats import pearsonr
 from matplotlib.lines import Line2D
-from model_fitting import ModelFitting
+from model_fitting import fit_q_learning_model as _fit_q_learning_model
+from nwb_utils import NWBUtils
 from typing import Optional, Tuple
 
 
-class OphysBehavior(ModelFitting):
+class OphysBehavior:
     def __init__(self, session_name, folder_path='/root/capsule/data/'):
         """
         Initializes the OphysBehavior instance for reading ephys and behavior NWB data.
@@ -36,12 +41,80 @@ class OphysBehavior(ModelFitting):
         self.folder_path = folder_path
         self.nwb_ophys_data = None
         self.fitted_latent = {}
-        self.internal_fitted_model_names = {}  # Dictionary to hold fitted results keyed by model name.
+        self.internal_fitted_model_names = []  # List of available fitted-model aliases for this session.
         self.read_ophys_nwb()
         self.get_fitted_model_names()
         self.get_fitted_latent()
         # copy the nwb_ophys_data to nwb_ophys_data
         self.nwb_behavior_data=self.nwb_ophys_data
+
+    # ------------------------------------------------------------------
+    # NWB / model-fitting helpers
+    #
+    # These used to be inherited from the old ``ModelFitting`` class. That
+    # class has since been refactored into standalone module functions, so
+    # the following thin wrappers keep the previous instance-method API while
+    # delegating to the current ``behavior_utils`` / ``model_fitting`` and
+    # ``nwb_utils`` functions.
+    # ------------------------------------------------------------------
+    def read_ophys_nwb(self):
+        """Read the ophys NWB for this session and cache it on ``self.nwb_ophys_data``."""
+        self.nwb_ophys_data = NWBUtils.read_ophys_nwb(
+            folder_path=self.folder_path,
+            session_name=self.session_name,
+        )
+        if self.nwb_ophys_data is None:
+            print(f"Warning: could not read ophys NWB for session '{self.session_name}'.")
+        return self.nwb_ophys_data
+
+    def get_fitted_model_names(self):
+        """Fetch and cache the list of available fitted-model aliases for this session."""
+        try:
+            self.internal_fitted_model_names = _get_fitted_model_names(self.session_name) or []
+        except Exception as e:
+            print(f"Could not fetch fitted model names for '{self.session_name}': {e}")
+            self.internal_fitted_model_names = []
+        return self.internal_fitted_model_names
+
+    def get_fitted_latent(self):
+        """Fetch and cache the fitted-latent dict for every available model alias."""
+        self.fitted_latent = {}
+        for alias in (self.internal_fitted_model_names or []):
+            try:
+                fit = _get_fitted_latent(self.session_name, alias)
+                if fit is not None:
+                    self.fitted_latent[alias] = fit
+            except Exception as e:
+                print(f"Could not fetch fitted latent for model '{alias}': {e}")
+        return self.fitted_latent
+
+    def fit_q_learning_model(self, model_name: str = 'q_learning_Y1'):
+        """Locally fit the asymmetric Q-learning model and cache its latents."""
+        if self.nwb_behavior_data is None:
+            print("Cannot fit Q-learning model: NWB behavior data is not loaded.")
+            return None
+        result = _fit_q_learning_model(self.nwb_behavior_data, model_name=model_name)
+        if result is not None:
+            self.fitted_latent[model_name] = result
+        return result
+
+    def extract_fitted_data(self, model_name: Optional[str] = None,
+                            latent_name: Optional[str] = None) -> Optional[np.ndarray]:
+        """
+        Extract a derived latent time series for the given model/latent name.
+
+        Uses a locally cached fit (e.g. from ``fit_q_learning_model``) when
+        available, otherwise fetches the remote fit via ``session_name``.
+        """
+        cached = self.fitted_latent.get(model_name) if isinstance(self.fitted_latent, dict) else None
+        return _extract_fitted_data(
+            self.nwb_behavior_data,
+            fitted_latent=cached,
+            session_name=self.session_name,
+            model_alias=model_name,
+            latent_name=latent_name,
+        )
+
 
     def align_to_event(self,
                     data_name: str = None,
