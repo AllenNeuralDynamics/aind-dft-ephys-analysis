@@ -1751,7 +1751,8 @@ class OphysBehavior:
                                            behavior_model: str or list = 'QLearning_L2F1_softmax', 
                                            latent_name: str or list = 'q_value_difference', 
                                            data_name: str or list = 'G_1_preprocessed-bright',
-                                           session_name_list: Optional[list] = None):
+                                           session_name_list: Optional[list] = None,
+                                           latent_normalization: Optional[str] = None):
         """
         Extracts and combines aligned photometry data and latent variables across one or more sessions,
         while excluding no-response trials.
@@ -1767,6 +1768,11 @@ class OphysBehavior:
         The aligned matrices from all sessions are concatenated (keyed by data_name),
         and the latent data for each (behavior_model, latent_name) pair are concatenated into a nested dictionary.
 
+        Because latent variables (e.g. value, RPE, deltaQ) can have different scales/offsets
+        across sessions, ``latent_normalization`` can be used to bring each session's latent
+        onto a common scale *before* concatenation, so pooled quantiles are comparable across
+        sessions.
+
         Parameters:
         - time_window (list): Time window (in seconds) relative to the event for alignment.
         - bin_size (float): Bin size (in seconds) for binning the photometry signal.
@@ -1775,6 +1781,13 @@ class OphysBehavior:
         - data_name (str or list): Photometry data key(s) to use for alignment.
         - session_name_list (Optional[list]): List of session names to process. If None or empty,
                                                 the current session is used.
+        - latent_normalization (Optional[str]): Per-session normalization applied to each latent
+            array before sessions are concatenated. One of:
+              * None      : no normalization (raw values, default).
+              * 'zscore'  : (x - mean) / std within the session.
+              * 'minmax'  : (x - min) / (max - min), mapped to [0, 1] within the session.
+              * 'rank'    : average-rank percentile mapped to [0, 1] within the session
+                            (robust to per-session scale/offset differences).
 
         Returns:
         dict: {
@@ -1783,6 +1796,12 @@ class OphysBehavior:
             "params": { ... }
         }
         """
+        valid_norms = (None, 'zscore', 'minmax', 'rank')
+        if latent_normalization not in valid_norms:
+            raise ValueError(
+                f"Invalid latent_normalization={latent_normalization!r}. "
+                f"Expected one of {valid_norms}."
+            )
 
         # Convert parameters to lists if needed.
         if not isinstance(data_name, list):
@@ -1813,11 +1832,53 @@ class OphysBehavior:
             valid_mask = choice_history != 2  # Exclude trials with no response.
             return aligned_matrix[valid_mask, :]
 
+        # Helper function to normalize a single session's latent array.
+        def normalize_latent(latent_data):
+            if latent_normalization is None:
+                return latent_data
+            latent_data = latent_data.astype(float)
+            finite = np.isfinite(latent_data)
+            if not np.any(finite):
+                return latent_data
+            if latent_normalization == 'zscore':
+                mu = np.nanmean(latent_data)
+                sd = np.nanstd(latent_data)
+                if sd == 0:
+                    return latent_data - mu
+                return (latent_data - mu) / sd
+            if latent_normalization == 'minmax':
+                lo = np.nanmin(latent_data)
+                hi = np.nanmax(latent_data)
+                if hi == lo:
+                    return np.zeros_like(latent_data)
+                return (latent_data - lo) / (hi - lo)
+            if latent_normalization == 'rank':
+                out = np.full_like(latent_data, np.nan)
+                vals = latent_data[finite]
+                # Average ranks (ties get mean rank), then map to [0, 1].
+                order = np.argsort(vals, kind='mergesort')
+                ranks = np.empty(len(vals), dtype=float)
+                sorted_vals = vals[order]
+                i = 0
+                while i < len(sorted_vals):
+                    j = i
+                    while j + 1 < len(sorted_vals) and sorted_vals[j + 1] == sorted_vals[i]:
+                        j += 1
+                    avg_rank = (i + j) / 2.0
+                    ranks[order[i:j + 1]] = avg_rank
+                    i = j + 1
+                denom = (len(vals) - 1) if len(vals) > 1 else 1
+                out[finite] = ranks / denom
+                return out
+            return latent_data
+
         # Helper function to extract latent data from a session.
         def extract_latent_data_from_session(instance, bm, ln):
             latent_data = np.array(instance.extract_fitted_data(model_name=bm, latent_name=ln))
             # Ensure latent_data is at least 1D.
-            return np.atleast_1d(latent_data)
+            latent_data = np.atleast_1d(latent_data)
+            # Apply per-session normalization before it is concatenated across sessions.
+            return normalize_latent(latent_data)
 
         # Decide how to iterate over sessions.
         if session_name_list is None or len(session_name_list) == 0:
@@ -1871,6 +1932,7 @@ class OphysBehavior:
             "latent_name": latent_names,
             "data_name": data_names,
             "session_name_list": session_name_list,
+            "latent_normalization": latent_normalization,
             "folder_path": self.folder_path
         }
 
