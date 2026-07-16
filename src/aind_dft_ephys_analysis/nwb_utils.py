@@ -205,9 +205,10 @@ class NWBUtils:
         if not session_name:
             print("Warning: session_name is required when nwb_full_path is not provided.")
             return None
-        core = extract_session_name_core(session_name)
 
+        core = extract_session_name_core(session_name)
         bases = _as_paths_list(folder_path)
+
         proc_folders = []
         for base in bases:
             folder_pattern = os.path.join(base, f"*{core}_*processed*")
@@ -216,9 +217,16 @@ class NWBUtils:
         if not proc_folders:
             print(f"Warning: No folder matching '*{core}_*processed*' found under {bases}.")
             return None
+        # If multiple processing runs match the same session core, use the
+        # fully-qualified folder name (when the caller passed one) to pick the
+        # exact run instead of bailing out with a warning.
         if len(proc_folders) > 1:
-            print(f"Warning: Multiple ophys folders found: {proc_folders}.")
-            return None
+            exact = [f for f in proc_folders if os.path.basename(f) == session_name]
+            if len(exact) == 1:
+                proc_folders = exact
+            else:
+                print(f"Warning: Multiple ophys folders found: {proc_folders}.")
+                return None
         proc_folder = proc_folders[0]
 
         file_pattern = os.path.join(proc_folder, 'nwb', '*.nwb')

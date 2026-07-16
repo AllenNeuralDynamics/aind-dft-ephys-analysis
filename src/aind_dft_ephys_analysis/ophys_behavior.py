@@ -1831,6 +1831,11 @@ class OphysBehavior:
                 instance = self
             else:
                 instance = type(self)(sess, folder_path=self.folder_path)
+            # Skip sessions whose ophys NWB could not be loaded (e.g. missing or
+            # ambiguous ophys folders), otherwise downstream extraction fails.
+            if instance.nwb_ophys_data is None:
+                print(f"Skipping session '{getattr(instance, 'session_name', 'current')}': ophys NWB not loaded.")
+                continue
             if behavior_model == 'q_learning_Y1':
                 instance.fit_q_learning_model()
             # Extract and store aligned data for each data_name.
