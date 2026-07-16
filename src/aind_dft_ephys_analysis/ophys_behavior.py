@@ -48,6 +48,34 @@ class OphysBehavior:
         # copy the nwb_ophys_data to nwb_ophys_data
         self.nwb_behavior_data=self.nwb_ophys_data
 
+    @classmethod
+    def empty(cls, folder_path='/root/capsule/data/'):
+        """
+        Create an ``OphysBehavior`` instance without loading any NWB file.
+
+        Useful as a lightweight "container" for multi-session aggregation
+        methods (e.g. ``extract_aligned_matrix_and_latent_data`` with a
+        non-empty ``session_name_list``), which spin up a fresh instance per
+        session internally and only use the parent instance for ``folder_path``
+        and to store the combined results. This avoids the wasted I/O of
+        loading a throwaway session's NWB.
+
+        Parameters:
+        - folder_path (str): Folder path passed to the per-session instances
+          created during aggregation.
+
+        Returns:
+        - OphysBehavior: an instance with ``session_name=None`` and no NWB loaded.
+        """
+        self = cls.__new__(cls)
+        self.session_name = None
+        self.folder_path = folder_path
+        self.nwb_ophys_data = None
+        self.nwb_behavior_data = None
+        self.fitted_latent = {}
+        self.internal_fitted_model_names = []
+        return self
+
     # ------------------------------------------------------------------
     # NWB / model-fitting helpers
     #
