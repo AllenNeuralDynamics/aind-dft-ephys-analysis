@@ -23,14 +23,15 @@ RUN --mount=type=secret,id=git-access-token \
     aind-mri-utils==0.3.0 \
     aind-spurious-correlation==0.0.6 \
     antspyx==0.5.3 \
-    hdmf-zarr==0.11.0 \
+    hdmf==6.1.0 \
+    hdmf-zarr==0.13.0 \
     ipykernel==6.29.5 \
     jupyter==1.1.1 \
     matplotlib==3.10.0 \
     matplotlib-venn==1.1.2 \
     numpy==2.2.2 \
     pandas==2.2.3 \
-    pynwb==2.8.3 \
+    pynwb==4.1.0 \
     scikit-learn==1.6.1 \
     scipy==1.15.1 \
     spikeinterface[full]==0.102.2 \
