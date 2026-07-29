@@ -145,7 +145,7 @@ def multi_unit_pulse_plot(
     width = int(np.ceil(np.sqrt(len(unit_ids))))
     height = int(np.ceil(len(unit_ids) / width))
 
-    fig = plt.figure(figsize=(width * n_types * 2.5, height * 3), constrained_layout=True)
+    fig = plt.figure(figsize=(width * n_types * 4, height * 3.5), constrained_layout=True)
     gs = gridspec.GridSpec(height, width, figure=fig)
 
     for idx, unit in enumerate(unit_ids):
