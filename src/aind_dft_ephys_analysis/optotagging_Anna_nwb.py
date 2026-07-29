@@ -338,6 +338,8 @@ def get_laser_onsets_from_nidaq(
     flip_NIDAQ: bool = False,
     channel_id: str = "PXIe-6341Digital Input Line",
     block_index: int = 0,
+    expected_n: Optional[int] = None,
+    search_all_segments: bool = True,
 ) -> np.ndarray:
     """
     Read laser-onset times from the raw Open Ephys NIDAQ events (channel 2).
@@ -347,6 +349,13 @@ def get_laser_onsets_from_nidaq(
     ``event_id`` ('2' = channel 2), optionally applying a 0.5 s correction when
     the sync signal was flipped.
 
+    Some sessions contain more than one recording under the same experiment
+    (``.../experiment1/recording1``, ``recording2``, ...). These map to
+    SpikeInterface *segments*, and the laser stimulation is not always in the
+    first one. When the requested ``opto_recording`` segment has no matching
+    laser events (or a count that disagrees with ``expected_n``), the other
+    segments are searched and the best-matching one is used instead.
+
     Parameters
     ----------
     recording_clipped_folder : str
@@ -355,9 +364,15 @@ def get_laser_onsets_from_nidaq(
     event_id : str, default '2'
         NIDAQ digital-input line label to keep (channel 2).
     opto_recording : int, default 0
-        Segment index of the recording that contains the laser stimulation.
+        Segment index of the recording to try first.
     flip_NIDAQ : bool, default False
         If True, subtract 0.5 s from every onset (flipped sync correction).
+    expected_n : int, optional
+        Expected number of laser onsets (e.g. the number of rows in the opto
+        CSV). When given, a segment whose event count matches it is preferred.
+    search_all_segments : bool, default True
+        If True, fall back to the other recording segments when the requested
+        one yields no / mismatched laser events.
 
     Returns
     -------
@@ -367,10 +382,53 @@ def get_laser_onsets_from_nidaq(
     import spikeinterface.extractors as se  # lazy import (heavy dependency)
 
     event = se.read_openephys_event(recording_clipped_folder, block_index=block_index)
-    events = event.get_events(channel_id=channel_id, segment_index=opto_recording)
-    laser_pulses = events[events["label"] == event_id]
     adjustment = 0.5 if flip_NIDAQ else 0.0
-    return np.asarray(laser_pulses["time"], dtype=float) - adjustment
+
+    def onsets_for_segment(seg: int) -> np.ndarray:
+        events = event.get_events(channel_id=channel_id, segment_index=seg)
+        laser_pulses = events[events["label"] == event_id]
+        return np.asarray(laser_pulses["time"], dtype=float) - adjustment
+
+    try:
+        onsets = onsets_for_segment(opto_recording)
+    except Exception:
+        onsets = np.array([], dtype=float)
+
+    # Fall back to the other recording segments when the requested one has no
+    # laser events, or fewer than expected (e.g. the stim lives in recording2).
+    need_search = search_all_segments and (
+        onsets.size == 0 or (expected_n is not None and onsets.size != expected_n)
+    )
+    if need_search:
+        try:
+            n_seg = int(event.get_num_segments())
+        except Exception:
+            n_seg = 1
+        best_seg, best_onsets = opto_recording, onsets
+        for seg in range(n_seg):
+            if seg == opto_recording:
+                continue
+            try:
+                cand = onsets_for_segment(seg)
+            except Exception:
+                continue
+            if expected_n is not None:
+                # Prefer an exact match to the opto-CSV row count.
+                if cand.size == expected_n:
+                    best_seg, best_onsets = seg, cand
+                    break
+                if best_onsets.size != expected_n and cand.size > best_onsets.size:
+                    best_seg, best_onsets = seg, cand
+            elif cand.size > best_onsets.size:
+                best_seg, best_onsets = seg, cand
+        if best_seg != opto_recording and best_onsets.size:
+            print(
+                f"[laser onsets] segment {opto_recording} had {onsets.size} matching "
+                f"event(s); using segment {best_seg} with {best_onsets.size} instead."
+            )
+        onsets = best_onsets
+
+    return np.asarray(onsets, dtype=float)
 
 
 def read_opto_trials_csv(
@@ -635,6 +693,7 @@ class OptotaggingAnalysisNWB:
             event_id=laser_event_id,
             opto_recording=opto_recording,
             flip_NIDAQ=flip_NIDAQ,
+            expected_n=len(self.trial_ids),
         )
         if len(self.laser_onset_times) != len(self.trial_ids):
             print(
