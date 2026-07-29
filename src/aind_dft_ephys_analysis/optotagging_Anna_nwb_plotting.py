@@ -140,7 +140,8 @@ def multi_unit_pulse_plot(
 ) -> Optional[str]:
     """
     Per-unit, per-trial-type pulse rasters at each unit's best power, with the
-    laser pulse shaded and the estimated latency marked.
+    laser pulse shaded and the estimated latency marked.  All pulses are stacked
+    vertically (y = pulse number) matching Anna's pulse_plot style.
     """
     unit_ids = list(unit_ids)
     if not unit_ids:
@@ -152,15 +153,17 @@ def multi_unit_pulse_plot(
     height = int(np.ceil(len(unit_ids) / width))
 
     fig = plt.figure(figsize=(width * 2 * n_types, height * 3), constrained_layout=True)
-    gs = gridspec.GridSpec(height, width, figure=fig)
+    gs = gridspec.GridSpec(height, width, hspace=0.9, wspace=0.4, figure=fig)
 
     for idx, unit in enumerate(unit_ids):
         spikes = get_unit_spike_times(analysis.nwb_data, int(unit))
         row = metrics.loc[metrics["unit_id"] == unit]
-        sub = gs[idx // width, idx % width].subgridspec(1, n_types, wspace=0.5)
+        sub = gs[idx // width, idx % width].subgridspec(
+            2, n_types, wspace=0.6, height_ratios=[0.005, 1]
+        )
 
         for it, trial_type in enumerate(trial_types):
-            ax = fig.add_subplot(sub[0, it])
+            ax = fig.add_subplot(sub[1, it])
             best_power = _best_power(row, trial_type, analysis, trial_type_col="type")
             sel = _select_trials(analysis, trial_type, probe)
             if best_power is not None and "power" in sel.columns:
@@ -168,18 +171,42 @@ def multi_unit_pulse_plot(
             if len(sel):
                 onsets = analysis.laser_onset_times[sel.index.to_numpy()]
                 duration = float(np.unique(sel.get("duration", [5.0]))[0]) / 1000.0
+                num_pulses = int(np.unique(sel.get("num_pulses", [5]))[0])
+                pulse_interval = float(np.unique(sel.get("pulse_interval", [duration * 1000]))[0]) / 1000.0
                 trange = [-duration / 2, duration * 1.5]
-                ragged = _ragged_align(spikes, onsets, trange)
-                raster_plot(ragged, trange, ax=ax)
-                ax.axvspan(0, duration, color="skyblue", alpha=0.3)
+                color = "tomato" if "red" in str(trial_type).lower() else "skyblue"
+
+                # Stack all pulses vertically (Anna's pulse_plot style)
+                n_trials = len(onsets)
+                for pulse in range(num_pulses):
+                    pulse_onsets = onsets + pulse * (duration + pulse_interval)
+                    ragged = _ragged_align(spikes, pulse_onsets, trange)
+                    for trial_i, trial_spikes in enumerate(ragged):
+                        y_pos = trial_i + (pulse * n_trials)
+                        if len(trial_spikes) > 0:
+                            ax.plot(trial_spikes, np.full(len(trial_spikes), y_pos + 1),
+                                    "k.", ms=2, markeredgecolor="none")
+                    ax.axhline(n_trials * pulse, color="0.7", lw=0.5, zorder=-100)
+
+                ax.axvspan(0, duration, color=color, alpha=0.3)
                 lat = _metric_value(row, f"{trial_type}_train_best_mean_latency")
                 if lat is not None and np.isfinite(lat):
                     ax.axvline(lat, color="blue", ls="--", lw=1)
+                ax.set_xlim(trange)
+                ax.set_ylim(0, n_trials * num_pulses)
+                ax.set_yticks(np.arange(n_trials / 2, n_trials * num_pulses, n_trials).astype(int))
+                ax.set_yticklabels(range(1, num_pulses + 1))
+
             title = f"{best_power} mW" if best_power is not None else trial_type
             ax.set_title(title, fontsize=8)
-            ax.set_xlabel("Time from laser (s)", fontsize=7)
+            ax.set_xlabel("Time from laser onset (s)", fontsize=7)
             if it == 0:
-                ax.set_ylabel("Trial", fontsize=7)
+                ax.set_ylabel("Pulse", fontsize=7)
+
+        # Title row with cluster ID
+        ax_title = fig.add_subplot(sub[0, :])
+        ax_title.axis("off")
+        ax_title.set_title(f"cluster {unit}", fontweight="heavy")
 
     os.makedirs(save_folder, exist_ok=True)
     out = os.path.join(save_folder, f"{fig_title}.png")
