@@ -84,16 +84,18 @@ def multi_unit_raster_plot(
     width = int(np.ceil(np.sqrt(len(unit_ids))))
     height = int(np.ceil(len(unit_ids) / width))
 
-    fig = plt.figure(figsize=(width * (n_types + 1) * 3, height * 3), constrained_layout=True)
-    gs = gridspec.GridSpec(height, width, figure=fig)
+    fig = plt.figure(figsize=(width * (n_types + 1) * 3, height * 2), constrained_layout=True)
+    gs = gridspec.GridSpec(height, width, hspace=0.9, wspace=0.4, figure=fig)
 
     for idx, unit in enumerate(unit_ids):
         spikes = get_unit_spike_times(analysis.nwb_data, int(unit))
-        sub = gs[idx // width, idx % width].subgridspec(1, n_types + 1, wspace=0.5)
+        sub = gs[idx // width, idx % width].subgridspec(
+            2, n_types + 1, wspace=0.8, hspace=0.6, height_ratios=[0.005, 1]
+        )
 
         for it, trial_type in enumerate(trial_types):
             sel = _select_trials(analysis, trial_type, probe)
-            ax = fig.add_subplot(sub[0, it])
+            ax = fig.add_subplot(sub[1, it])
             if len(sel):
                 onsets = analysis.laser_onset_times[sel.index.to_numpy()]
                 ragged = _ragged_align(spikes, onsets, time_range)
@@ -101,19 +103,23 @@ def multi_unit_raster_plot(
                 # shade laser pulses if parameters available
                 _shade_pulses(ax, sel, trial_type)
             ax.set_title(f"{trial_type}", fontsize=8)
-            ax.set_xlabel("Time from laser (s)", fontsize=7)
+            ax.set_xlabel("Time from laser onset (s)", fontsize=7)
             if it == 0:
                 ax.set_ylabel("Trial", fontsize=7)
 
         # waveform heatmap
-        ax_w = fig.add_subplot(sub[0, n_types])
+        ax_w = fig.add_subplot(sub[1, n_types])
         wm = np.asarray(waveform_mean[int(unit)])  # (timepoints, electrodes)
         im = ax_w.imshow(wm.T, aspect="auto", cmap="PRGn",
                          vmin=-np.nanmax(np.abs(wm)), vmax=np.nanmax(np.abs(wm)))
-        ax_w.set_title(f"unit {unit}", fontsize=8, fontweight="bold")
         ax_w.set_xlabel("Sample", fontsize=7)
         ax_w.set_ylabel("Channel", fontsize=7)
         fig.colorbar(im, ax=ax_w, fraction=0.046)
+
+        # Title row with unit ID
+        ax_title = fig.add_subplot(sub[0, :])
+        ax_title.axis("off")
+        ax_title.set_title(f"cluster {unit}", fontweight="heavy")
 
     os.makedirs(save_folder, exist_ok=True)
     out = os.path.join(save_folder, f"{fig_title}.png")
