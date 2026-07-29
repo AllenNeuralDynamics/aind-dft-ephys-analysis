@@ -653,11 +653,14 @@ class OptotaggingAnalysisNWB:
         return get_stream_names(self.nwb_data)
 
     def _units_on_probe(self, probe: Optional[str]) -> np.ndarray:
+        qc_units = np.asarray(self.qc_units, dtype=int)
         if probe is None:
-            return self.qc_units
+            return qc_units
         probes = self.unit_probes
-        mask = np.array([str(probes[u]) == str(probe) for u in self.qc_units])
-        return self.qc_units[mask]
+        mask = np.array(
+            [str(probes[u]) == str(probe) for u in qc_units], dtype=bool
+        )
+        return qc_units[mask]
 
     # -- pulse timing helper -------------------------------------------------
     @staticmethod

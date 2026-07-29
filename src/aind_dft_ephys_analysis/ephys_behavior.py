@@ -21,7 +21,13 @@ from aind_spurious_correlation import methods
 from ephys_utils import append_units_locations
 
 
-def get_units_passed_default_qc(nwb_data: Any) -> np.ndarray:
+def get_units_passed_default_qc(
+    nwb_data: Any,
+    metric_fallback: bool = True,
+    presence_ratio_min: float = 0.8,
+    isi_violations_max: float = 0.5,
+    amplitude_cutoff_max: float = 0.1,
+) -> np.ndarray:
     """
     Retrieves the indices of units in a combined NWB dataset that have passed
     the automated default QC checks and are not labeled as 'noise'.
@@ -39,11 +45,23 @@ def get_units_passed_default_qc(nwb_data: Any) -> np.ndarray:
     After computing these, the `default_qc` field should be True. Additionally, units
     labeled as 'noise' by `decoder_label` are excluded.
 
+    If the precomputed ``default_qc`` flag passes zero units (e.g. because a
+    metric such as ``amplitude_cutoff`` is missing / all-NaN in this NWB, which
+    forces the flag to ``False`` for every unit) and ``metric_fallback`` is
+    True, QC is reconstructed directly from the raw metric columns. Any
+    criterion whose column is absent or entirely NaN is skipped.
+
     Parameters
     ----------
     nwb_data : NWB file handle
         Combined NWB object containing a `units` table with columns:
         `default_qc` and `decoder_label`.
+    metric_fallback : bool, default True
+        When the ``default_qc`` flag yields zero passing units, rebuild QC from
+        the raw ``presence_ratio`` / ``isi_violations_ratio`` /
+        ``amplitude_cutoff`` columns.
+    presence_ratio_min, isi_violations_max, amplitude_cutoff_max : float
+        Thresholds used only by the metric fallback.
 
     Returns
     -------
@@ -55,8 +73,41 @@ def get_units_passed_default_qc(nwb_data: Any) -> np.ndarray:
     default_qc = np.array(tbl['default_qc'].data)
     labels = np.array(tbl['decoder_label'].data)
 
+    not_noise = labels != 'noise'
+    qc_pass = (default_qc == True) | (default_qc == 'True')
+
+    if qc_pass.sum() == 0 and metric_fallback:
+        n_units = len(labels)
+        cond = np.ones(n_units, dtype=bool)
+        applied = []
+
+        def _metric(col: str) -> Optional[np.ndarray]:
+            if col not in tbl.colnames:
+                return None
+            arr = np.array(tbl[col].data, dtype=float)
+            return None if np.all(np.isnan(arr)) else arr
+
+        pr = _metric('presence_ratio')
+        if pr is not None:
+            cond &= (pr >= presence_ratio_min)
+            applied.append(f'presence_ratio >= {presence_ratio_min}')
+        isi = _metric('isi_violations_ratio')
+        if isi is not None:
+            cond &= (isi <= isi_violations_max)
+            applied.append(f'isi_violations_ratio <= {isi_violations_max}')
+        ac = _metric('amplitude_cutoff')
+        if ac is not None:
+            cond &= np.isnan(ac) | (ac <= amplitude_cutoff_max)
+            applied.append(f'amplitude_cutoff <= {amplitude_cutoff_max}')
+
+        qc_pass = cond
+        print(
+            "default_qc flag passed 0 units; reconstructed QC from raw metrics "
+            f"({', '.join(applied) if applied else 'no usable metric columns'})."
+        )
+
     # Mask for QC-passed, non-noise units
-    mask = ((default_qc == True) | (default_qc == 'True')) & (labels != 'noise')
+    mask = qc_pass & not_noise
 
     # Return indices
     indices = np.nonzero(mask)[0]
