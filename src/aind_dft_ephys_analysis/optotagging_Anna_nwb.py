@@ -751,14 +751,14 @@ class OptotaggingAnalysisNWB:
                 )
 
                 metrics.at[row_i, f"{col}_num_sig_pulses"] = int(np.nansum(responsive))
-                metrics.at[row_i, f"{col}_mean_latency"] = np.nanmean(latencies)
+                metrics.at[row_i, f"{col}_mean_latency"] = _safe_nanmean(latencies)
                 lat_valid = latencies[~np.isnan(latencies)]
                 metrics.at[row_i, f"{col}_latency_range"] = (
                     float(np.nanmax(lat_valid) - np.nanmin(lat_valid)) if lat_valid.size else np.nan
                 )
-                metrics.at[row_i, f"{col}_mean_time_to_first_spike"] = np.nanmean(ttfs)
-                metrics.at[row_i, f"{col}_mean_jitter"] = np.nanmean(jitter)
-                metrics.at[row_i, f"{col}_mean_reliability"] = np.nanmean(reliability)
+                metrics.at[row_i, f"{col}_mean_time_to_first_spike"] = _safe_nanmean(ttfs)
+                metrics.at[row_i, f"{col}_mean_jitter"] = _safe_nanmean(jitter)
+                metrics.at[row_i, f"{col}_mean_reliability"] = _safe_nanmean(reliability)
 
         return metrics
 
@@ -805,6 +805,14 @@ def _q(val: Any) -> str:
     if isinstance(val, str):
         return f"'{val}'"
     return str(val)
+
+
+def _safe_nanmean(arr: Any) -> float:
+    """Mean over non-NaN entries; NaN for empty / all-NaN input (no warning)."""
+    a = np.asarray(arr, dtype=float)
+    if a.size == 0 or np.all(np.isnan(a)):
+        return float("nan")
+    return float(np.nanmean(a))
 
 
 def _column_name(param_values: Sequence[Any], suffixes: Optional[Sequence[Optional[str]]]) -> str:
