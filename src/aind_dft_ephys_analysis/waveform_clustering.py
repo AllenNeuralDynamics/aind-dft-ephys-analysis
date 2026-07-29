@@ -642,3 +642,233 @@ def analyze_units_waveforms(
         "time_ms": time_ms,
         "csv_path": csv_path,
     }
+
+
+# ============================================================
+# Full dataset: every unit of every session (QC-labelled)
+# ============================================================
+#: Column-name prefix for the raw trough-aligned waveform samples stored in the
+#: big dataset CSV (e.g. ``wf_000``, ``wf_001`` ...). Used to round-trip
+#: waveforms through the CSV without a separate file.
+WAVEFORM_COL_PREFIX = "wf_"
+
+#: Metadata columns written before the feature / waveform columns.
+DATASET_META_COLS: List[str] = [
+    "session_name",
+    "unit_index",
+    "region",
+    "qc_pass",
+]
+
+#: Timing-context columns (constant per row) so the trough-aligned time axis can
+#: be rebuilt on reload.
+DATASET_CONTEXT_COLS: List[str] = ["pre_ms", "post_ms", "sampling_rate_hz"]
+
+
+def build_features_dataset(
+    sessions_to_use: Sequence[str],
+    pre_ms: float = DEFAULT_PRE_MS,
+    post_ms: float = DEFAULT_POST_MS,
+    sampling_rate_hz: float = DEFAULT_SAMPLING_RATE_HZ,
+    qc_metric_fallback: bool = True,
+    normalize: bool = True,
+    include_waveform: bool = True,
+    wf_prefix: str = WAVEFORM_COL_PREFIX,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Build one big table over *every* unit of *every* session.
+
+    Unlike :func:`collect_region_waveforms_from_sessions` (which keeps only
+    QC-passing, region-matched units), this keeps **all** units that produce a
+    valid trough-aligned waveform and simply *labels* each row with whether it
+    passed default QC. The result is a single DataFrame you can save once and
+    reload for downstream feature analysis / clustering without re-reading NWBs.
+
+    Each row contains:
+
+    - ``session_name`` : session-core id
+    - ``unit_index``   : within-session unit index
+    - ``region``       : CCF brain region (or ``None``)
+    - ``qc_pass``      : ``True`` if the unit passed default QC, else ``False``
+    - the :data:`FEATURE_COLS` morphology features
+    - ``pre_ms`` / ``post_ms`` / ``sampling_rate_hz`` : timing context
+    - ``wf_000`` ... ``wf_NNN`` : the raw trough-aligned peak waveform samples
+      (only when ``include_waveform`` is True)
+
+    Parameters
+    ----------
+    sessions_to_use : sequence of str
+        Session names to load (e.g. from :func:`find_ephys_sessions`).
+    pre_ms, post_ms, sampling_rate_hz : float
+        Extraction-window and timing parameters.
+    qc_metric_fallback : bool
+        Passed to :func:`get_units_passed_default_qc` so QC can be rebuilt from
+        raw metric columns when the precomputed flag passes zero units.
+    normalize : bool
+        Amplitude-normalize each waveform before computing features (the raw,
+        un-normalized waveform is what gets stored in the ``wf_`` columns).
+    include_waveform : bool
+        Store the per-sample waveform columns in the table.
+    wf_prefix : str
+        Prefix for the waveform sample columns.
+    verbose : bool
+        Print per-session progress.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per valid unit across all sessions.
+    """
+    time_ms, pre_samples, post_samples, win_len = make_time_axis(
+        pre_ms, post_ms, sampling_rate_hz
+    )
+    mps = ms_per_sample(sampling_rate_hz)
+
+    rows: List[Dict[str, Any]] = []
+    waveforms: List[np.ndarray] = []
+
+    for si, session_name in enumerate(sessions_to_use):
+        try:
+            nwb_data = NWBUtils.read_ephys_nwb(session_name=session_name)
+            if nwb_data is None:
+                if verbose:
+                    print(f"[skip] {session_name}: no ephys NWB")
+                continue
+            session_core = extract_session_name_core(session_name)
+            if session_core is None:
+                session_core = Path(str(getattr(nwb_data, "session_id", session_name))).stem
+            nwb_data = append_units_locations(nwb_data, session_name=session_core)
+        except Exception as e:
+            if verbose:
+                print(f"[skip] {session_name}: {e}")
+            continue
+
+        try:
+            qc_units = set(
+                int(u)
+                for u in get_units_passed_default_qc(
+                    nwb_data, metric_fallback=qc_metric_fallback
+                ).tolist()
+            )
+        except Exception as e:
+            if verbose:
+                print(f"[warn] {session_core}: QC unavailable ({e}); marking all False")
+            qc_units = set()
+
+        waveform_mean = nwb_data.units["waveform_mean"][:]
+        try:
+            ccf_locations = nwb_data.units["ccf_location"][:]
+        except Exception:
+            ccf_locations = None
+        n_units = waveform_mean.shape[0]
+
+        n_added = 0
+        for u in range(n_units):
+            trace = extract_peak_window(waveform_mean[u], pre_samples, post_samples)
+            if trace is None or len(trace) != win_len:
+                continue
+            wf_for_features = normalize_waveform(trace) if normalize else trace
+            feats = extract_features(wf_for_features, time_ms, mps)
+            region = (
+                get_region_from_loc(ccf_locations[u])
+                if ccf_locations is not None
+                else None
+            )
+            row: Dict[str, Any] = {
+                "session_name": session_core,
+                "unit_index": u,
+                "region": region,
+                "qc_pass": u in qc_units,
+            }
+            row.update(feats)
+            row["pre_ms"] = pre_ms
+            row["post_ms"] = post_ms
+            row["sampling_rate_hz"] = sampling_rate_hz
+            rows.append(row)
+            waveforms.append(trace)
+            n_added += 1
+
+        if verbose:
+            n_pass = sum(1 for u in range(n_units) if u in qc_units)
+            print(
+                f"[{si + 1}/{len(sessions_to_use)}] {session_core}: "
+                f"+{n_added} units ({n_pass} QC-pass; total {len(rows)})"
+            )
+        _close_nwb(nwb_data)
+
+    base_cols = DATASET_META_COLS + FEATURE_COLS + DATASET_CONTEXT_COLS
+    df = pd.DataFrame(rows, columns=base_cols) if rows else pd.DataFrame(columns=base_cols)
+
+    if include_waveform:
+        wf_cols = [f"{wf_prefix}{i:03d}" for i in range(win_len)]
+        wf_arr = np.vstack(waveforms) if waveforms else np.empty((0, win_len))
+        wf_df = pd.DataFrame(wf_arr, columns=wf_cols, index=df.index)
+        df = pd.concat([df, wf_df], axis=1)
+
+    return df
+
+
+def save_dataset_csv(
+    df: pd.DataFrame,
+    out_dir: Union[str, Path],
+    filename: str = "all_sessions_waveform_features.csv",
+) -> Path:
+    """Write the big per-unit dataset to a single CSV. Returns its path."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / filename
+    df.to_csv(out_path, index=False)
+    return out_path
+
+
+def load_features_dataset(
+    csv_path: Union[str, Path],
+    wf_prefix: str = WAVEFORM_COL_PREFIX,
+) -> Dict[str, Any]:
+    """Reload a dataset saved by :func:`build_features_dataset`.
+
+    Splits the flat CSV back into a feature/metadata table and a waveform
+    matrix, and rebuilds the trough-aligned time axis from the stored timing
+    context columns.
+
+    Returns
+    -------
+    result : dict with keys
+        ``features`` : pd.DataFrame with metadata + :data:`FEATURE_COLS`
+        (waveform columns dropped).
+        ``waveforms`` : np.ndarray (n_units, win_len) of the stored waveforms.
+        ``time_ms`` : np.ndarray trough-aligned time axis.
+        ``pre_ms`` / ``post_ms`` / ``sampling_rate_hz`` : timing context.
+    """
+    df = pd.read_csv(csv_path)
+
+    wf_cols = [c for c in df.columns if c.startswith(wf_prefix)]
+    wf_cols = sorted(wf_cols, key=lambda c: int(c[len(wf_prefix):]))
+    if wf_cols:
+        waveforms = df[wf_cols].to_numpy(dtype=float)
+    else:
+        waveforms = np.empty((len(df), 0))
+
+    features = df.drop(columns=wf_cols) if wf_cols else df.copy()
+
+    def _ctx(col: str, default: float) -> float:
+        if col in df.columns and len(df):
+            try:
+                return float(df[col].iloc[0])
+            except Exception:
+                return default
+        return default
+
+    pre_ms = _ctx("pre_ms", DEFAULT_PRE_MS)
+    post_ms = _ctx("post_ms", DEFAULT_POST_MS)
+    sampling_rate_hz = _ctx("sampling_rate_hz", DEFAULT_SAMPLING_RATE_HZ)
+    time_ms, _, _, _ = make_time_axis(pre_ms, post_ms, sampling_rate_hz)
+
+    return {
+        "features": features,
+        "waveforms": waveforms,
+        "time_ms": time_ms,
+        "pre_ms": pre_ms,
+        "post_ms": post_ms,
+        "sampling_rate_hz": sampling_rate_hz,
+    }
