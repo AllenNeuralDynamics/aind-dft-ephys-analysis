@@ -36,6 +36,101 @@ PREFIX = "opto_tagging_Anna"
 # name -> (data list of length n_units, description string)
 Columns = Dict[str, Tuple[List[Any], str]]
 
+METRICS_CSV_SUFFIX = "_laser_response_metrics.csv"
+
+
+# ---------------------------------------------------------------------------
+# Load pre-generated metric CSVs from a folder
+# ---------------------------------------------------------------------------
+def load_metrics_from_csv(
+    csv_folder: str,
+    session: str,
+    suffix: str = METRICS_CSV_SUFFIX,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Load the per-probe ``*_laser_response_metrics.csv`` files for one session.
+
+    Matches files named ``{session}_{probe}{suffix}`` (the naming written in
+    Step 4) and returns ``{probe: metrics DataFrame}``. The probe label is
+    recovered from the portion of the filename between the session prefix and
+    the suffix.
+    """
+    import glob
+    import os
+
+    all_metrics: Dict[str, pd.DataFrame] = {}
+    pattern = os.path.join(csv_folder, f"{session}_*{suffix}")
+    for path in sorted(glob.glob(pattern)):
+        name = os.path.basename(path)
+        probe = name[len(session) + 1 : -len(suffix)]
+        all_metrics[probe] = pd.read_csv(path)
+    return all_metrics
+
+
+def infer_trial_types(
+    all_metrics: Dict[str, pd.DataFrame],
+    token: str = "_train_max_num_sig_pulses",
+) -> List[str]:
+    """Infer the trial/emission types present from the metric column names."""
+    types = set()
+    for df in all_metrics.values():
+        for col in df.columns:
+            if col.endswith(token):
+                types.add(col[: -len(token)])
+    return sorted(types)
+
+
+def append_opto_tagging_from_csv(
+    nwb_data: Any,
+    csv_folder: str,
+    session: str,
+    trial_types: Optional[Iterable[str]] = None,
+    red_min_sig_pulses: int = 4,
+    blue_min_sig_pulses: int = 5,
+    max_jitter: float = 0.006,
+    max_isi: float = 0.5,
+    prefix: str = PREFIX,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    """
+    End-to-end: read the session's pre-generated metric CSVs from ``csv_folder``
+    and append the opto-tagging results onto ``nwb_data``'s units table.
+
+    This is the standalone workflow: metrics were computed once and saved to CSV
+    (Step 4); later you load the NWB and point this at the CSV folder. Unit rows
+    are matched by the ``unit_id`` column (the NWB unit index), so the same NWB
+    the metrics were computed from must be used.
+
+    Returns a dict with ``all_metrics``, ``trial_types``, ``criteria_by_type``,
+    ``tag_by_probe``, ``columns`` and ``added`` (the column names written).
+    """
+    all_metrics = load_metrics_from_csv(csv_folder, session)
+    if not all_metrics:
+        raise FileNotFoundError(
+            f"No '{session}_*{METRICS_CSV_SUFFIX}' files found in {csv_folder}."
+        )
+    trial_types = list(trial_types) if trial_types is not None else infer_trial_types(all_metrics)
+
+    tag_by_probe, criteria_by_type = assign_opto_tags(
+        all_metrics,
+        trial_types,
+        red_min_sig_pulses=red_min_sig_pulses,
+        blue_min_sig_pulses=blue_min_sig_pulses,
+        max_jitter=max_jitter,
+        max_isi=max_isi,
+    )
+    columns = build_opto_tagging_columns(nwb_data, all_metrics, tag_by_probe, prefix=prefix)
+    added = append_opto_tagging_columns(nwb_data, columns, overwrite=overwrite)
+
+    return {
+        "all_metrics": all_metrics,
+        "trial_types": trial_types,
+        "criteria_by_type": criteria_by_type,
+        "tag_by_probe": tag_by_probe,
+        "columns": columns,
+        "added": added,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Tag assignment (mirrors the selection logic in the notebook / Anna's main.py)
