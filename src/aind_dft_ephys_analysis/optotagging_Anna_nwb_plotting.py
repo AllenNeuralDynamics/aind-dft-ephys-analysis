@@ -26,16 +26,49 @@ def raster_plot(
     ax: Optional[plt.Axes] = None,
     color: str = "k",
     ms: float = 2.5,
+    cond_each_trial: Optional[Sequence] = None,
+    cond_colors: Optional[Sequence[str]] = None,
     **kwargs,
 ) -> plt.Axes:
-    """Simple per-trial raster. ``event_locked_spike_times`` is a ragged list."""
+    """Per-trial raster. If ``cond_each_trial`` is given, trials are grouped by
+    condition value (e.g. power) with separating lines, left-edge condition bars
+    and condition labels on the y-axis (matching Anna's raster_plot)."""
     ax = ax or plt.gca()
-    for trial, spikes in enumerate(event_locked_spike_times):
-        if len(spikes):
-            ax.plot(spikes, np.full(len(spikes), trial + 1), ".",
-                    color=color, ms=ms, **kwargs)
+
+    if cond_each_trial is not None:
+        cond_each_trial = np.asarray(cond_each_trial)
+        conds = np.unique(cond_each_trial)
+        if cond_colors is None:
+            cond_colors = np.tile(["0.5", "0.75"], int(np.ceil(len(conds) / 2)))
+        xspan = time_range[1] - time_range[0]
+        total = 0
+        centers = []
+        for i, cond in enumerate(conds):
+            idxs = np.flatnonzero(cond_each_trial == cond)
+            start = total
+            for j in idxs:
+                total += 1
+                spikes = event_locked_spike_times[j]
+                if len(spikes):
+                    ax.plot(spikes, np.full(len(spikes), total), ".",
+                            color=color, ms=ms, **kwargs)
+            centers.append((start + total) / 2.0)
+            ax.axhline(total, color="0.7", lw=0.5, zorder=-100)
+            xpos = [time_range[0] - 0.03 * xspan, time_range[0]]
+            ax.fill_between(xpos, [start, start], [total, total], ec="none",
+                            fc=cond_colors[i % len(cond_colors)], clip_on=False)
+        ax.set_yticks(centers)
+        ax.set_yticklabels([f"{c}" for c in conds])
+        ax.tick_params("y", length=0, pad=8)
+        ax.set_ylim(0, max(total, 1))
+    else:
+        for trial, spikes in enumerate(event_locked_spike_times):
+            if len(spikes):
+                ax.plot(spikes, np.full(len(spikes), trial + 1), ".",
+                        color=color, ms=ms, **kwargs)
+        ax.set_ylim(0, len(event_locked_spike_times) + 2)
+
     ax.set_xlim(time_range)
-    ax.set_ylim(0, len(event_locked_spike_times) + 2)
     return ax
 
 
@@ -94,27 +127,73 @@ def multi_unit_raster_plot(
         )
 
         for it, trial_type in enumerate(trial_types):
-            sel = _select_trials(analysis, trial_type, probe)
             ax = fig.add_subplot(sub[1, it])
+            sel = _select_trials(analysis, trial_type, probe)
+            # Anna's filter: train pulses on a single external emission site
+            if "param_group" in sel.columns:
+                sel = sel[sel["param_group"] == "train"]
+            if "site" in sel.columns:
+                sel = sel[sel["site"] == 0]
+
             if len(sel):
+                # Pulse-train geometry -> full-train time range (Anna's convention)
+                duration = float(np.unique(sel["duration"])[0]) if "duration" in sel.columns else 5.0
+                num_pulses = int(np.unique(sel["num_pulses"])[0]) if "num_pulses" in sel.columns else 5
+                pulse_interval = float(np.unique(sel["pulse_interval"])[0]) if "pulse_interval" in sel.columns else duration
+                total_duration = (duration * num_pulses) + (pulse_interval * num_pulses)  # ms
+                trange = [-(total_duration / 2) / 1000.0, (1.5 * total_duration) / 1000.0]
+
                 onsets = analysis.laser_onset_times[sel.index.to_numpy()]
-                ragged = _ragged_align(spikes, onsets, time_range)
-                raster_plot(ragged, time_range, ax=ax)
-                # shade laser pulses if parameters available
-                _shade_pulses(ax, sel, trial_type)
-            ax.set_title(f"{trial_type}", fontsize=8)
+                ragged = _ragged_align(spikes, onsets, trange)
+                cond = sel["power"].tolist() if "power" in sel.columns else None
+                raster_plot(ragged, trange, ax=ax, cond_each_trial=cond, ms=2.5,
+                            markeredgecolor="none")
+
+                # Shade every laser pulse across the train
+                laser_color = "tomato" if "red" in str(trial_type).lower() else "skyblue"
+                y0, y1 = ax.get_ylim()
+                for pulse in range(num_pulses):
+                    ax.add_patch(patches.Rectangle(
+                        (pulse * (duration + pulse_interval) / 1000.0, y0),
+                        duration / 1000.0, y1 - y0,
+                        edgecolor=laser_color, facecolor=laser_color,
+                        alpha=0.35, linewidth=0, clip_on=False,
+                    ))
+
+                # Title = wavelength (473 nm / 638 nm), like Anna
+                if "wavelength" in sel.columns:
+                    wl = np.unique(sel["wavelength"])[0]
+                    ax.set_title(f"{wl} nm", fontsize=8)
+                else:
+                    ax.set_title(f"{trial_type}", fontsize=8)
+            else:
+                ax.set_title(f"{trial_type}", fontsize=8)
+
+            ax.tick_params("both", labelsize=8)
             ax.set_xlabel("Time from laser onset (s)", fontsize=7)
             if it == 0:
-                ax.set_ylabel("Trial", fontsize=7)
+                ax.set_ylabel("Power (mW)", fontsize=7)
 
-        # waveform heatmap
+        # waveform heatmap (cropped like Anna) with peak-channel inset
         ax_w = fig.add_subplot(sub[1, n_types])
         wm = np.asarray(waveform_mean[int(unit)])  # (timepoints, electrodes)
-        im = ax_w.imshow(wm.T, aspect="auto", cmap="PRGn",
-                         vmin=-np.nanmax(np.abs(wm)), vmax=np.nanmax(np.abs(wm)))
-        ax_w.set_xlabel("Sample", fontsize=7)
+        t0, t1, c1 = 40, 160, 150
+        wm_slice = wm[t0:t1, :c1] if wm.shape[0] >= t1 else wm[:, :c1]
+        vmax = float(np.nanmax(np.abs(wm_slice))) or 1.0
+        im = ax_w.imshow(wm_slice.T, aspect="auto", cmap="PRGn", vmin=-vmax, vmax=vmax)
+        ax_w.invert_yaxis()
+        ax_w.set_xlabel("Sample number", fontsize=7)
         ax_w.set_ylabel("Channel", fontsize=7)
-        fig.colorbar(im, ax=ax_w, fraction=0.046)
+        cbar = fig.colorbar(im, ax=ax_w, fraction=0.046)
+        cbar.set_label("Voltage (uV)", fontsize=7)
+
+        # inset: peak-channel waveform trace
+        peak_ch = int(np.unravel_index(np.nanargmin(wm), wm.shape)[1])
+        peak_trace = wm[t0:t1, peak_ch] if wm.shape[0] >= t1 else wm[:, peak_ch]
+        ax_in = ax_w.inset_axes([0.62, 0.68, 0.34, 0.28])
+        ax_in.plot(peak_trace, lw=1.5, c="k")
+        ax_in.set_xticks([])
+        ax_in.set_yticks([])
 
         # Title row with unit ID
         ax_title = fig.add_subplot(sub[0, :])
