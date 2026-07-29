@@ -166,6 +166,11 @@ def multi_unit_pulse_plot(
             ax = fig.add_subplot(sub[1, it])
             best_power = _best_power(row, trial_type, analysis, trial_type_col="type")
             sel = _select_trials(analysis, trial_type, probe)
+            # Filter to train param_group only (matching Anna's main.py)
+            if "param_group" in sel.columns:
+                sel = sel[sel["param_group"] == "train"]
+            if "site" in sel.columns:
+                sel = sel[sel["site"] == 0]
             if best_power is not None and "power" in sel.columns:
                 sel = sel[sel["power"] == best_power]
             if len(sel):
