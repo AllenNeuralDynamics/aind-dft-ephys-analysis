@@ -15,6 +15,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 # ============================================================
 import numpy as np
 import pandas as pd
+from scipy.signal import find_peaks
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
@@ -872,3 +873,138 @@ def load_features_dataset(
         "post_ms": post_ms,
         "sampling_rate_hz": sampling_rate_hz,
     }
+
+
+# ============================================================
+# Waveform quality / noise filtering
+# ============================================================
+def waveform_noise_features(
+    trace: np.ndarray,
+    time_ms: np.ndarray,
+    core_ms: float = 0.7,
+    prominence: float = 0.25,
+    min_peak_height: float = 0.25,
+    flat_eps: float = 0.05,
+) -> Dict[str, float]:
+    """Compute simple shape metrics that separate clean spikes from artifacts.
+
+    A clean extracellular spike has a single dominant trough (at t=0), at most a
+    couple of accompanying deflections, and a baseline that returns to ~0. Noisy
+    / oscillatory waveforms instead ring across the whole window (many peaks,
+    many zero-crossings, energy spread far from the trough).
+
+    Parameters
+    ----------
+    trace : np.ndarray
+        A single trough-aligned waveform (raw or normalized; it is
+        amplitude-normalized internally).
+    time_ms : np.ndarray
+        Time axis (ms) matching ``trace`` (0 ms == trough).
+    core_ms : float
+        Half-width (ms) of the central window used for the ``late_energy`` ratio.
+    prominence, min_peak_height : float
+        Peak-detection thresholds on the normalized ``|trace|``.
+    flat_eps : float
+        Samples with ``|amplitude| < flat_eps`` are treated as baseline when
+        counting zero crossings (suppresses tiny wiggles).
+
+    Returns
+    -------
+    dict with keys ``n_peaks``, ``zero_crossings`` and ``late_energy``.
+    """
+    t = np.asarray(trace, dtype=float)
+    m = float(np.max(np.abs(t))) if t.size else 0.0
+    if not np.isfinite(m) or m <= 0:
+        return {"n_peaks": np.inf, "zero_crossings": np.inf, "late_energy": 1.0}
+
+    tn = t / m
+    absn = np.abs(tn)
+
+    # Number of prominent excursions in |trace| (a clean spike has very few).
+    peaks, _ = find_peaks(absn, prominence=prominence, height=min_peak_height)
+    n_peaks = int(len(peaks))
+
+    # Zero crossings after flattening baseline noise (oscillations => many).
+    sig = tn.copy()
+    sig[absn < flat_eps] = 0.0
+    nz = sig[sig != 0.0]
+    zero_crossings = int(np.sum(np.diff(np.sign(nz)) != 0)) if nz.size > 1 else 0
+
+    # Fraction of energy outside the central +/- core_ms window (spikes decay).
+    core = np.abs(time_ms) <= core_ms
+    total = float(np.sum(tn ** 2))
+    late_energy = float(np.sum(tn[~core] ** 2) / total) if total > 0 else 1.0
+
+    return {
+        "n_peaks": n_peaks,
+        "zero_crossings": zero_crossings,
+        "late_energy": late_energy,
+    }
+
+
+def clean_waveform_mask(
+    waveforms: np.ndarray,
+    time_ms: np.ndarray,
+    max_peaks: int = 4,
+    max_zero_crossings: int = 8,
+    max_late_energy: float = 0.6,
+    core_ms: float = 0.7,
+    prominence: float = 0.25,
+    min_peak_height: float = 0.25,
+    return_metrics: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, pd.DataFrame]]:
+    """Boolean mask flagging clean (non-noisy) waveforms.
+
+    A waveform is kept (``True``) only when it passes **all** of:
+
+    - ``n_peaks <= max_peaks``            (few prominent excursions)
+    - ``zero_crossings <= max_zero_crossings``
+    - ``late_energy <= max_late_energy``  (energy concentrated near the trough)
+
+    Loosen the thresholds to keep more units, tighten them to be stricter.
+
+    Parameters
+    ----------
+    waveforms : np.ndarray, shape (n_units, win_len)
+        Trough-aligned waveforms (raw or normalized).
+    time_ms : np.ndarray
+        Window time axis.
+    max_peaks, max_zero_crossings, max_late_energy : see above.
+    core_ms, prominence, min_peak_height : forwarded to
+        :func:`waveform_noise_features`.
+    return_metrics : bool
+        Also return the per-unit metric DataFrame (with an ``is_clean`` column).
+
+    Returns
+    -------
+    mask : np.ndarray of bool  (True == clean)
+    metrics : pd.DataFrame  (only when ``return_metrics`` is True)
+    """
+    if len(waveforms) == 0:
+        mask = np.ones(0, dtype=bool)
+        if return_metrics:
+            return mask, pd.DataFrame(
+                columns=["n_peaks", "zero_crossings", "late_energy", "is_clean"]
+            )
+        return mask
+
+    metrics = pd.DataFrame(
+        [
+            waveform_noise_features(
+                w, time_ms, core_ms=core_ms, prominence=prominence,
+                min_peak_height=min_peak_height,
+            )
+            for w in waveforms
+        ]
+    )
+    mask = (
+        (metrics["n_peaks"] <= max_peaks)
+        & (metrics["zero_crossings"] <= max_zero_crossings)
+        & (metrics["late_energy"] <= max_late_energy)
+    ).to_numpy()
+
+    if return_metrics:
+        metrics = metrics.copy()
+        metrics["is_clean"] = mask
+        return mask, metrics
+    return mask
