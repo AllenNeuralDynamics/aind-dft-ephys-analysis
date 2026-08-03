@@ -137,6 +137,24 @@ def process_session(session: str) -> str:
         beh = smart_read_csv(str(beh_csv))
         trials = np.asarray(find_trials(nwb, "response"))
 
+        # ---- Latent availability / length check ----
+        # Report which configured latents exist in the behavior summary and
+        # whether their length matches the number of trials.
+        n_trials = int(len(trials))
+        present, missing = [], []
+        for col in LATENTS:
+            if col in beh.columns:
+                n = int(_as_1d_float_array(beh.at[0, col]).shape[0])
+                match = "ok" if n == n_trials else "LENGTH-MISMATCH"
+                present.append(col)
+                print(f"[{session}] latent present: {col} (len={n}, trials={n_trials}) [{match}]")
+            else:
+                missing.append(col)
+                print(f"[{session}] latent MISSING: {col}")
+        print(f"[{session}] latents present={len(present)}/{len(LATENTS)}, missing={len(missing)}")
+        if not present:
+            return f"[{session}] skip: none of the {len(LATENTS)} configured latents in behavior CSV"
+
         save_dir.mkdir(parents=True, exist_ok=True)
 
         for i, (col, lname) in enumerate(zip(LATENTS, Latent_NAMES), start=1):
