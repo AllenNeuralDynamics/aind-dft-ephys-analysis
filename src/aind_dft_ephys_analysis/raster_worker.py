@@ -168,6 +168,16 @@ def process_session(session: str) -> str:
             # Convert to compact float array to avoid pandas object retention.
             vals = _as_1d_float_array(beh.at[0, col])
 
+            # Skip latents whose length doesn't match the number of trials
+            # (e.g. model latents with no fitted data become scalars).
+            if vals.shape[0] != len(trials):
+                print(
+                    f"[{session}] skip: {col} "
+                    f"(length {vals.shape[0]} != trials {len(trials)})"
+                )
+                del vals
+                continue
+
             try:
                 plot_raster_and_quantile_psth_by_latent(
                     source=psth,
@@ -193,6 +203,9 @@ def process_session(session: str) -> str:
                     min_trial_rate=1,
                 )
                 print(f"[{session}] plotted: {col}")
+            except Exception as e:
+                # One bad latent should not abort the whole session.
+                print(f"[{session}] error plotting {col}: {e}")
             finally:
                 # Critical: close any figures created inside the plotting function.
                 # If the plotting function already closes figures, this is harmless.
