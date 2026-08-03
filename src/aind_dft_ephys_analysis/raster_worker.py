@@ -45,7 +45,7 @@ model_latents = [
 for latent, name in model_latents:
     LATENTS.append(latent)
     Latent_NAMES.append(name)
-"""
+
 # --------------------------------------------------
 # no_model — running-window reward rate (window = 1–30)
 # --------------------------------------------------
@@ -81,7 +81,8 @@ for a in ALPHAS:
     for suffix, short_name in EWMA_TYPES:
         LATENTS.append(f"no_model-reward_rate_alpha_{a}-{suffix}")
         Latent_NAMES.append(f"rr_alpha_{a_str}_{short_name}")
-"""
+
+
 # --------------------------------------------------
 # Sanity check
 # --------------------------------------------------
