@@ -16,7 +16,7 @@ from matplotlib.colors import ListedColormap
 from scipy.cluster.hierarchy import linkage, dendrogram, leaves_list
 from hdmf_zarr import NWBZarrIO
 from scipy.stats import ttest_rel
-from utils_ephys import find_best_electrode, cluster_estimated_x, load_ccf_channel_locations, extract_channel_info
+from ephys_utils import find_best_electrode, cluster_estimated_x, load_ccf_channel_locations, extract_channel_info
 
 class OpticalTagging:
     def __init__(self, behavior_json_file, ephys_nwb_file):
