@@ -690,6 +690,15 @@ class OpticalTagging:
             return
         spk = filtered_spikes[unit_index[0]]
 
+        # Probe / shank info for the figure title (from ccf_location if available)
+        probe_str, shank_str = "?", "?"
+        try:
+            ccf = self.nwb_ephys_data.units['ccf_location'][unit_index[0]]
+            probe_str = ccf.get('probe', '?')
+            shank_str = ccf.get('shank', '?')
+        except Exception:
+            pass
+
         # Plot each condition
         for cond in conds:
             pwr, loc, lname, dur, fre, pdur = cond
@@ -718,7 +727,7 @@ class OpticalTagging:
                 2, 1, figsize=(10, 8), sharex=True,
                 gridspec_kw={'height_ratios': [3, 1]}
             )
-            fig.suptitle(f"Unit {unit_index[0]} | Condition: {cond}", fontsize=14)
+            fig.suptitle(f"Unit {unit_index[0]} | {probe_str} shank {shank_str} | Condition: {cond}", fontsize=14)
 
             # Optional mean-waveform inset in the top-right corner of the raster panel
             if show_waveform:
