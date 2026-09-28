@@ -724,22 +724,27 @@ class OpticalTagging:
         bins = np.arange(time_window[0], time_window[1] + bin_size, bin_size)
         centers = bins[:-1] + bin_size / 2
 
-        # One figure per unit: 2 rows (raster, PSTH) x n_conds columns.
-        fig, axes = plt.subplots(
-            2, n_conds,
-            figsize=(6 * n_conds, 8), sharex='col',
-            gridspec_kw={'height_ratios': [3, 1]},
-            squeeze=False,
-        )
+        # One figure per unit, conditions arranged in a 3-column grid
+        # (3 x 3 for up to 9 conditions). Each grid cell is a sub-figure
+        # holding a stacked raster (top) + PSTH (bottom).
+        ncols = 3
+        nrows = int(np.ceil(n_conds / ncols))
+        fig = plt.figure(figsize=(6 * ncols, 4 * nrows), layout="constrained")
         fig.suptitle(
             f"Unit {unit_index[0]} | {probe_str} shank {shank_str}",
             fontsize=14,
         )
+        subfigs = fig.subfigures(nrows, ncols, squeeze=False)
 
-        for col, (cond, these_events) in enumerate(valid):
+        last_raster_ax = None
+        for idx, (cond, these_events) in enumerate(valid):
             pwr, loc, lname, dur, fre, pdur = cond
-            raster_ax = axes[0, col]
-            psth_ax = axes[1, col]
+            r, c = divmod(idx, ncols)
+            sf = subfigs[r][c]
+            raster_ax, psth_ax = sf.subplots(
+                2, 1, sharex=True, gridspec_kw={'height_ratios': [3, 1]}
+            )
+            last_raster_ax = raster_ax
 
             # Sort by first post-onset spike
             first_spikes = []
@@ -765,8 +770,7 @@ class OpticalTagging:
                 psth_counts.append(counts)
 
             raster_ax.set_title(f"Cond: {cond}", fontsize=9)
-            if col == 0:
-                raster_ax.set_ylabel("Trial (sorted)")
+            raster_ax.set_ylabel("Trial (sorted)")
             # Legend upper-left so it does not overlap the waveform inset.
             raster_ax.legend(
                 [mpatches.Patch(color="gray", alpha=0.3)],
@@ -807,21 +811,24 @@ class OpticalTagging:
                 for p in pulse_times_rel:
                     psth_ax.axvspan(p, p + pdur, color="gray", alpha=0.3)
 
-            if col == 0:
-                psth_ax.set_ylabel("Firing Rate (Hz)")
+            psth_ax.set_ylabel("Firing Rate (Hz)")
             psth_ax.set_xlabel("Time from Event (s)")
             psth_ax.legend(fontsize=8)
 
-        # Optional mean-waveform inset in the top-right corner of the figure
-        # (drawn once, in the last raster panel).
-        if show_waveform:
+        # Hide any unused grid cells (when n_conds is not a multiple of ncols).
+        for idx in range(n_conds, nrows * ncols):
+            r, c = divmod(idx, ncols)
+            subfigs[r][c].set_visible(False)
+
+        # Optional mean-waveform inset in the top-right corner of the last raster.
+        if show_waveform and last_raster_ax is not None:
             try:
                 units_table = self.nwb_ephys_data.units[:]
                 wf = np.array(units_table.loc[unit_index[0], "waveform_mean"])
                 # Peak channel = the one with the most negative trough
                 peak_ch = int(np.argmin(np.min(wf, axis=0)))
                 wf_trace = wf[:, peak_ch]
-                wf_ax = axes[0, -1].inset_axes([0.80, 0.78, 0.18, 0.20])
+                wf_ax = last_raster_ax.inset_axes([0.80, 0.78, 0.18, 0.20])
                 wf_ax.plot(wf_trace, color="black", linewidth=1)
                 wf_ax.set_title(f"waveform (ch {peak_ch})", fontsize=8, pad=1)
                 wf_ax.set_xticks([])
@@ -830,8 +837,6 @@ class OpticalTagging:
                     spine.set_visible(False)
             except Exception as e:
                 print(f"Warning: could not draw waveform inset for unit {unit_index[0]}: {e}")
-
-        plt.tight_layout()
 
         # Save a single figure per unit (all conditions in one image).
         if save_path and save_formats:
