@@ -1719,6 +1719,320 @@ class OpticalTagging:
         self.significant_df = results_df
         return results_df
 
+    # ------------------------------------------------------------------ #
+    # Robust opto-tagging: SALT + latency/jitter/reliability/effect-size  #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _bh_correct(pvals):
+        """Benjamini-Hochberg FDR correction. NaNs are treated as p=1.0."""
+        p = np.asarray(pvals, dtype=float)
+        p = np.where(np.isnan(p), 1.0, p)
+        n = p.size
+        if n == 0:
+            return p
+        order = np.argsort(p)
+        ranked = p[order] * n / (np.arange(n) + 1)
+        # Enforce monotonicity from the largest p-value downward.
+        ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+        out = np.empty(n)
+        out[order] = np.clip(ranked, 0.0, 1.0)
+        return out
+
+    @staticmethod
+    def _js_divergence(P, Q):
+        """Jensen-Shannon divergence (base-2) between two distributions."""
+        P = np.asarray(P, dtype=float)
+        Q = np.asarray(Q, dtype=float)
+        if P.sum() > 0:
+            P = P / P.sum()
+        if Q.sum() > 0:
+            Q = Q / Q.sum()
+        M = 0.5 * (P + Q)
+
+        def _kl(a, b):
+            mask = (a > 0) & (b > 0)
+            return np.sum(a[mask] * np.log2(a[mask] / b[mask]))
+
+        return 0.5 * _kl(P, M) + 0.5 * _kl(Q, M)
+
+    @staticmethod
+    def _latency_hist(spike_matrix, nbins):
+        """
+        First-spike-latency distribution for a (trials x nbins) binary matrix.
+
+        Returns a length ``nbins + 1`` probability vector; the extra final bin
+        counts trials with no spike in the window (as in Kvitsiani et al. 2013).
+        """
+        hist = np.zeros(nbins + 1)
+        for row in spike_matrix:
+            idx = np.flatnonzero(row)
+            if idx.size:
+                hist[idx[0]] += 1
+            else:
+                hist[nbins] += 1
+        s = hist.sum()
+        if s > 0:
+            hist = hist / s
+        return hist
+
+    def _salt(self, spt_baseline, spt_test, dt, wn):
+        """
+        Stimulus-Associated spike Latency Test (Kvitsiani et al., 2013).
+
+        Compares the first-spike-latency distribution in the test window against
+        distributions from equally sized baseline epochs using the (square-root)
+        Jensen-Shannon divergence. Returns ``(p_value, info_diff)`` where a small
+        p-value means the test latency distribution is atypical vs baseline.
+        """
+        nmbn = int(round(wn / dt))
+        if nmbn < 1:
+            return 1.0, 0.0
+        nbase = spt_baseline.shape[1]
+        nm = nbase // nmbn  # number of baseline epochs
+        if nm < 2:
+            return 1.0, 0.0
+
+        dists = [
+            self._latency_hist(spt_baseline[:, i * nmbn:(i + 1) * nmbn], nmbn)
+            for i in range(nm)
+        ]
+        test_dist = self._latency_hist(spt_test[:, :nmbn], nmbn)
+
+        base_jsd = []
+        for i in range(nm):
+            for j in range(i + 1, nm):
+                base_jsd.append(np.sqrt(max(self._js_divergence(dists[i], dists[j]), 0.0) * 2))
+        base_jsd = np.array(base_jsd)
+        if base_jsd.size == 0:
+            return 1.0, 0.0
+
+        test_jsd = np.array([
+            np.sqrt(max(self._js_divergence(dists[i], test_dist), 0.0) * 2)
+            for i in range(nm)
+        ])
+        test_stat = np.median(test_jsd)
+        p = float(np.mean(base_jsd >= test_stat))
+        info = float(test_stat - np.median(base_jsd))
+        return p, info
+
+    def find_tagged_units(self, unit_index=None,
+                          baseline_window=(-0.05, 0.0),
+                          latency_window=(0.0, 0.006),
+                          alpha=0.05,
+                          effect_ratio=2.0,
+                          min_abs_increase=0.0,
+                          min_reliability=0.2,
+                          max_latency=0.006,
+                          max_jitter=0.003,
+                          salt_dt=0.001,
+                          remove_artefacts=True, removal_window=0.002,
+                          align_to_event="pulse"):
+        """
+        Robust opto-tagging that layers several criteria on top of a paired
+        t-test, to avoid over-calling tagged units when trial counts are large.
+
+        For every unit x condition it computes, using a SHORT ``latency_window``
+        (direct-activation window, default 0-6 ms):
+          - paired t-test (baseline vs stim rate), BH-FDR corrected
+          - SALT test (Kvitsiani et al. 2013), BH-FDR corrected
+          - effect size: stim/baseline rate ratio and absolute increase
+          - reliability: fraction of pulses with >=1 spike in the window
+          - first-spike latency (median) and jitter (SD of first-spike latency)
+
+        A unit x condition is flagged ``tagged=True`` only if ALL of the
+        following hold:
+          - t-test significant after correction (``p_ttest_corr < alpha``)
+          - SALT significant after correction (``p_salt_corr < alpha``)
+          - ``stim_FR_mean > baseline_FR_mean``
+          - ``effect_ratio`` met AND absolute increase >= ``min_abs_increase``
+          - ``reliability >= min_reliability``
+          - ``median_latency <= max_latency``
+          - ``jitter <= max_jitter``
+
+        Parameters
+        ----------
+        unit_index : int or list of int, optional
+            Units to test. Defaults to all QC-passing units.
+        baseline_window : (float, float)
+            Pre-event window (s) for baseline rate and SALT baseline epochs.
+        latency_window : (float, float)
+            Short post-event window (s) for direct activation, latency, jitter,
+            reliability, effect size, and the SALT test window.
+        alpha : float
+            Significance level applied to the corrected p-values.
+        effect_ratio : float
+            Required ``stim_FR_mean / baseline_FR_mean`` ratio.
+        min_abs_increase : float
+            Required absolute rate increase (Hz).
+        min_reliability : float
+            Required fraction of pulses evoking a spike in ``latency_window``.
+        max_latency : float
+            Maximum allowed median first-spike latency (s).
+        max_jitter : float
+            Maximum allowed first-spike-latency SD (s).
+        salt_dt : float
+            Time resolution (s) for the SALT latency histograms.
+        remove_artefacts, removal_window, align_to_event
+            As in ``find_significant_units``.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per unit x condition with all metrics and the ``tagged`` flag.
+            Also stored on ``self.tagged_df``.
+        """
+        if not hasattr(self, "units_passing_qc"):
+            print("Error: QC-passing units are missing.")
+            return pd.DataFrame()
+
+        if unit_index is None:
+            unit_index = self.units_passing_qc.index.tolist()
+        elif isinstance(unit_index, int):
+            unit_index = [unit_index]
+        else:
+            unit_index = [u for u in unit_index if u in self.units_passing_qc.index]
+        if len(unit_index) == 0:
+            print("Error: None of the selected units exist in QC-passing units.")
+            return pd.DataFrame()
+
+        event_dict = self._get_event_arrays(align_to_event)
+        if event_dict is None:
+            return pd.DataFrame()
+        event_times = event_dict["event_times"]
+        unique_conditions = event_dict["unique_conditions"]
+        power_map = event_dict["power_map"]
+        location_map = event_dict["location_map"]
+        lasername_map = event_dict["lasername_map"]
+        cycle_duration_map = event_dict["cycle_duration_map"]
+        frequency_map = event_dict["frequency_map"]
+        pdur_map = event_dict["pdur_map"]
+
+        filtered_spikes = self._get_filtered_spike_times(unit_index, remove_artefacts, removal_window)
+        if filtered_spikes is None:
+            return pd.DataFrame()
+
+        b0, b1 = baseline_window
+        w0, w1 = latency_window
+        base_dur = b1 - b0
+        win_dur = w1 - w0
+        nb = max(int(round(base_dur / salt_dt)), 1)
+        nt = max(int(round(win_dur / salt_dt)), 1)
+
+        rows = []
+        for cond in unique_conditions:
+            pwr_cond, loc_cond, lname_cond, cycle_cond, freq_cond, pdur_cond = cond
+            sel_mask = (
+                (power_map == pwr_cond) &
+                (location_map == loc_cond) &
+                (lasername_map == lname_cond) &
+                (cycle_duration_map == cycle_cond) &
+                (frequency_map == freq_cond) &
+                (pdur_map == pdur_cond)
+            )
+            these_events = event_times[sel_mask]
+            n_events = len(these_events)
+            if n_events == 0:
+                continue
+
+            for unit in unit_index:
+                st = filtered_spikes[unit]
+                baseline_rates = np.empty(n_events)
+                stim_rates = np.empty(n_events)
+                latencies = []
+                spt_baseline = np.zeros((n_events, nb))
+                spt_test = np.zeros((n_events, nt))
+
+                for i, t in enumerate(these_events):
+                    # Baseline spikes -> rate + SALT baseline matrix
+                    bspk = st[(st >= t + b0) & (st < t + b1)] - (t + b0)
+                    if bspk.size:
+                        bidx = np.floor(bspk / salt_dt).astype(int)
+                        bidx = bidx[(bidx >= 0) & (bidx < nb)]
+                        spt_baseline[i, bidx] = 1
+                    baseline_rates[i] = bspk.size / base_dur
+
+                    # Test-window spikes -> rate + SALT test matrix + first latency
+                    tspk = st[(st >= t + w0) & (st < t + w1)] - (t + w0)
+                    if tspk.size:
+                        tidx = np.floor(tspk / salt_dt).astype(int)
+                        tidx = tidx[(tidx >= 0) & (tidx < nt)]
+                        spt_test[i, tidx] = 1
+                        latencies.append(w0 + tspk.min())
+                    stim_rates[i] = tspk.size / win_dur
+
+                n_hit = len(latencies)
+                reliability = n_hit / n_events
+                median_latency = float(np.median(latencies)) if n_hit > 0 else np.nan
+                jitter = float(np.std(latencies, ddof=1)) if n_hit > 1 else np.nan
+
+                baseline_fr_mean = float(np.mean(baseline_rates))
+                stim_fr_mean = float(np.mean(stim_rates))
+                abs_increase = stim_fr_mean - baseline_fr_mean
+                if baseline_fr_mean > 0:
+                    ratio = stim_fr_mean / baseline_fr_mean
+                else:
+                    ratio = np.inf if stim_fr_mean > 0 else 0.0
+
+                # Paired t-test on short-latency rates
+                if n_events < 2 or np.allclose(baseline_rates, stim_rates):
+                    p_ttest = 1.0
+                else:
+                    _, p_ttest = ttest_rel(baseline_rates, stim_rates)
+                    if np.isnan(p_ttest):
+                        p_ttest = 1.0
+
+                # SALT test
+                p_salt, salt_info = self._salt(spt_baseline, spt_test, salt_dt, win_dur)
+
+                rows.append({
+                    "condition": cond,
+                    "unit_id": unit,
+                    "n_pulses": n_events,
+                    "n_hit": n_hit,
+                    "reliability": reliability,
+                    "median_latency": median_latency,
+                    "jitter": jitter,
+                    "baseline_FR_mean": baseline_fr_mean,
+                    "stim_FR_mean": stim_fr_mean,
+                    "abs_increase": abs_increase,
+                    "effect_ratio": ratio,
+                    "p_ttest": p_ttest,
+                    "p_salt": p_salt,
+                    "salt_info": salt_info,
+                    "best_electrode": self.nwb_ephys_data.units['ccf_location'][unit]['best_electrode'],
+                    "shank": self.nwb_ephys_data.units['ccf_location'][unit]['shank'],
+                    "probe": self.nwb_ephys_data.units['ccf_location'][unit]['probe'],
+                    "estimated_x": self.nwb_ephys_data.units['estimated_x'][unit],
+                    "estimated_y": self.nwb_ephys_data.units['estimated_y'][unit],
+                })
+
+        results_df = pd.DataFrame(rows)
+        if results_df.empty:
+            self.tagged_df = results_df
+            return results_df
+
+        # Multiple-comparison (BH-FDR) correction across all unit x condition tests.
+        results_df["p_ttest_corr"] = self._bh_correct(results_df["p_ttest"].values)
+        results_df["p_salt_corr"] = self._bh_correct(results_df["p_salt"].values)
+
+        effect_ok = (results_df["effect_ratio"] >= effect_ratio) & \
+                    (results_df["abs_increase"] >= min_abs_increase)
+        latency_ok = results_df["median_latency"].le(max_latency)   # NaN -> False
+        jitter_ok = results_df["jitter"].le(max_jitter)             # NaN -> False
+
+        results_df["tagged"] = (
+            (results_df["p_ttest_corr"] < alpha) &
+            (results_df["p_salt_corr"] < alpha) &
+            (results_df["stim_FR_mean"] > results_df["baseline_FR_mean"]) &
+            effect_ok &
+            (results_df["reliability"] >= min_reliability) &
+            latency_ok &
+            jitter_ok
+        )
+
+        self.tagged_df = results_df
+        return results_df
+
     def plot_waveform_mean(self, unit_id, save_path="/root/capsule/scratch/", save_formats=["eps"]):
         """
         Plots the mean waveform for a specified unit.
