@@ -622,7 +622,8 @@ class OpticalTagging:
     def plot_raster_graph(self, unit_index=None, time_window=[-0.05, 0.1], bin_size=0.005,
                           remove_artefacts=True, removal_window=0.002,
                           align_to_event="pulse", min_onset_time=0.0,
-                          save_path="/root/capsule/scratch/", save_formats=['eps']):
+                          save_path="/root/capsule/scratch/", save_formats=['eps'],
+                          show_waveform=False):
         """
         Plots a raster and peri-stimulus time histogram (PSTH) for a single unit,
         sorting trials by the first spike ≥ min_onset_time, and—
@@ -647,6 +648,9 @@ class OpticalTagging:
             Base path (without extension) where to save the figure.
         save_formats : list of str or None
             List of formats to save in, e.g. ["pdf", "eps"]. Supported: "pdf", "eps".
+        show_waveform : bool
+            If True, draw the unit's mean waveform (peak channel) as a small inset
+            in the top-right corner of the raster panel.
         """
         # Validate inputs
         optical_tagging_par = self.get_optical_tagging_par()
@@ -715,6 +719,24 @@ class OpticalTagging:
                 gridspec_kw={'height_ratios': [3, 1]}
             )
             fig.suptitle(f"Unit {unit_index[0]} | Condition: {cond}", fontsize=14)
+
+            # Optional mean-waveform inset in the top-right corner of the raster panel
+            if show_waveform:
+                try:
+                    units_table = self.nwb_ephys_data.units[:]
+                    wf = np.array(units_table.loc[unit_index[0], "waveform_mean"])
+                    # Peak channel = the one with the most negative trough
+                    peak_ch = int(np.argmin(np.min(wf, axis=0)))
+                    wf_trace = wf[:, peak_ch]
+                    wf_ax = raster_ax.inset_axes([0.80, 0.78, 0.18, 0.20])
+                    wf_ax.plot(wf_trace, color="black", linewidth=1)
+                    wf_ax.set_title(f"waveform (ch {peak_ch})", fontsize=8, pad=1)
+                    wf_ax.set_xticks([])
+                    wf_ax.set_yticks([])
+                    for spine in wf_ax.spines.values():
+                        spine.set_visible(False)
+                except Exception as e:
+                    print(f"Warning: could not draw waveform inset for unit {unit_index[0]}: {e}")
 
             # Raster + per-trial PSTH
             for row, t in enumerate(sorted_events):
