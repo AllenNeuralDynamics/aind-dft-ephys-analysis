@@ -622,13 +622,14 @@ class OpticalTagging:
     def plot_raster_graph(self, unit_index=None, time_window=[-0.05, 0.1], bin_size=0.005,
                           remove_artefacts=True, removal_window=0.002,
                           align_to_event="pulse", min_onset_time=0.0,
-                          save_path="/root/capsule/scratch/", save_formats=['eps'],
+                          save_path="/root/capsule/scratch/", save_formats=['png'],
                           show_waveform=False):
         """
         Plots a raster and peri-stimulus time histogram (PSTH) for a single unit,
         sorting trials by the first spike ≥ min_onset_time, and—
         if align_to_event=="laser"—shading all individual pulses.
-        Optionally saves the figure as PDF and/or EPS, with the condition in the filename.
+        All conditions for the unit are drawn in a SINGLE figure (one column per
+        condition), and the figure is optionally saved to one file per unit.
 
         Parameters
         ----------
@@ -645,12 +646,14 @@ class OpticalTagging:
         min_onset_time : float
             Only spikes ≥ this (relative to event) count toward sorting.
         save_path : str or None
-            Base path (without extension) where to save the figure.
+            Base path (without extension) where to save the figure. One file is
+            written per unit (all conditions in the same image).
         save_formats : list of str or None
-            List of formats to save in, e.g. ["pdf", "eps"]. Supported: "pdf", "eps".
+            List of formats to save in, e.g. ["png", "pdf", "eps"].
+            Supported: "png", "pdf", "eps", "svg", "jpg", "jpeg".
         show_waveform : bool
             If True, draw the unit's mean waveform (peak channel) as a small inset
-            in the top-right corner of the raster panel.
+            in the top-right corner of the figure.
         """
         # Validate inputs
         optical_tagging_par = self.get_optical_tagging_par()
@@ -699,7 +702,9 @@ class OpticalTagging:
         except Exception:
             pass
 
-        # Plot each condition
+        # Collect only the conditions that actually have events for this unit,
+        # so every condition is drawn in a SINGLE figure (one column each).
+        valid = []
         for cond in conds:
             pwr, loc, lname, dur, fre, pdur = cond
             mask = (
@@ -709,6 +714,32 @@ class OpticalTagging:
             these_events = event_times[mask]
             if len(these_events) == 0:
                 continue
+            valid.append((cond, these_events))
+
+        if not valid:
+            print(f"No events for unit {unit_index[0]} in any condition.")
+            return
+
+        n_conds = len(valid)
+        bins = np.arange(time_window[0], time_window[1] + bin_size, bin_size)
+        centers = bins[:-1] + bin_size / 2
+
+        # One figure per unit: 2 rows (raster, PSTH) x n_conds columns.
+        fig, axes = plt.subplots(
+            2, n_conds,
+            figsize=(6 * n_conds, 8), sharex='col',
+            gridspec_kw={'height_ratios': [3, 1]},
+            squeeze=False,
+        )
+        fig.suptitle(
+            f"Unit {unit_index[0]} | {probe_str} shank {shank_str}",
+            fontsize=14,
+        )
+
+        for col, (cond, these_events) in enumerate(valid):
+            pwr, loc, lname, dur, fre, pdur = cond
+            raster_ax = axes[0, col]
+            psth_ax = axes[1, col]
 
             # Sort by first post-onset spike
             first_spikes = []
@@ -718,53 +749,31 @@ class OpticalTagging:
             order = np.argsort(first_spikes)
             sorted_events = these_events[order]
 
-            # PSTH bins
-            bins = np.arange(time_window[0], time_window[1] + bin_size, bin_size)
-            psth_counts = []
-
-            # Create figure
-            fig, (raster_ax, psth_ax) = plt.subplots(
-                2, 1, figsize=(10, 8), sharex=True,
-                gridspec_kw={'height_ratios': [3, 1]}
-            )
-            fig.suptitle(f"Unit {unit_index[0]} | {probe_str} shank {shank_str} | Condition: {cond}", fontsize=14)
-
-            # Optional mean-waveform inset in the top-right corner of the raster panel
-            if show_waveform:
-                try:
-                    units_table = self.nwb_ephys_data.units[:]
-                    wf = np.array(units_table.loc[unit_index[0], "waveform_mean"])
-                    # Peak channel = the one with the most negative trough
-                    peak_ch = int(np.argmin(np.min(wf, axis=0)))
-                    wf_trace = wf[:, peak_ch]
-                    wf_ax = raster_ax.inset_axes([0.80, 0.78, 0.18, 0.20])
-                    wf_ax.plot(wf_trace, color="black", linewidth=1)
-                    wf_ax.set_title(f"waveform (ch {peak_ch})", fontsize=8, pad=1)
-                    wf_ax.set_xticks([])
-                    wf_ax.set_yticks([])
-                    for spine in wf_ax.spines.values():
-                        spine.set_visible(False)
-                except Exception as e:
-                    print(f"Warning: could not draw waveform inset for unit {unit_index[0]}: {e}")
+            # Shade stim intervals ONCE (identical across trials) instead of per row.
+            if align_to_event == "pulse":
+                raster_ax.axvspan(0, pdur, color="gray", alpha=0.3)
+            else:
+                for p in np.arange(0, dur, 1.0 / fre):
+                    raster_ax.axvspan(p, p + pdur, color="gray", alpha=0.3)
 
             # Raster + per-trial PSTH
+            psth_counts = []
             for row, t in enumerate(sorted_events):
                 aligned = spk[(spk >= t + time_window[0]) & (spk <= t + time_window[1])] - t
                 raster_ax.vlines(aligned, row + 0.5, row + 1.5, color="black")
-
-                # Shade stim intervals
-                if align_to_event == "pulse":
-                    raster_ax.axvspan(0, pdur, color="gray", alpha=0.3)
-                else:
-                    pulses = np.arange(t, t + dur, 1.0 / fre)
-                    for p in pulses:
-                        raster_ax.axvspan(p - t, p - t + pdur, color="gray", alpha=0.3)
-
                 counts, _ = np.histogram(aligned, bins=bins)
                 psth_counts.append(counts)
 
-            raster_ax.set_ylabel("Trial (sorted)")
-            raster_ax.legend([mpatches.Patch(color="gray", alpha=0.3)], ["Stim Window(s)"])
+            raster_ax.set_title(f"Cond: {cond}", fontsize=9)
+            if col == 0:
+                raster_ax.set_ylabel("Trial (sorted)")
+            # Legend upper-left so it does not overlap the waveform inset.
+            raster_ax.legend(
+                [mpatches.Patch(color="gray", alpha=0.3)],
+                ["Stim Window(s)"],
+                loc="upper left",
+                fontsize=8,
+            )
 
             # Compute mean & SEM FR
             arr = np.array(psth_counts)
@@ -773,7 +782,6 @@ class OpticalTagging:
                        if len(arr) > 1 else np.zeros_like(mean_cnt))
             fr = mean_cnt / bin_size
             fr_sem = sem_cnt / bin_size
-            centers = bins[:-1] + bin_size / 2
 
             # Mask artefact bins around all pulses
             mask_bins = np.ones_like(centers, dtype=bool)
@@ -799,32 +807,46 @@ class OpticalTagging:
                 for p in pulse_times_rel:
                     psth_ax.axvspan(p, p + pdur, color="gray", alpha=0.3)
 
-            psth_ax.set_ylabel("Firing Rate (Hz)")
+            if col == 0:
+                psth_ax.set_ylabel("Firing Rate (Hz)")
             psth_ax.set_xlabel("Time from Event (s)")
-            psth_ax.legend()
+            psth_ax.legend(fontsize=8)
 
-            plt.tight_layout()
+        # Optional mean-waveform inset in the top-right corner of the figure
+        # (drawn once, in the last raster panel).
+        if show_waveform:
+            try:
+                units_table = self.nwb_ephys_data.units[:]
+                wf = np.array(units_table.loc[unit_index[0], "waveform_mean"])
+                # Peak channel = the one with the most negative trough
+                peak_ch = int(np.argmin(np.min(wf, axis=0)))
+                wf_trace = wf[:, peak_ch]
+                wf_ax = axes[0, -1].inset_axes([0.80, 0.78, 0.18, 0.20])
+                wf_ax.plot(wf_trace, color="black", linewidth=1)
+                wf_ax.set_title(f"waveform (ch {peak_ch})", fontsize=8, pad=1)
+                wf_ax.set_xticks([])
+                wf_ax.set_yticks([])
+                for spine in wf_ax.spines.values():
+                    spine.set_visible(False)
+            except Exception as e:
+                print(f"Warning: could not draw waveform inset for unit {unit_index[0]}: {e}")
 
-            # Save figures with condition in filename
-            if save_path and save_formats:
-                # sanitize and build cond string
-                cond_str = "_".join([
-                    str(pwr).replace(" ", ""),
-                    str(loc).replace(" ", ""),
-                    str(lname).replace(" ", ""),
-                    f"dur{dur}",
-                    f"fre{fre}",
-                    f"pdur{int(pdur*1000)}ms"
-                ])
-                for fmt in save_formats:
-                    fmt_low = fmt.lower()
-                    if fmt_low in ("pdf", "eps"):
-                        fname = f"{save_path}_{cond_str}.{fmt_low}"
-                        fig.savefig(fname, format=fmt_low, dpi=300, bbox_inches='tight')
-                    else:
-                        print(f"Warning: unsupported save format '{fmt}'")
+        plt.tight_layout()
 
-            plt.show()
+        # Save a single figure per unit (all conditions in one image).
+        if save_path and save_formats:
+            supported = ("png", "pdf", "eps", "svg", "jpg", "jpeg")
+            for fmt in save_formats:
+                fmt_low = fmt.lower()
+                if fmt_low in supported:
+                    fname = f"{save_path}.{fmt_low}"
+                    fig.savefig(fname, format=fmt_low, dpi=300, bbox_inches='tight')
+                else:
+                    print(f"Warning: unsupported save format '{fmt}'")
+
+        plt.show()
+        plt.close(fig)
+
 
 
 
