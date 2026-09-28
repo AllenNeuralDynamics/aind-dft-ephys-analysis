@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import gc
-import glob
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -13,12 +12,11 @@ import matplotlib
 matplotlib.use("Agg")  # headless in workers
 import matplotlib.pyplot as plt
 
-from optical_tagging import OpticalTagging
+from nwb_utils import NWBUtils
 from behavior_utils import extract_event_timestamps
 
 
 # ---- Shared config (edit if needed) ----
-DATA_ROOT = Path("/root/capsule/data")
 OUTDIR = Path("/root/capsule/scratch/lick_raster_plot")
 
 TIME_WINDOW = (-1.0, 1.0)      # seconds around each lick
@@ -36,24 +34,17 @@ def session_core_from_folder(sorted_folder: str) -> str:
     return core
 
 
-def build_session_paths(sorted_folder: str, data_root: Path = DATA_ROOT) -> dict:
-    """Derive behavior JSON and ephys NWB paths from a sorted-folder name."""
-    core = session_core_from_folder(sorted_folder)
-    behavior_json_file = str(data_root / f"ecephys_{core}" / "behavior" / f"{core}.json")
+def get_units_passing_qc(nwb):
+    """Return the QC-passed units table from a loaded ephys NWB.
 
-    ephys_nwb_file = str(
-        data_root / sorted_folder / "nwb" / f"ecephys_{core}_experiment1_recording1.nwb"
-    )
-    if not os.path.exists(ephys_nwb_file):
-        matches = glob.glob(str(data_root / sorted_folder / "nwb" / "*experiment1_recording1.nwb"))
-        if matches:
-            ephys_nwb_file = matches[0]
-
-    return {
-        "label": core,
-        "behavior_json_file": behavior_json_file,
-        "ephys_nwb_file": ephys_nwb_file,
-    }
+    Mirrors OpticalTagging.get_units_passed_default_qc: keep units whose
+    ``default_qc`` is True and whose ``decoder_label`` is not 'noise'.
+    """
+    units = nwb.units[:]
+    return units[
+        ((units.default_qc == "True") | (units.default_qc == True)) &
+        (units.decoder_label != "noise")
+    ]
 
 
 def compute_aligned_raster_psth(spike_times, event_times, time_window, bin_size):
@@ -85,24 +76,24 @@ def compute_aligned_raster_psth(spike_times, event_times, time_window, bin_size)
     return per_event, centers, fr, sem
 
 
-def get_lick_times(opto_tag, side: str) -> np.ndarray:
+def get_lick_times(nwb, side: str) -> np.ndarray:
     """Return sorted left/right lick times (s) in the spike-time clock."""
     event_name = "left_lick" if side.lower() == "left" else "right_lick"
     lick_times = np.asarray(
-        extract_event_timestamps(opto_tag.nwb_ephys_data, event_name), dtype=float
+        extract_event_timestamps(nwb, event_name), dtype=float
     )
     lick_times = lick_times[~np.isnan(lick_times)]
     return np.sort(lick_times)
 
 
-def plot_lick_aligned(opto_tag, unit_index, side, lick_times,
+def plot_lick_aligned(units_df, unit_index, side, lick_times,
                       time_window, bin_size, session_label,
                       save_path, save_formats, max_raster_events):
     """Save a raster (top) + PSTH (bottom) figure for one unit and one lick side."""
     side = side.lower()
     n_licks = len(lick_times)
 
-    spikes = opto_tag.units_passing_qc.loc[unit_index]["spike_times"]
+    spikes = units_df.loc[unit_index]["spike_times"]
     per_event, centers, fr, sem = compute_aligned_raster_psth(
         spikes, lick_times, time_window, bin_size
     )
@@ -149,36 +140,35 @@ def process_session(session: str) -> str:
     of one session. Returns a short status string.
 
     This function must be top-level in a module so it is importable by 'spawn'.
+    The ephys NWB is loaded by session name via ``NWBUtils.read_ephys_nwb`` so that
+    spike times and lick acquisition share the same (ephys) clock.
     """
-    opto: Optional[Any] = None
+    nwb: Optional[Any] = None
     try:
-        paths = build_session_paths(session)
-        label = paths["label"]
+        label = session_core_from_folder(session)
 
-        if not os.path.exists(paths["ephys_nwb_file"]):
-            return f"[{label}] skip: ephys NWB not found: {paths['ephys_nwb_file']}"
+        nwb = NWBUtils.read_ephys_nwb(session_name=session)
+        if nwb is None or not hasattr(nwb, "units"):
+            return f"[{label}] skip: ephys NWB not found or has no units"
 
-        opto = OpticalTagging(
-            behavior_json_file=paths["behavior_json_file"],
-            ephys_nwb_file=paths["ephys_nwb_file"],
-        )
+        units_passing_qc = get_units_passing_qc(nwb)
 
-        left_licks = get_lick_times(opto, "left")
-        right_licks = get_lick_times(opto, "right")
+        left_licks = get_lick_times(nwb, "left")
+        right_licks = get_lick_times(nwb, "right")
 
-        units = list(opto.units_passing_qc.index) if UNITS is None else list(UNITS)
+        units = list(units_passing_qc.index) if UNITS is None else list(UNITS)
         save_dir = str(OUTDIR / label)
         os.makedirs(save_dir, exist_ok=True)
 
         print(f"[{label}] units={len(units)} | left_licks={len(left_licks)} | right_licks={len(right_licks)}")
 
         for i, unit_index in enumerate(units, start=1):
-            if unit_index not in opto.units_passing_qc.index:
+            if unit_index not in units_passing_qc.index:
                 continue
             for side, licks in (("left", left_licks), ("right", right_licks)):
                 try:
                     plot_lick_aligned(
-                        opto, unit_index, side, licks,
+                        units_passing_qc, unit_index, side, licks,
                         TIME_WINDOW, BIN_SIZE, label,
                         save_dir, SAVE_FORMATS, MAX_RASTER_EVENTS,
                     )
@@ -200,7 +190,12 @@ def process_session(session: str) -> str:
         except Exception:
             pass
         try:
-            del opto
+            if nwb is not None and hasattr(nwb, "io"):
+                nwb.io.close()
+        except Exception:
+            pass
+        try:
+            del nwb
         except Exception:
             pass
         gc.collect()
