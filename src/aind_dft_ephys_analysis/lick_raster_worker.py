@@ -140,10 +140,12 @@ def process_session(session: str) -> str:
     of one session. Returns a short status string.
 
     This function must be top-level in a module so it is importable by 'spawn'.
-    The ephys NWB is loaded by session name via ``NWBUtils.read_ephys_nwb`` so that
-    spike times and lick acquisition share the same (ephys) clock.
+    Spikes are read from the ephys NWB (``NWBUtils.read_ephys_nwb``) and lick times
+    from the behavior NWB (``NWBUtils.read_behavior_nwb``); both are synchronized to
+    the same clock by the upstream pipeline, so no extra alignment is needed.
     """
     nwb: Optional[Any] = None
+    beh: Optional[Any] = None
     try:
         label = session_core_from_folder(session)
 
@@ -151,10 +153,14 @@ def process_session(session: str) -> str:
         if nwb is None or not hasattr(nwb, "units"):
             return f"[{label}] skip: ephys NWB not found or has no units"
 
+        beh = NWBUtils.read_behavior_nwb(session_name=session)
+        if beh is None:
+            return f"[{label}] skip: behavior NWB not found (needed for lick times)"
+
         units_passing_qc = get_units_passing_qc(nwb)
 
-        left_licks = get_lick_times(nwb, "left")
-        right_licks = get_lick_times(nwb, "right")
+        left_licks = get_lick_times(beh, "left")
+        right_licks = get_lick_times(beh, "right")
 
         units = list(units_passing_qc.index) if UNITS is None else list(UNITS)
         save_dir = str(OUTDIR / label)
@@ -189,13 +195,15 @@ def process_session(session: str) -> str:
             plt.close("all")
         except Exception:
             pass
-        try:
-            if nwb is not None and hasattr(nwb, "io"):
-                nwb.io.close()
-        except Exception:
-            pass
+        for _obj in (nwb, beh):
+            try:
+                if _obj is not None and hasattr(_obj, "io"):
+                    _obj.io.close()
+            except Exception:
+                pass
         try:
             del nwb
+            del beh
         except Exception:
             pass
         gc.collect()
