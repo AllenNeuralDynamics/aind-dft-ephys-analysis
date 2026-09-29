@@ -18,6 +18,114 @@ from hdmf_zarr import NWBZarrIO
 from scipy.stats import ttest_rel
 from ephys_utils import find_best_electrode, cluster_estimated_x, load_ccf_channel_locations, extract_channel_info
 
+
+def bh_correct(pvals):
+    """Benjamini-Hochberg FDR correction. NaNs are treated as p=1.0."""
+    p = np.asarray(pvals, dtype=float)
+    p = np.where(np.isnan(p), 1.0, p)
+    n = p.size
+    if n == 0:
+        return p
+    order = np.argsort(p)
+    ranked = p[order] * n / (np.arange(n) + 1)
+    # Enforce monotonicity from the largest p-value downward.
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    out = np.empty(n)
+    out[order] = np.clip(ranked, 0.0, 1.0)
+    return out
+
+
+def select_tagged_units(metrics_df,
+                        alpha=0.05,
+                        effect_ratio=2.0,
+                        min_abs_increase=0.0,
+                        min_reliability=0.2,
+                        max_latency=0.006,
+                        max_jitter=0.003,
+                        correction="fdr_bh",
+                        return_tagged_only=False):
+    """
+    SELECTION step of robust opto-tagging: apply thresholds to precomputed
+    metrics (from :meth:`OpticalTagging.compute_tagging_metrics`) and add a
+    ``tagged`` flag.
+
+    This is a standalone function (no ``OpticalTagging`` instance required), so
+    it can be run on a metrics table combined across many sessions -- e.g. read
+    several per-session CSVs, ``pd.concat`` them, and select in one call. When a
+    ``session`` column is present, multiple-comparison correction is applied
+    within each (``session``, ``pulse_index``) family; otherwise within each
+    ``pulse_index`` family. A row is flagged ``tagged=True`` only if ALL hold:
+      - t-test significant after correction (``p_ttest_corr < alpha``)
+      - SALT significant after correction (``p_salt_corr < alpha``)
+      - ``stim_FR_mean > baseline_FR_mean``
+      - ``effect_ratio`` met AND absolute increase >= ``min_abs_increase``
+      - ``reliability >= min_reliability``
+      - ``median_latency <= max_latency``
+      - ``jitter <= max_jitter``
+
+    Parameters
+    ----------
+    metrics_df : pd.DataFrame
+        Metrics table produced by ``compute_tagging_metrics`` (one session or
+        several concatenated).
+    alpha, effect_ratio, min_abs_increase, min_reliability, max_latency, max_jitter
+        Selection thresholds.
+    correction : {"fdr_bh", "none"}
+        Multiple-comparison correction for the p-values.
+    return_tagged_only : bool
+        If True, return only rows where ``tagged`` is True.
+
+    Returns
+    -------
+    pd.DataFrame
+        The metrics table with ``p_ttest_corr``, ``p_salt_corr`` and ``tagged``
+        columns added.
+    """
+    if metrics_df is None or len(metrics_df) == 0:
+        print("Error: no metrics to select from.")
+        return pd.DataFrame()
+
+    df = metrics_df.copy()
+
+    # Families over which p-values are corrected: keep sessions independent and
+    # each pulse position independent (they are separate test families).
+    family_cols = [c for c in ("session", "pulse_index") if c in df.columns]
+
+    if correction in ("fdr_bh", "bh"):
+        if family_cols:
+            df["p_ttest_corr"] = df.groupby(family_cols)["p_ttest"].transform(
+                lambda s: pd.Series(bh_correct(s.values), index=s.index))
+            df["p_salt_corr"] = df.groupby(family_cols)["p_salt"].transform(
+                lambda s: pd.Series(bh_correct(s.values), index=s.index))
+        else:
+            df["p_ttest_corr"] = bh_correct(df["p_ttest"].values)
+            df["p_salt_corr"] = bh_correct(df["p_salt"].values)
+    elif correction in (None, "none"):
+        df["p_ttest_corr"] = df["p_ttest"]
+        df["p_salt_corr"] = df["p_salt"]
+    else:
+        raise ValueError(f"Unknown correction: {correction!r}")
+
+    effect_ok = (df["effect_ratio"] >= effect_ratio) & \
+                (df["abs_increase"] >= min_abs_increase)
+    latency_ok = df["median_latency"].le(max_latency)   # NaN -> False
+    jitter_ok = df["jitter"].le(max_jitter)             # NaN -> False
+
+    df["tagged"] = (
+        (df["p_ttest_corr"] < alpha) &
+        (df["p_salt_corr"] < alpha) &
+        (df["stim_FR_mean"] > df["baseline_FR_mean"]) &
+        effect_ok &
+        (df["reliability"] >= min_reliability) &
+        latency_ok &
+        jitter_ok
+    )
+
+    if return_tagged_only:
+        return df[df["tagged"]].reset_index(drop=True)
+    return df
+
+
 class OpticalTagging:
     def __init__(self, behavior_json_file, ephys_nwb_file):
         """
@@ -625,11 +733,42 @@ class OpticalTagging:
         hist_counts, _ = np.histogram(all_aligned, bins=bins_arr)
         return hist_counts
 
+    @staticmethod
+    def _lookup_condition_metrics(metrics_df, unit_id, cond):
+        """
+        Return the pooled (``pulse_index == -1``) metrics row for one
+        ``unit_id`` x ``cond`` as a dict, or None if not present. ``cond`` may be
+        stored as a tuple (in-memory) or a string (after a CSV round-trip).
+        """
+        from ast import literal_eval
+
+        def _as_tuple(c):
+            if isinstance(c, str):
+                try:
+                    c = literal_eval(c)
+                except (ValueError, SyntaxError):
+                    return None
+            return tuple(c) if isinstance(c, (tuple, list)) else None
+
+        target = _as_tuple(cond)
+        sub = metrics_df[metrics_df["unit_id"] == unit_id]
+        if "pulse_index" in sub.columns:
+            sub = sub[sub["pulse_index"] == -1]
+        for _, row in sub.iterrows():
+            if _as_tuple(row["condition"]) == target:
+                return {
+                    "reliability": row.get("reliability", float("nan")),
+                    "median_latency": row.get("median_latency", float("nan")),
+                    "jitter": row.get("jitter", float("nan")),
+                    "effect_ratio": row.get("effect_ratio", float("nan")),
+                }
+        return None
+
     def plot_raster_graph(self, unit_index=None, time_window=[-0.05, 0.1], bin_size=0.005,
                           remove_artefacts=True, removal_window=0.002,
                           align_to_event="pulse", min_onset_time=0.0,
                           save_path="/root/capsule/scratch/", save_formats=['png'],
-                          show_waveform=False):
+                          show_waveform=False, metrics_df=None):
         """
         Plots a raster and peri-stimulus time histogram (PSTH) for a single unit,
         sorting trials by the first spike ≥ min_onset_time, and—
@@ -660,6 +799,11 @@ class OpticalTagging:
         show_waveform : bool
             If True, draw the unit's mean waveform (peak channel) as a small inset
             in the top-right corner of the figure.
+        metrics_df : pd.DataFrame, optional
+            Metrics table from ``compute_tagging_metrics``. When provided, each
+            condition panel is annotated with this unit's pooled (``pulse_index
+            == -1``) ``reliability``, ``median_latency``, ``jitter`` and
+            ``effect_ratio`` for that condition.
         """
         # Validate inputs
         optical_tagging_par = self.get_optical_tagging_par()
@@ -784,6 +928,24 @@ class OpticalTagging:
                 loc="upper left",
                 fontsize=8,
             )
+
+            # Optional per-condition metric annotation (pooled pulse_index == -1).
+            if metrics_df is not None and len(metrics_df) > 0:
+                m = self._lookup_condition_metrics(metrics_df, unit_index[0], cond)
+                if m is not None:
+                    txt = (
+                        f"reliability={m['reliability']:.2f}\n"
+                        f"median_latency={m['median_latency'] * 1e3:.2f} ms\n"
+                        f"jitter={m['jitter'] * 1e3:.2f} ms\n"
+                        f"effect_ratio={m['effect_ratio']:.2f}"
+                    )
+                    raster_ax.text(
+                        0.02, 0.72, txt,
+                        transform=raster_ax.transAxes,
+                        fontsize=7, va="top", ha="left",
+                        bbox=dict(boxstyle="round", facecolor="white", alpha=0.7,
+                                  edgecolor="none"),
+                    )
 
             # Compute mean & SEM FR
             arr = np.array(psth_counts)
@@ -2020,7 +2182,12 @@ class OpticalTagging:
                     )
                     if m is None:
                         continue
-                    row = {"condition": cond, "unit_id": unit, "pulse_index": pidx_label}
+                    row = {
+                        "session": self.session_name,
+                        "condition": cond,
+                        "unit_id": unit,
+                        "pulse_index": pidx_label,
+                    }
                     row.update(m)
                     row.update({
                         "best_electrode": ccf['best_electrode'],
@@ -2045,36 +2212,12 @@ class OpticalTagging:
                             correction="fdr_bh",
                             return_tagged_only=False):
         """
-        SELECTION step of robust opto-tagging: apply thresholds to precomputed
-        metrics (from :meth:`compute_tagging_metrics`) and add a ``tagged`` flag.
+        Thin wrapper around the module-level :func:`select_tagged_units`.
 
-        Multiple-comparison correction is applied within each ``pulse_index``
-        family (the pooled row and each pulse position are corrected separately),
-        so a unit x condition is flagged ``tagged=True`` only if ALL hold:
-          - t-test significant after correction (``p_ttest_corr < alpha``)
-          - SALT significant after correction (``p_salt_corr < alpha``)
-          - ``stim_FR_mean > baseline_FR_mean``
-          - ``effect_ratio`` met AND absolute increase >= ``min_abs_increase``
-          - ``reliability >= min_reliability``
-          - ``median_latency <= max_latency``
-          - ``jitter <= max_jitter``
-
-        Parameters
-        ----------
-        metrics_df : pd.DataFrame, optional
-            Metrics table. Defaults to ``self.metrics_df``.
-        alpha, effect_ratio, min_abs_increase, min_reliability, max_latency, max_jitter
-            Selection thresholds.
-        correction : {"fdr_bh", "none"}
-            Multiple-comparison correction for the p-values.
-        return_tagged_only : bool
-            If True, return only rows where ``tagged`` is True.
-
-        Returns
-        -------
-        pd.DataFrame
-            The metrics table with ``p_ttest_corr``, ``p_salt_corr`` and
-            ``tagged`` columns added. Also stored on ``self.tagged_df``.
+        Defaults ``metrics_df`` to ``self.metrics_df`` and stores the result on
+        ``self.tagged_df``. For combining several sessions, call the standalone
+        :func:`select_tagged_units` function directly on a concatenated metrics
+        table instead (it does not need an ``OpticalTagging`` instance).
         """
         if metrics_df is None:
             metrics_df = getattr(self, "metrics_df", None)
@@ -2082,42 +2225,18 @@ class OpticalTagging:
             print("Error: no metrics to select from. Run compute_tagging_metrics first.")
             return pd.DataFrame()
 
-        df = metrics_df.copy()
-
-        # Correct p-values within each pulse_index family (separate test families).
-        if correction in ("fdr_bh", "bh"):
-            if "pulse_index" in df.columns:
-                df["p_ttest_corr"] = df.groupby("pulse_index")["p_ttest"].transform(
-                    lambda s: pd.Series(self._bh_correct(s.values), index=s.index))
-                df["p_salt_corr"] = df.groupby("pulse_index")["p_salt"].transform(
-                    lambda s: pd.Series(self._bh_correct(s.values), index=s.index))
-            else:
-                df["p_ttest_corr"] = self._bh_correct(df["p_ttest"].values)
-                df["p_salt_corr"] = self._bh_correct(df["p_salt"].values)
-        elif correction in (None, "none"):
-            df["p_ttest_corr"] = df["p_ttest"]
-            df["p_salt_corr"] = df["p_salt"]
-        else:
-            raise ValueError(f"Unknown correction: {correction!r}")
-
-        effect_ok = (df["effect_ratio"] >= effect_ratio) & \
-                    (df["abs_increase"] >= min_abs_increase)
-        latency_ok = df["median_latency"].le(max_latency)   # NaN -> False
-        jitter_ok = df["jitter"].le(max_jitter)             # NaN -> False
-
-        df["tagged"] = (
-            (df["p_ttest_corr"] < alpha) &
-            (df["p_salt_corr"] < alpha) &
-            (df["stim_FR_mean"] > df["baseline_FR_mean"]) &
-            effect_ok &
-            (df["reliability"] >= min_reliability) &
-            latency_ok &
-            jitter_ok
+        df = select_tagged_units(
+            metrics_df,
+            alpha=alpha,
+            effect_ratio=effect_ratio,
+            min_abs_increase=min_abs_increase,
+            min_reliability=min_reliability,
+            max_latency=max_latency,
+            max_jitter=max_jitter,
+            correction=correction,
+            return_tagged_only=return_tagged_only,
         )
-
         self.tagged_df = df
-        if return_tagged_only:
-            return df[df["tagged"]].reset_index(drop=True)
         return df
 
     def find_tagged_units(self, unit_index=None,
