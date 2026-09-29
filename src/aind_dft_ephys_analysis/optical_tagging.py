@@ -308,6 +308,7 @@ class OpticalTagging:
         pulse_cycle_duration_map = []
         pulse_frequency_map = []
         pulse_pdur_map = []  # pulse_duration in seconds
+        pulse_index_map = []  # 0-based position of each pulse within its train
 
         def safe_fetch(arr, idx):
             return arr[idx] if idx < len(arr) else None
@@ -329,9 +330,11 @@ class OpticalTagging:
             pulse_cycle_duration_map.extend([dur] * n_pulses_trial)
             pulse_frequency_map.extend([fre] * n_pulses_trial)
             pulse_pdur_map.extend([pdur] * n_pulses_trial)
+            pulse_index_map.extend(range(n_pulses_trial))
 
         # Convert lists to arrays
         pulse_start_times = np.array(pulse_start_times)
+        pulse_index_map = np.array(pulse_index_map, dtype=int)
         pulse_power_map = np.array(pulse_power_map, dtype=object)
         pulse_location_map = np.array(pulse_location_map, dtype=object)
         pulse_lasername_map = np.array(pulse_lasername_map, dtype=object)
@@ -360,6 +363,7 @@ class OpticalTagging:
             "pulse_cycle_duration_map": pulse_cycle_duration_map,
             "pulse_frequency_map": pulse_frequency_map,
             "pulse_pdur_map": pulse_pdur_map,
+            "pulse_index_map": pulse_index_map,
             "combined_conditions": combined_conditions,
             "unique_conditions": unique_conditions
         }
@@ -569,7 +573,8 @@ class OpticalTagging:
                 "lasername_map": pulse_data["pulse_lasername_map"],
                 "cycle_duration_map": pulse_data["pulse_cycle_duration_map"],
                 "frequency_map": pulse_data["pulse_frequency_map"],
-                "pdur_map": pulse_data["pulse_pdur_map"]
+                "pdur_map": pulse_data["pulse_pdur_map"],
+                "pulse_index_map": pulse_data["pulse_index_map"]
             }
         elif align_to_event == "laser":
             laser_data = self._build_laser_start_arrays()
@@ -583,7 +588,8 @@ class OpticalTagging:
                 "lasername_map": laser_data["laser_lasername_map"],
                 "cycle_duration_map": laser_data["laser_cycle_duration_map"],
                 "frequency_map": laser_data["laser_frequency_map"],
-                "pdur_map": laser_data["laser_pdur_map"]
+                "pdur_map": laser_data["laser_pdur_map"],
+                "pulse_index_map": np.zeros(len(laser_data["laser_start_times"]), dtype=int)
             }
         else:
             print("Error: Invalid align_to_event value. Use 'pulse' or 'laser'.")
@@ -1815,39 +1821,107 @@ class OpticalTagging:
         info = float(test_stat - np.median(base_jsd))
         return p, info
 
-    def find_tagged_units(self, unit_index=None,
-                          baseline_window=(-0.05, 0.0),
-                          latency_window=(0.0, 0.006),
-                          alpha=0.05,
-                          effect_ratio=2.0,
-                          min_abs_increase=0.0,
-                          min_reliability=0.2,
-                          max_latency=0.006,
-                          max_jitter=0.003,
-                          salt_dt=0.001,
-                          remove_artefacts=True, removal_window=0.002,
-                          align_to_event="pulse"):
+    def _tag_metrics_for_events(self, st, events, b0, b1, w0, w1,
+                                base_dur, win_dur, nb, nt, salt_dt):
         """
-        Robust opto-tagging that layers several criteria on top of a paired
-        t-test, to avoid over-calling tagged units when trial counts are large.
+        Compute opto-tagging metrics for one unit over a set of event times.
+
+        Returns a dict of metrics (rates, reliability, latency, jitter, effect
+        size, and raw t-test / SALT p-values), or None if ``events`` is empty.
+        """
+        n_events = len(events)
+        if n_events == 0:
+            return None
+
+        baseline_rates = np.empty(n_events)
+        stim_rates = np.empty(n_events)
+        latencies = []
+        spt_baseline = np.zeros((n_events, nb))
+        spt_test = np.zeros((n_events, nt))
+
+        for i, t in enumerate(events):
+            # Baseline spikes -> rate + SALT baseline matrix
+            bspk = st[(st >= t + b0) & (st < t + b1)] - (t + b0)
+            if bspk.size:
+                bidx = np.floor(bspk / salt_dt).astype(int)
+                bidx = bidx[(bidx >= 0) & (bidx < nb)]
+                spt_baseline[i, bidx] = 1
+            baseline_rates[i] = bspk.size / base_dur
+
+            # Test-window spikes -> rate + SALT test matrix + first latency
+            tspk = st[(st >= t + w0) & (st < t + w1)] - (t + w0)
+            if tspk.size:
+                tidx = np.floor(tspk / salt_dt).astype(int)
+                tidx = tidx[(tidx >= 0) & (tidx < nt)]
+                spt_test[i, tidx] = 1
+                latencies.append(w0 + tspk.min())
+            stim_rates[i] = tspk.size / win_dur
+
+        n_hit = len(latencies)
+        reliability = n_hit / n_events
+        median_latency = float(np.median(latencies)) if n_hit > 0 else np.nan
+        jitter = float(np.std(latencies, ddof=1)) if n_hit > 1 else np.nan
+
+        baseline_fr_mean = float(np.mean(baseline_rates))
+        stim_fr_mean = float(np.mean(stim_rates))
+        abs_increase = stim_fr_mean - baseline_fr_mean
+        if baseline_fr_mean > 0:
+            ratio = stim_fr_mean / baseline_fr_mean
+        else:
+            ratio = np.inf if stim_fr_mean > 0 else 0.0
+
+        # Paired t-test on short-latency rates
+        if n_events < 2 or np.allclose(baseline_rates, stim_rates):
+            p_ttest = 1.0
+        else:
+            _, p_ttest = ttest_rel(baseline_rates, stim_rates)
+            if np.isnan(p_ttest):
+                p_ttest = 1.0
+
+        # SALT test
+        p_salt, salt_info = self._salt(spt_baseline, spt_test, salt_dt, win_dur)
+
+        return {
+            "n_pulses": n_events,
+            "n_hit": n_hit,
+            "reliability": reliability,
+            "median_latency": median_latency,
+            "jitter": jitter,
+            "baseline_FR_mean": baseline_fr_mean,
+            "stim_FR_mean": stim_fr_mean,
+            "abs_increase": abs_increase,
+            "effect_ratio": ratio,
+            "p_ttest": float(p_ttest),
+            "p_salt": p_salt,
+            "salt_info": salt_info,
+        }
+
+    def compute_tagging_metrics(self, unit_index=None,
+                                baseline_window=(-0.05, 0.0),
+                                latency_window=(0.0, 0.006),
+                                salt_dt=0.001,
+                                per_pulse=True,
+                                remove_artefacts=True, removal_window=0.002,
+                                align_to_event="pulse"):
+        """
+        CALCULATION step of robust opto-tagging (no thresholding / selection).
 
         For every unit x condition it computes, using a SHORT ``latency_window``
         (direct-activation window, default 0-6 ms):
-          - paired t-test (baseline vs stim rate), BH-FDR corrected
-          - SALT test (Kvitsiani et al. 2013), BH-FDR corrected
-          - effect size: stim/baseline rate ratio and absolute increase
+          - paired t-test p-value (baseline vs stim rate)  [``p_ttest``]
+          - SALT test p-value (Kvitsiani et al. 2013)       [``p_salt``]
+          - effect size: stim/baseline rate ratio + absolute increase
           - reliability: fraction of pulses with >=1 spike in the window
           - first-spike latency (median) and jitter (SD of first-spike latency)
 
-        A unit x condition is flagged ``tagged=True`` only if ALL of the
-        following hold:
-          - t-test significant after correction (``p_ttest_corr < alpha``)
-          - SALT significant after correction (``p_salt_corr < alpha``)
-          - ``stim_FR_mean > baseline_FR_mean``
-          - ``effect_ratio`` met AND absolute increase >= ``min_abs_increase``
-          - ``reliability >= min_reliability``
-          - ``median_latency <= max_latency``
-          - ``jitter <= max_jitter``
+        If ``per_pulse`` is True and ``align_to_event == "pulse"``, the same
+        metrics are ALSO computed separately for each pulse position within the
+        train. Rows are tagged by ``pulse_index``:
+          - ``pulse_index == -1`` : pooled over all pulses in the train
+          - ``pulse_index == 0,1,2,...`` : that pulse position only
+
+        No p-value correction and no ``tagged`` flag are added here; use
+        :meth:`select_tagged_units` for that.
 
         Parameters
         ----------
@@ -1858,28 +1932,18 @@ class OpticalTagging:
         latency_window : (float, float)
             Short post-event window (s) for direct activation, latency, jitter,
             reliability, effect size, and the SALT test window.
-        alpha : float
-            Significance level applied to the corrected p-values.
-        effect_ratio : float
-            Required ``stim_FR_mean / baseline_FR_mean`` ratio.
-        min_abs_increase : float
-            Required absolute rate increase (Hz).
-        min_reliability : float
-            Required fraction of pulses evoking a spike in ``latency_window``.
-        max_latency : float
-            Maximum allowed median first-spike latency (s).
-        max_jitter : float
-            Maximum allowed first-spike-latency SD (s).
         salt_dt : float
             Time resolution (s) for the SALT latency histograms.
+        per_pulse : bool
+            Also compute metrics per pulse position within each train.
         remove_artefacts, removal_window, align_to_event
             As in ``find_significant_units``.
 
         Returns
         -------
         pd.DataFrame
-            One row per unit x condition with all metrics and the ``tagged`` flag.
-            Also stored on ``self.tagged_df``.
+            One row per unit x condition x pulse_index with the raw metrics.
+            Also stored on ``self.metrics_df``.
         """
         if not hasattr(self, "units_passing_qc"):
             print("Error: QC-passing units are missing.")
@@ -1906,6 +1970,9 @@ class OpticalTagging:
         cycle_duration_map = event_dict["cycle_duration_map"]
         frequency_map = event_dict["frequency_map"]
         pdur_map = event_dict["pdur_map"]
+        pulse_index_map = event_dict.get("pulse_index_map")
+        if pulse_index_map is None:
+            pulse_index_map = np.zeros(len(event_times), dtype=int)
 
         filtered_spikes = self._get_filtered_spike_times(unit_index, remove_artefacts, removal_window)
         if filtered_spikes is None:
@@ -1929,109 +1996,171 @@ class OpticalTagging:
                 (frequency_map == freq_cond) &
                 (pdur_map == pdur_cond)
             )
-            these_events = event_times[sel_mask]
-            n_events = len(these_events)
-            if n_events == 0:
+            idx = np.flatnonzero(sel_mask)
+            if idx.size == 0:
                 continue
+            cond_events = event_times[idx]
+            cond_pidx = pulse_index_map[idx]
+
+            # Group 1: pooled over all pulses in the train (pulse_index = -1).
+            groups = [(-1, cond_events)]
+            # Groups 2..k: one per pulse position within the train.
+            if per_pulse and align_to_event == "pulse":
+                for p in sorted(set(int(x) for x in cond_pidx)):
+                    groups.append((p, cond_events[cond_pidx == p]))
 
             for unit in unit_index:
                 st = filtered_spikes[unit]
-                baseline_rates = np.empty(n_events)
-                stim_rates = np.empty(n_events)
-                latencies = []
-                spt_baseline = np.zeros((n_events, nb))
-                spt_test = np.zeros((n_events, nt))
+                ccf = self.nwb_ephys_data.units['ccf_location'][unit]
+                est_x = self.nwb_ephys_data.units['estimated_x'][unit]
+                est_y = self.nwb_ephys_data.units['estimated_y'][unit]
+                for pidx_label, evs in groups:
+                    m = self._tag_metrics_for_events(
+                        st, evs, b0, b1, w0, w1, base_dur, win_dur, nb, nt, salt_dt
+                    )
+                    if m is None:
+                        continue
+                    row = {"condition": cond, "unit_id": unit, "pulse_index": pidx_label}
+                    row.update(m)
+                    row.update({
+                        "best_electrode": ccf['best_electrode'],
+                        "shank": ccf['shank'],
+                        "probe": ccf['probe'],
+                        "estimated_x": est_x,
+                        "estimated_y": est_y,
+                    })
+                    rows.append(row)
 
-                for i, t in enumerate(these_events):
-                    # Baseline spikes -> rate + SALT baseline matrix
-                    bspk = st[(st >= t + b0) & (st < t + b1)] - (t + b0)
-                    if bspk.size:
-                        bidx = np.floor(bspk / salt_dt).astype(int)
-                        bidx = bidx[(bidx >= 0) & (bidx < nb)]
-                        spt_baseline[i, bidx] = 1
-                    baseline_rates[i] = bspk.size / base_dur
+        metrics_df = pd.DataFrame(rows)
+        self.metrics_df = metrics_df
+        return metrics_df
 
-                    # Test-window spikes -> rate + SALT test matrix + first latency
-                    tspk = st[(st >= t + w0) & (st < t + w1)] - (t + w0)
-                    if tspk.size:
-                        tidx = np.floor(tspk / salt_dt).astype(int)
-                        tidx = tidx[(tidx >= 0) & (tidx < nt)]
-                        spt_test[i, tidx] = 1
-                        latencies.append(w0 + tspk.min())
-                    stim_rates[i] = tspk.size / win_dur
+    def select_tagged_units(self, metrics_df=None,
+                            alpha=0.05,
+                            effect_ratio=2.0,
+                            min_abs_increase=0.0,
+                            min_reliability=0.2,
+                            max_latency=0.006,
+                            max_jitter=0.003,
+                            correction="fdr_bh",
+                            return_tagged_only=False):
+        """
+        SELECTION step of robust opto-tagging: apply thresholds to precomputed
+        metrics (from :meth:`compute_tagging_metrics`) and add a ``tagged`` flag.
 
-                n_hit = len(latencies)
-                reliability = n_hit / n_events
-                median_latency = float(np.median(latencies)) if n_hit > 0 else np.nan
-                jitter = float(np.std(latencies, ddof=1)) if n_hit > 1 else np.nan
+        Multiple-comparison correction is applied within each ``pulse_index``
+        family (the pooled row and each pulse position are corrected separately),
+        so a unit x condition is flagged ``tagged=True`` only if ALL hold:
+          - t-test significant after correction (``p_ttest_corr < alpha``)
+          - SALT significant after correction (``p_salt_corr < alpha``)
+          - ``stim_FR_mean > baseline_FR_mean``
+          - ``effect_ratio`` met AND absolute increase >= ``min_abs_increase``
+          - ``reliability >= min_reliability``
+          - ``median_latency <= max_latency``
+          - ``jitter <= max_jitter``
 
-                baseline_fr_mean = float(np.mean(baseline_rates))
-                stim_fr_mean = float(np.mean(stim_rates))
-                abs_increase = stim_fr_mean - baseline_fr_mean
-                if baseline_fr_mean > 0:
-                    ratio = stim_fr_mean / baseline_fr_mean
-                else:
-                    ratio = np.inf if stim_fr_mean > 0 else 0.0
+        Parameters
+        ----------
+        metrics_df : pd.DataFrame, optional
+            Metrics table. Defaults to ``self.metrics_df``.
+        alpha, effect_ratio, min_abs_increase, min_reliability, max_latency, max_jitter
+            Selection thresholds.
+        correction : {"fdr_bh", "none"}
+            Multiple-comparison correction for the p-values.
+        return_tagged_only : bool
+            If True, return only rows where ``tagged`` is True.
 
-                # Paired t-test on short-latency rates
-                if n_events < 2 or np.allclose(baseline_rates, stim_rates):
-                    p_ttest = 1.0
-                else:
-                    _, p_ttest = ttest_rel(baseline_rates, stim_rates)
-                    if np.isnan(p_ttest):
-                        p_ttest = 1.0
+        Returns
+        -------
+        pd.DataFrame
+            The metrics table with ``p_ttest_corr``, ``p_salt_corr`` and
+            ``tagged`` columns added. Also stored on ``self.tagged_df``.
+        """
+        if metrics_df is None:
+            metrics_df = getattr(self, "metrics_df", None)
+        if metrics_df is None or len(metrics_df) == 0:
+            print("Error: no metrics to select from. Run compute_tagging_metrics first.")
+            return pd.DataFrame()
 
-                # SALT test
-                p_salt, salt_info = self._salt(spt_baseline, spt_test, salt_dt, win_dur)
+        df = metrics_df.copy()
 
-                rows.append({
-                    "condition": cond,
-                    "unit_id": unit,
-                    "n_pulses": n_events,
-                    "n_hit": n_hit,
-                    "reliability": reliability,
-                    "median_latency": median_latency,
-                    "jitter": jitter,
-                    "baseline_FR_mean": baseline_fr_mean,
-                    "stim_FR_mean": stim_fr_mean,
-                    "abs_increase": abs_increase,
-                    "effect_ratio": ratio,
-                    "p_ttest": p_ttest,
-                    "p_salt": p_salt,
-                    "salt_info": salt_info,
-                    "best_electrode": self.nwb_ephys_data.units['ccf_location'][unit]['best_electrode'],
-                    "shank": self.nwb_ephys_data.units['ccf_location'][unit]['shank'],
-                    "probe": self.nwb_ephys_data.units['ccf_location'][unit]['probe'],
-                    "estimated_x": self.nwb_ephys_data.units['estimated_x'][unit],
-                    "estimated_y": self.nwb_ephys_data.units['estimated_y'][unit],
-                })
+        # Correct p-values within each pulse_index family (separate test families).
+        if correction in ("fdr_bh", "bh"):
+            if "pulse_index" in df.columns:
+                df["p_ttest_corr"] = df.groupby("pulse_index")["p_ttest"].transform(
+                    lambda s: pd.Series(self._bh_correct(s.values), index=s.index))
+                df["p_salt_corr"] = df.groupby("pulse_index")["p_salt"].transform(
+                    lambda s: pd.Series(self._bh_correct(s.values), index=s.index))
+            else:
+                df["p_ttest_corr"] = self._bh_correct(df["p_ttest"].values)
+                df["p_salt_corr"] = self._bh_correct(df["p_salt"].values)
+        elif correction in (None, "none"):
+            df["p_ttest_corr"] = df["p_ttest"]
+            df["p_salt_corr"] = df["p_salt"]
+        else:
+            raise ValueError(f"Unknown correction: {correction!r}")
 
-        results_df = pd.DataFrame(rows)
-        if results_df.empty:
-            self.tagged_df = results_df
-            return results_df
+        effect_ok = (df["effect_ratio"] >= effect_ratio) & \
+                    (df["abs_increase"] >= min_abs_increase)
+        latency_ok = df["median_latency"].le(max_latency)   # NaN -> False
+        jitter_ok = df["jitter"].le(max_jitter)             # NaN -> False
 
-        # Multiple-comparison (BH-FDR) correction across all unit x condition tests.
-        results_df["p_ttest_corr"] = self._bh_correct(results_df["p_ttest"].values)
-        results_df["p_salt_corr"] = self._bh_correct(results_df["p_salt"].values)
-
-        effect_ok = (results_df["effect_ratio"] >= effect_ratio) & \
-                    (results_df["abs_increase"] >= min_abs_increase)
-        latency_ok = results_df["median_latency"].le(max_latency)   # NaN -> False
-        jitter_ok = results_df["jitter"].le(max_jitter)             # NaN -> False
-
-        results_df["tagged"] = (
-            (results_df["p_ttest_corr"] < alpha) &
-            (results_df["p_salt_corr"] < alpha) &
-            (results_df["stim_FR_mean"] > results_df["baseline_FR_mean"]) &
+        df["tagged"] = (
+            (df["p_ttest_corr"] < alpha) &
+            (df["p_salt_corr"] < alpha) &
+            (df["stim_FR_mean"] > df["baseline_FR_mean"]) &
             effect_ok &
-            (results_df["reliability"] >= min_reliability) &
+            (df["reliability"] >= min_reliability) &
             latency_ok &
             jitter_ok
         )
 
-        self.tagged_df = results_df
-        return results_df
+        self.tagged_df = df
+        if return_tagged_only:
+            return df[df["tagged"]].reset_index(drop=True)
+        return df
+
+    def find_tagged_units(self, unit_index=None,
+                          baseline_window=(-0.05, 0.0),
+                          latency_window=(0.0, 0.006),
+                          alpha=0.05,
+                          effect_ratio=2.0,
+                          min_abs_increase=0.0,
+                          min_reliability=0.2,
+                          max_latency=0.006,
+                          max_jitter=0.003,
+                          salt_dt=0.001,
+                          per_pulse=False,
+                          remove_artefacts=True, removal_window=0.002,
+                          align_to_event="pulse"):
+        """
+        Convenience wrapper that runs :meth:`compute_tagging_metrics` followed by
+        :meth:`select_tagged_units` in one call. Prefer calling the two steps
+        separately when you want to compute/save metrics once and then explore
+        different selection criteria.
+        """
+        metrics_df = self.compute_tagging_metrics(
+            unit_index=unit_index,
+            baseline_window=baseline_window,
+            latency_window=latency_window,
+            salt_dt=salt_dt,
+            per_pulse=per_pulse,
+            remove_artefacts=remove_artefacts,
+            removal_window=removal_window,
+            align_to_event=align_to_event,
+        )
+        if metrics_df.empty:
+            self.tagged_df = metrics_df
+            return metrics_df
+        return self.select_tagged_units(
+            metrics_df,
+            alpha=alpha,
+            effect_ratio=effect_ratio,
+            min_abs_increase=min_abs_increase,
+            min_reliability=min_reliability,
+            max_latency=max_latency,
+            max_jitter=max_jitter,
+        )
 
     def plot_waveform_mean(self, unit_id, save_path="/root/capsule/scratch/", save_formats=["eps"]):
         """
