@@ -741,9 +741,13 @@ class OpticalTagging:
         stored as a tuple (in-memory) or a string (after a CSV round-trip).
         """
         from ast import literal_eval
+        import re
 
         def _as_tuple(c):
             if isinstance(c, str):
+                # Strip numpy scalar wrappers, e.g. "np.float64(1.0)" -> "1.0",
+                # so older CSVs (saved before native-type storage) still parse.
+                c = re.sub(r"np\.\w+\(([^()]*)\)", r"\1", c)
                 try:
                     c = literal_eval(c)
                 except (ValueError, SyntaxError):
@@ -2184,7 +2188,12 @@ class OpticalTagging:
                         continue
                     row = {
                         "session": self.session_name,
-                        "condition": cond,
+                        # Store the condition with native Python types so the
+                        # CSV round-trips cleanly (no "np.float64(...)" wrappers).
+                        "condition": (
+                            float(pwr_cond), float(loc_cond), str(lname_cond),
+                            float(cycle_cond), float(freq_cond), float(pdur_cond),
+                        ),
                         "unit_id": unit,
                         "pulse_index": pidx_label,
                     }
