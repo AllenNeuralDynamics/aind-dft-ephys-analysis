@@ -457,10 +457,122 @@ def get_fitted_model_names(
 
 
 
+# ============================================================
+# Local model-fit store
+# ------------------------------------------------------------
+# Fits produced locally (see the local model-fitting notebook) are
+# cached on disk so the behavior summary can use them *by default*
+# instead of the remote MLE pipeline, whose latent variables can be
+# degenerate for some model variants (e.g. all-zero q_value).
+# ============================================================
+DEFAULT_LOCAL_FIT_DIR = Path("/root/capsule/scratch/local_model_fitting")
+
+
+def _json_sanitize(x: Any) -> Any:
+    """Best-effort conversion to JSON-serializable types."""
+    if isinstance(x, (str, int, float, bool)) or x is None:
+        return x
+    if isinstance(x, (list, tuple)):
+        return [_json_sanitize(v) for v in x]
+    if isinstance(x, dict):
+        return {str(k): _json_sanitize(v) for k, v in x.items()}
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, (np.floating,)):
+        return float(x)
+    if isinstance(x, (np.bool_,)):
+        return bool(x)
+    return str(x)
+
+
+def _local_fit_path(
+    session_name: str,
+    model_alias: str,
+    local_dir: Optional[Union[str, Path]] = None,
+) -> Path:
+    """Return the canonical JSON path for a locally-saved fit.
+
+    Layout: ``<local_dir>/<session_core>/<model_alias>.json``
+    """
+    base = Path(local_dir) if local_dir is not None else DEFAULT_LOCAL_FIT_DIR
+    core = extract_session_name_core(session_name) or session_name
+    core = str(core).replace(".nwb", "")
+    safe_alias = str(model_alias).replace("/", "_").replace(os.sep, "_")
+    return base / core / f"{safe_alias}.json"
+
+
+def save_local_fitted_latent(
+    session_name: str,
+    model_alias: str,
+    fit_dict: Dict[str, Any],
+    local_dir: Optional[Union[str, Path]] = None,
+) -> Path:
+    """Persist a locally-computed fit so it can be reused by the behavior summary.
+
+    Parameters
+    ----------
+    session_name : str
+        NWB session name, e.g. ``"744329_2024-11-25_12-13-37.nwb"``.
+    model_alias : str
+        Model alias (must match the alias used in the behavior summary).
+    fit_dict : dict
+        Dict with at least ``"params"`` and ``"fitted_latent_variables"`` keys
+        (same structure returned by :func:`get_fitted_latent`).
+    local_dir : str or Path, optional
+        Root directory of the local fit store.
+
+    Returns
+    -------
+    pathlib.Path
+        The file path that was written.
+    """
+    path = _local_fit_path(session_name, model_alias, local_dir=local_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "session_name": session_name,
+        "model_alias": model_alias,
+        "params": fit_dict.get("params"),
+        "fitted_latent_variables": fit_dict.get("fitted_latent_variables"),
+    }
+    with path.open("w") as f:
+        json.dump(_json_sanitize(payload), f, indent=2)
+    return path
+
+
+def load_local_fitted_latent(
+    session_name: str,
+    model_alias: str,
+    local_dir: Optional[Union[str, Path]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Load a locally-saved fit, or ``None`` if it does not exist.
+
+    Returns a dict shaped like :func:`get_fitted_latent`'s output:
+    ``{"params": ..., "fitted_latent_variables": ..., "results": ...}``.
+    """
+    path = _local_fit_path(session_name, model_alias, local_dir=local_dir)
+    if not path.exists():
+        return None
+    try:
+        with path.open("r") as f:
+            payload = json.load(f)
+    except Exception as e:
+        print(f"[load_local_fitted_latent] Failed to read {path}: {e}")
+        return None
+    return {
+        "params": payload.get("params"),
+        "fitted_latent_variables": payload.get("fitted_latent_variables"),
+        "results": payload,
+    }
+
+
 def get_fitted_latent(
     session_name: str,
     model_alias: Optional[str] = None,
     *,
+    use_local: bool = True,
+    local_dir: Optional[Union[str, Path]] = None,
     max_retries: int = 3,
     base_delay: float = 2.0,
 ) -> Union[pd.DataFrame, Dict[str, Any], None]:
@@ -482,6 +594,13 @@ def get_fitted_latent(
         NWB session name, e.g. "744329_2024-11-25_12-13-37.nwb".
     model_alias : Optional[str]
         Model alias to filter for. If None, returns full DataFrame.
+    use_local : bool
+        If True (default), first look for a locally-saved fit
+        (see :func:`save_local_fitted_latent`) and return it when present,
+        before querying the remote MLE pipeline.
+    local_dir : str or Path, optional
+        Root directory of the local fit store. Defaults to
+        :data:`DEFAULT_LOCAL_FIT_DIR`.
     max_retries : int
         Max retry attempts for network-related errors when fetching results.
     base_delay : float
@@ -508,6 +627,17 @@ def get_fitted_latent(
     # ------------------------------------------------------------
     if not session_name:
         raise ValueError("The 'session_name' parameter cannot be empty.")
+
+    # ------------------------------------------------------------
+    # Prefer a locally-saved fit if present (offline / corrected fits).
+    # This is the default so the behavior summary uses local results
+    # instead of the remote MLE pipeline.
+    # ------------------------------------------------------------
+    if model_alias is not None and use_local:
+        local = load_local_fitted_latent(session_name, model_alias, local_dir=local_dir)
+        if local is not None:
+            print(f"[get_fitted_latent] Using LOCAL fit for '{model_alias}' ({session_name}).")
+            return local
 
     # ------------------------------------------------------------
     # Parse subject ID and session date from the session name

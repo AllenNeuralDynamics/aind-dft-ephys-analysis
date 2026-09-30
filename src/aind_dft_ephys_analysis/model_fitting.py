@@ -77,6 +77,101 @@ def fit_ctt_from_nwb(
     return forager
 
 
+def fit_forager_latent(
+    nwb: Any,
+    model_alias: str,
+    *,
+    clamp_params: Optional[Dict[str, Any]] = None,
+    workers: int = 4,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """
+    Fit an ``aind_dynamic_foraging_models`` forager (selected by ``agent_alias``)
+    from an in-memory NWB object and return its fitted latent variables.
+
+    The returned dict mirrors :func:`behavior_utils.get_fitted_latent`'s output
+    so it can be saved via :func:`behavior_utils.save_local_fitted_latent` and
+    reused by the behavior summary.
+
+    Parameters
+    ----------
+    nwb : object
+        In-memory NWB object (already loaded).
+    model_alias : str
+        Forager alias as listed in
+        ``ForagerCollection().get_all_foragers()['agent_alias']``,
+        e.g. ``"QLearning_L2F1_softmax"`` or ``"QLearning_L1F1_CK1_softmax"``.
+    clamp_params : dict, optional
+        Parameters to clamp during fitting.
+    workers : int
+        Number of workers for differential evolution.
+    seed : int
+        RNG seed for reproducibility.
+
+    Returns
+    -------
+    dict
+        ``{"model_alias", "params", "fitted_latent_variables",
+        "n_valid_trials", "results"}``. ``fitted_latent_variables`` typically
+        contains ``q_value``, ``choice_prob``, ``choice_kernel`` and ``rpe``.
+    """
+    import copy
+
+    df = nwb.trials.to_dataframe()
+
+    choice = df.animal_response.map({0: 0, 1: 1, 2: np.nan}).to_numpy(dtype=float)
+    reward = (df.rewarded_historyL | df.rewarded_historyR).to_numpy(dtype=bool)
+
+    keep = ~np.isnan(choice)
+    choice_valid = choice[keep].astype(int)
+    reward_valid = reward[keep].astype(int)
+
+    fc = ForagerCollection()
+    foragers_df = fc.get_all_foragers()
+
+    alias_map: Dict[str, Any] = {}
+    for _, row in foragers_df.iterrows():
+        alias = row["agent_alias"]
+        if pd.isna(alias):
+            continue
+        alias_map[str(alias)] = row["forager"]
+
+    if model_alias not in alias_map:
+        raise KeyError(
+            f"model_alias={model_alias!r} not found in ForagerCollection aliases. "
+            f"Available (first 20): {sorted(alias_map)[:20]}"
+        )
+
+    forager = copy.deepcopy(alias_map[model_alias])
+
+    DE_kwargs = dict(
+        workers=int(workers),
+        disp=False,
+        seed=np.random.default_rng(seed),
+    )
+
+    forager.fit(
+        choice_valid,
+        reward_valid,
+        clamp_params=clamp_params or {},
+        DE_kwargs=DE_kwargs,
+    )
+
+    result_dict = forager.get_fitting_result_dict()
+    params = result_dict.get("params", result_dict.get("fitted_params"))
+    latent = result_dict.get("fitted_latent_variables", {})
+
+    return {
+        "model_alias": model_alias,
+        "params": params,
+        "fitted_latent_variables": latent,
+        "n_valid_trials": int(len(choice_valid)),
+        "results": {
+            k: v for k, v in result_dict.items() if k != "fitted_latent_variables"
+        },
+    }
+
+
 def fit_q_learning_model(
     nwb_behavior_data,
     model_name: str = "q_learning_Y1"
