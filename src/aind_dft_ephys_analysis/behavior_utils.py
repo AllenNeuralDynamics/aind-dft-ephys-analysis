@@ -35,6 +35,7 @@ from general_utils import (
 from model_fitting import fit_q_learning_model
 from nwb_utils import NWBUtils
 from model_fitting import fit_ctt_from_nwb
+from model_fitting import fit_forager_latent
 
 
 def silent_get_mle_model_fitting(*args, **kwargs):
@@ -572,6 +573,10 @@ def get_fitted_latent(
     model_alias: Optional[str] = None,
     *,
     use_local: bool = True,
+    fit_if_missing: bool = True,
+    nwb: Optional[Any] = None,
+    fit_workers: int = 4,
+    fit_seed: int = 42,
     local_dir: Optional[Union[str, Path]] = None,
     max_retries: int = 3,
     base_delay: float = 2.0,
@@ -598,6 +603,18 @@ def get_fitted_latent(
         If True (default), first look for a locally-saved fit
         (see :func:`save_local_fitted_latent`) and return it when present,
         before querying the remote MLE pipeline.
+    fit_if_missing : bool
+        If True (default) and no local fit exists, fit the forager locally
+        on demand (via :func:`model_fitting.fit_forager_latent`), save it to
+        the local store, and return it. Only applies to aliases that map to a
+        ``ForagerCollection`` forager; other aliases fall back to remote.
+    nwb : object, optional
+        Pre-loaded behavior NWB to reuse for on-demand fitting. If None and a
+        fit is needed, the NWB is loaded via ``NWBUtils.read_behavior_nwb``.
+    fit_workers : int
+        Number of workers for on-demand differential-evolution fitting.
+    fit_seed : int
+        RNG seed for on-demand fitting.
     local_dir : str or Path, optional
         Root directory of the local fit store. Defaults to
         :data:`DEFAULT_LOCAL_FIT_DIR`.
@@ -638,6 +655,54 @@ def get_fitted_latent(
         if local is not None:
             print(f"[get_fitted_latent] Using LOCAL fit for '{model_alias}' ({session_name}).")
             return local
+
+    # ------------------------------------------------------------
+    # No local fit found: fit the model locally on demand and cache it,
+    # so subsequent calls reuse the saved result. Only attempt this for
+    # aliases that correspond to a fittable ForagerCollection forager;
+    # otherwise fall through to the remote MLE pipeline.
+    # ------------------------------------------------------------
+    if model_alias is not None and use_local and fit_if_missing:
+        try:
+            _nwb = nwb
+            if _nwb is None:
+                _nwb = NWBUtils.read_behavior_nwb(session_name=session_name)
+            if _nwb is None:
+                print(
+                    f"[get_fitted_latent] Could not load NWB for '{session_name}'; "
+                    "skipping on-demand local fit."
+                )
+            else:
+                print(
+                    f"[get_fitted_latent] No local fit for '{model_alias}'; "
+                    "fitting locally on demand ..."
+                )
+                fit_dict = fit_forager_latent(
+                    _nwb,
+                    model_alias,
+                    workers=fit_workers,
+                    seed=fit_seed,
+                )
+                saved_path = save_local_fitted_latent(
+                    session_name, model_alias, fit_dict, local_dir=local_dir
+                )
+                print(f"[get_fitted_latent] Saved local fit -> {saved_path}")
+                return {
+                    "params": fit_dict.get("params"),
+                    "fitted_latent_variables": fit_dict.get("fitted_latent_variables"),
+                    "results": fit_dict,
+                }
+        except KeyError:
+            # Alias is not a ForagerCollection forager -> use remote instead.
+            print(
+                f"[get_fitted_latent] '{model_alias}' is not a local forager; "
+                "falling back to the remote MLE pipeline."
+            )
+        except Exception as e:
+            print(
+                f"[get_fitted_latent] On-demand local fit for '{model_alias}' failed "
+                f"({type(e).__name__}: {e}); falling back to remote."
+            )
 
     # ------------------------------------------------------------
     # Parse subject ID and session date from the session name
@@ -1536,10 +1601,14 @@ def generate_behavior_summary(
         else:
             # Remote / archived model fits
             if alias not in remote_fit_cache:
-                # This calls get_fitted_latent(session_name, alias) ONCE
+                # This calls get_fitted_latent(session_name, alias) ONCE.
+                # By default it uses a local fit (loading it, or fitting
+                # locally on demand and caching it) and only falls back to
+                # the remote MLE pipeline when the alias is not a local forager.
                 remote_fit_cache[alias] = get_fitted_latent(
                     session_name=full_session_name,
-                    model_alias=alias
+                    model_alias=alias,
+                    nwb=nwb_data,
                 )
             fit_source = 'remote'
 
