@@ -503,6 +503,26 @@ def plot_raster_and_quantile_psth_by_latent(
         raise ValueError("`latent_trial_ids` contains duplicates; must be one-to-one.")
 
     # -----------------------------
+    # 1b) Exclude specified trials (e.g. optogenetics / laser-on) from all
+    #     downstream raster + PSTH computations. Enabled by default.
+    # -----------------------------
+    n_excluded = 0
+    exclude_applied = False
+    if exclude_trials and exclude_trial_ids is not None:
+        exclude_arr = np.asarray(list(exclude_trial_ids), dtype=np.int64)
+        if exclude_arr.size:
+            excl_mask = np.isin(latent_trial_ids, exclude_arr)
+            n_excluded = int(excl_mask.sum())
+            if n_excluded:
+                latent_trial_ids = latent_trial_ids[~excl_mask]
+                latent_values = latent_values[~excl_mask]
+                exclude_applied = True
+            if latent_trial_ids.size == 0:
+                raise ValueError(
+                    "All trials were excluded by `exclude_trial_ids`; nothing to plot."
+                )
+
+    # -----------------------------
     # 2) Load PSTH & raster subset
     # -----------------------------
     psth_da, raster_da = load_psth_raster_subset(
