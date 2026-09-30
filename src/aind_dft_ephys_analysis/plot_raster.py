@@ -19,6 +19,7 @@ import pandas as pd
 
 # Project-specific loader (assumed available in your environment)
 from create_psth import load_psth_raster_subset
+from behavior_utils import find_trials
 
 
 def plot_psth_raster_for_units(
