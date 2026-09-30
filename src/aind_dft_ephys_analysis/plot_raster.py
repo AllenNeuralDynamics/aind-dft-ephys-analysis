@@ -43,6 +43,8 @@ def plot_psth_raster_for_units(
     y_mode: Literal["auto_per_unit", "auto_global", "none"] = "auto_per_unit",
     y_pad: float = 0.05,
     group_name: Optional[Sequence[str]] = None,
+    exclude_trial_ids: Optional[Sequence[int]] = None,  # NEW: trials to drop (e.g. opto)
+    exclude_trials: bool = True,        # NEW: apply exclude_trial_ids (default on)
     show: bool = True,  # control whether to display figures
 ) -> None:
     """
@@ -233,6 +235,20 @@ def plot_psth_raster_for_units(
         raise ValueError(
             "After loading, none of the requested trial groups have matching trials."
         )
+
+    # Exclude specified trials (e.g. optogenetics / laser-on) from every group.
+    if exclude_trials and exclude_trial_ids is not None:
+        exclude_arr = _to_1d_int(exclude_trial_ids)
+        if exclude_arr.size:
+            trial_groups = {
+                k: np.setdiff1d(v, exclude_arr, assume_unique=False)
+                for k, v in trial_groups.items()
+            }
+            trial_groups = {k: v for k, v in trial_groups.items() if v.size > 0}
+            if len(trial_groups) == 0:
+                raise ValueError(
+                    "After excluding `exclude_trial_ids`, no trial groups remain."
+                )
 
     # Colors
     cmap = plt.rcParams["axes.prop_cycle"].by_key()["color"]
