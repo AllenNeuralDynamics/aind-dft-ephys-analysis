@@ -258,7 +258,6 @@ def plot_psth_raster_for_units(
         except IndexError:
             # Skip units not present in the dataset
             continue
-        pos = int(where[0])
 
         unit_psth = psth_da.isel(unit=pos)
         unit_raster = raster_da.isel(unit=pos)
