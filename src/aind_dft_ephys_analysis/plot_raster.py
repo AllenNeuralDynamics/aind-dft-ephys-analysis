@@ -392,6 +392,9 @@ def plot_raster_and_quantile_psth_by_latent(
     show: bool = True,                  # control figure display
     overwrite: bool = True,             # overwrite existing figure files
     min_trial_rate: float = 0,        # NEW: include only trials with mean rate > this
+    exclude_trial_ids: Optional[Sequence[int]] = None,  # NEW: trials to drop (e.g. opto)
+    exclude_trials: bool = True,        # NEW: apply exclude_trial_ids (default on)
+    exclude_label: str = "opto",        # NEW: title annotation for excluded trials
     save_format: Union[str, Sequence[str]] = ["png","eps"],
 ) -> None:
     """
@@ -796,7 +799,8 @@ def plot_raster_and_quantile_psth_by_latent(
             ax_rast.axvline(0.0, color="k", ls="--", lw=0.8)
 
             ttl = f"{title_prefix} Unit {unit}" if title_prefix else f"Unit {unit}"
-            ax_rast.set_title(f"{ttl} (sorted {order_str}; rate>{min_trial_rate})")
+            excl_note = f"; {exclude_label} excluded (n={n_excluded})" if exclude_applied else ""
+            ax_rast.set_title(f"{ttl} (sorted {order_str}; rate>{min_trial_rate}{excl_note})")
             ax_rast.set_ylabel("Trials (sorted by latent)")
 
             # -----------------------------
