@@ -237,14 +237,20 @@ def plot_psth_raster_for_units(
         )
 
     # Exclude specified trials (e.g. optogenetics / laser-on) from every group.
+    n_excluded = 0
+    exclude_applied = False
     if exclude_trials and exclude_trial_ids is not None:
         exclude_arr = _to_1d_int(exclude_trial_ids)
         if exclude_arr.size:
+            before = int(sum(int(v.size) for v in trial_groups.values()))
             trial_groups = {
                 k: np.setdiff1d(v, exclude_arr, assume_unique=False)
                 for k, v in trial_groups.items()
             }
             trial_groups = {k: v for k, v in trial_groups.items() if v.size > 0}
+            after = int(sum(int(v.size) for v in trial_groups.values()))
+            n_excluded = before - after
+            exclude_applied = n_excluded > 0
             if len(trial_groups) == 0:
                 raise ValueError(
                     "After excluding `exclude_trial_ids`, no trial groups remain."
@@ -299,7 +305,8 @@ def plot_psth_raster_for_units(
 
         ax_rast.axvline(0, color="k", ls="--", lw=0.8)
         ax_rast.set_ylabel("Trial")
-        ax_rast.set_title(f"Unit {unit}")
+        excl_note = f" (opto excluded, n={n_excluded})" if exclude_applied else ""
+        ax_rast.set_title(f"Unit {unit}{excl_note}")
 
         # PSTH (single-trial or mean ± SEM)
         unit_max = 0.0
