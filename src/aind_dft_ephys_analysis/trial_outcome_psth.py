@@ -240,7 +240,7 @@ def plot_population_psth(
     ax.set_ylabel("Firing rate (Hz)")
     ax.set_title(
         f"Population PSTH {contrast.label_a} vs {contrast.label_b}, "
-        f"{pop.n_units} tagged units{_excl_note(exclude_opto, opto_n)}"
+        f"{pop.n_units} units{_excl_note(exclude_opto, opto_n)}"
     )
     ax.legend(frameon=False)
     fig.tight_layout()
@@ -293,7 +293,7 @@ def plot_scatter(
     ax.set_xlabel(f"{contrast.label_a} rate (Hz)  [{scatter_win[0]}-{scatter_win[1]} s]")
     ax.set_ylabel(f"{contrast.label_b} rate (Hz)  [{scatter_win[0]}-{scatter_win[1]} s]")
     ax.set_title(
-        f"{contrast.label_a} vs {contrast.label_b}, {n_units} tagged units"
+        f"{contrast.label_a} vs {contrast.label_b}, {n_units} units"
         f"{_excl_note(exclude_opto, opto_n)}"
     )
     ax.legend(frameon=False)
