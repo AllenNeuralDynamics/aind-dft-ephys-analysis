@@ -597,6 +597,105 @@ def plot_axis_traces(
     return fig, ax
 
 
+def plot_reward_stim_outcomes(
+    res: AxisResult,
+    cond_trial_ids: Sequence[int],
+    nwb,
+    *,
+    stim_label: str = "stim",
+    show_reference: bool = True,
+    save_path: Optional[str] = None,
+    show: bool = True,
+    figsize: Tuple[float, float] = (11, 4),
+):
+    """
+    Reward-axis projection of stimulation trials split by outcome.
+
+    Plots three stim groups projected onto the reward CD — **reward**,
+    **no-reward**, and **all** (reward + no-reward) — all with no-response
+    trials excluded (they have no outcome). Left panel = fit-window projection
+    strip; right panel = time-resolved mean ± SEM. When ``show_reference`` is
+    True the unstim reward / no-reward poles are drawn as faint references.
+    """
+    import matplotlib.pyplot as plt
+
+    cond = np.asarray(cond_trial_ids, dtype=np.int64)
+    rew = set(int(t) for t in find_trials(nwb, "rewarded"))
+    unrew = set(int(t) for t in find_trials(nwb, "unrewarded"))
+    resp = set(int(t) for t in find_trials(nwb, "response"))
+
+    ids_reward = np.array(sorted(t for t in cond if int(t) in rew), dtype=np.int64)
+    ids_noreward = np.array(sorted(t for t in cond if int(t) in unrew), dtype=np.int64)
+    ids_all = np.array(sorted(t for t in cond if int(t) in resp), dtype=np.int64)
+
+    groups = [
+        (ids_reward, "stim reward", "tab:green"),
+        (ids_noreward, "stim no-reward", "tab:orange"),
+        (ids_all, "stim all", "tab:gray"),
+    ]
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=figsize)
+
+    # -- left: fit-window projection strip --------------------------------
+    rng = np.random.RandomState(0)
+    for i, (ids, nm, col) in enumerate(groups):
+        _, vals = res.project(ids)
+        if vals.size == 0:
+            continue
+        axL.scatter(np.full(vals.size, i) + rng.uniform(-0.09, 0.09, vals.size),
+                    vals, s=14, alpha=0.45, color=col)
+        axL.hlines(np.nanmean(vals), i - 0.22, i + 0.22, color=col, lw=2.5)
+    if show_reference:
+        axL.axhline(res.mean_engaged, color="tab:blue", ls="--", lw=0.9,
+                    label=f"unstim {res.label_engaged}")
+        axL.axhline(res.mean_diseng, color="tab:red", ls="--", lw=0.9,
+                    label=f"unstim {res.label_diseng}")
+        axL.legend(frameon=False, fontsize=7, loc="best")
+    axL.set_xticks(range(len(groups)))
+    axL.set_xticklabels([g[1] for g in groups], rotation=12)
+    axL.set_ylabel(f"CD projection  ({res.label_diseng} +, {res.label_engaged} −)")
+    axL.set_title(f"reward axis — d'={res.dprime:.2f}, AUC={res.auc:.2f}")
+
+    # -- right: time-resolved mean ± SEM ----------------------------------
+    def mean_sem(ids):
+        _, tr = res.project_traces(ids)
+        if tr.size == 0:
+            return None, None
+        return np.nanmean(tr, axis=0), np.nanstd(tr, axis=0) / np.sqrt(max(tr.shape[0], 1))
+
+    t = res.time
+    for ids, nm, col in groups:
+        m, sem = mean_sem(ids)
+        if m is None:
+            continue
+        axR.plot(t, m, color=col, label=f"{nm} (n={ids.size})")
+        axR.fill_between(t, m - sem, m + sem, color=col, alpha=0.18)
+    if show_reference:
+        for ids, nm, col in [
+            (res.ids_engaged, f"unstim {res.label_engaged}", "tab:blue"),
+            (res.ids_diseng, f"unstim {res.label_diseng}", "tab:red"),
+        ]:
+            m, sem = mean_sem(ids)
+            if m is None:
+                continue
+            axR.plot(t, m, color=col, ls="--", lw=1.0, alpha=0.7, label=nm)
+    axR.axvline(0, color="k", ls="--", lw=0.8)
+    axR.set_xlabel(f"Time from {res.align} (s)")
+    axR.set_ylabel("CD projection")
+    axR.set_title("reward axis — time-resolved")
+    axR.legend(frameon=False, fontsize=7)
+
+    fig.suptitle(f"{stim_label} — reward-axis projection by outcome", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, (axL, axR)
+
+
 def plot_trace_grid(
     axis_cache: dict,
     stim_conditions: dict,
@@ -676,6 +775,114 @@ def plot_trace_grid(
 
     fig.suptitle(
         f"Time-resolved projection — axis={axis_name}, stim condition {condition}",
+        fontsize=11,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, axes
+
+
+def plot_reward_outcome_grid(
+    axis_cache: dict,
+    stim_conditions: dict,
+    *,
+    condition,
+    sel_order: Sequence[str],
+    window_order: Sequence[str],
+    axis_name: str = "reward",
+    stim_label: Optional[str] = None,
+    nwb=None,
+    show_reference: bool = True,
+    sharey: bool = True,
+    save_path: Optional[str] = None,
+    show: bool = True,
+    figsize: Optional[Tuple[float, float]] = None,
+):
+    """
+    Swept version of :func:`plot_reward_stim_outcomes` (grid analog of 7b).
+
+    One combined figure for a single stim ``condition`` on the reward axis:
+    rows are unit selections, columns are fit windows. Each panel shows the
+    time-resolved mean ± SEM projection for the stim trials split by outcome —
+    **reward**, **no-reward**, and **all** (reward + no-reward) — all with
+    no-response trials excluded. When ``show_reference`` is True the unstim
+    reward / no-reward poles are overlaid as faint dashed traces.
+    """
+    import matplotlib.pyplot as plt
+
+    if nwb is None:
+        raise ValueError("plot_reward_outcome_grid needs nwb to split outcomes.")
+
+    sel_order = list(sel_order)
+    window_order = list(window_order)
+    nrow, ncol = len(sel_order), len(window_order)
+    if figsize is None:
+        figsize = (3.4 * ncol, 2.7 * nrow)
+    slabel = stim_label if stim_label is not None else f"stim (cond {condition})"
+
+    cond = np.asarray(stim_conditions.get(condition, []), dtype=np.int64)
+    rew = set(int(t) for t in find_trials(nwb, "rewarded"))
+    unrew = set(int(t) for t in find_trials(nwb, "unrewarded"))
+    resp = set(int(t) for t in find_trials(nwb, "response"))
+    ids_reward = np.array(sorted(t for t in cond if int(t) in rew), dtype=np.int64)
+    ids_noreward = np.array(sorted(t for t in cond if int(t) in unrew), dtype=np.int64)
+    ids_all = np.array(sorted(t for t in cond if int(t) in resp), dtype=np.int64)
+    groups = [
+        (ids_reward, f"reward (n={ids_reward.size})", "tab:green"),
+        (ids_noreward, f"no-reward (n={ids_noreward.size})", "tab:orange"),
+        (ids_all, f"all (n={ids_all.size})", "tab:gray"),
+    ]
+
+    fig, axes = plt.subplots(nrow, ncol, figsize=figsize, sharex=True, sharey=sharey, squeeze=False)
+
+    def mean_sem(res, ids):
+        _, tr = res.project_traces(ids)
+        if tr.size == 0:
+            return None, None
+        return np.nanmean(tr, axis=0), np.nanstd(tr, axis=0) / np.sqrt(max(tr.shape[0], 1))
+
+    for r, sel in enumerate(sel_order):
+        for c, win in enumerate(window_order):
+            ax = axes[r][c]
+            res = axis_cache.get((sel, win, axis_name))
+            if res is None:
+                ax.text(0.5, 0.5, "n/a", ha="center", va="center",
+                        transform=ax.transAxes, color="0.6")
+                ax.set_xticks([]); ax.set_yticks([])
+            else:
+                t = res.time
+                for ids, nm, col in groups:
+                    m, sem = mean_sem(res, ids)
+                    if m is None:
+                        continue
+                    ax.plot(t, m, color=col, lw=1.2, label=nm)
+                    ax.fill_between(t, m - sem, m + sem, color=col, alpha=0.18)
+                if show_reference:
+                    for ids, nm, col in [
+                        (res.ids_engaged, f"unstim {res.label_engaged}", "tab:blue"),
+                        (res.ids_diseng, f"unstim {res.label_diseng}", "tab:red"),
+                    ]:
+                        m, sem = mean_sem(res, ids)
+                        if m is None:
+                            continue
+                        ax.plot(t, m, color=col, ls="--", lw=1.0, alpha=0.6, label=nm)
+                ax.axvline(0, color="k", ls="--", lw=0.7)
+                if r == 0 and c == ncol - 1:
+                    ax.legend(frameon=False, fontsize=7, loc="best")
+            if r == 0:
+                ax.set_title(win, fontsize=9)
+            if c == 0:
+                ax.set_ylabel(f"{sel}\nCD proj", fontsize=8)
+            if r == nrow - 1:
+                ax.set_xlabel("Time from go cue (s)", fontsize=8)
+
+    fig.suptitle(
+        f"Reward-axis projection by outcome — {slabel}",
         fontsize=11,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.97))
