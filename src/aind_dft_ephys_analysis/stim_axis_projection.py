@@ -51,11 +51,37 @@ AXES: Dict[str, Dict[str, str]] = {
 }
 
 
-def resolve_axis(name: str) -> Dict[str, str]:
-    """Return the axis spec dict for ``name`` (adds a 'name' key)."""
+def _flip_axis(spec: Dict[str, str]) -> Dict[str, str]:
+    """Reverse a resolved axis spec (swap class A/B, labels, and engaged pole)."""
+    out = dict(spec)
+    out["type_a"], out["type_b"] = spec["type_b"], spec["type_a"]
+    out["label_a"], out["label_b"] = spec["label_b"], spec["label_a"]
+    out["engaged"] = "a" if spec.get("engaged", "a") == "b" else "b"
+    return out
+
+
+def resolve_axis(name: str, sign: str = "positive") -> Dict[str, str]:
+    """
+    Return the axis spec dict for ``name`` (adds a 'name' key).
+
+    ``sign`` selects the CD orientation (CD = class A - class B):
+      - ``"positive"`` (default): disengaged / no-reward pole is positive, i.e.
+        ``no_response - response`` and ``no_reward - reward``.
+      - ``"negative"``: engaged / reward pole is positive, i.e.
+        ``response - no_response`` and ``reward - no_reward`` (classes swapped).
+
+    Pole-referenced stats (disengagement index, d', AUC) are unchanged by the
+    sign; only the raw-projection orientation flips.
+    """
     if name not in AXES:
         raise KeyError(f"Unknown axis {name!r}; choose from {list(AXES)}.")
-    return dict(name=name, **AXES[name])
+    spec = dict(name=name, **AXES[name])
+    s = str(sign).lower()
+    if s in ("negative", "neg", "engaged", "reward", "-"):
+        return _flip_axis(spec)
+    if s in ("positive", "pos", "disengaged", "+"):
+        return spec
+    raise ValueError(f"Unknown sign {sign!r}; use 'positive' or 'negative'.")
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +337,7 @@ def build_axis(
     exclude_trial_ids: Optional[Sequence[int]] = None,
     zscore_units: bool = False,
     random_state: int = 0,
+    cd_sign: str = "positive",
 ) -> AxisResult:
     """
     Fit a coding direction on **unstimulated** trials for the given contrast.
@@ -334,8 +361,14 @@ def build_axis(
         Per-unit z-score inside the CD fit (default False = raw-rate CD).
     random_state : int
         Seed for the balanced half-split.
+    cd_sign : {"positive", "negative"}
+        CD orientation. ``"positive"`` (default) puts the disengaged / no-reward
+        pole on the positive axis (``no_response - response``,
+        ``no_reward - reward``); ``"negative"`` flips it to the engaged / reward
+        pole (``response - no_response``, ``reward - no_reward``). Pole-referenced
+        stats are unchanged; only the raw-projection orientation flips.
     """
-    axis = resolve_axis(axis_name)
+    axis = resolve_axis(axis_name, cd_sign)
     avail = set(int(t) for t in _psth_trial_ids(psth, align))
 
     # Snap sub-bin windows to the nearest PSTH bin so coarse PSTHs (e.g. 0.2 s
