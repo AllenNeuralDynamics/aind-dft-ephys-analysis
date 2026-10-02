@@ -152,6 +152,32 @@ def _psth_trial_ids(psth, align: str) -> np.ndarray:
     raise KeyError("No 'trial_index_<align>' coordinate found in the PSTH.")
 
 
+def _snap_window(psth, window, *, verbose: bool = True):
+    """
+    Return a time window guaranteed to contain >= 1 PSTH sample.
+
+    If ``window`` already captures at least one bin (``time >= t0 & time < t1``)
+    it is returned unchanged. Otherwise (e.g. a sub-bin window on a coarse PSTH)
+    it is snapped to the single bin nearest the window midpoint, using the median
+    bin width to set the returned edges. Returns ``(snapped_window, n_bins)``.
+    """
+    time = np.asarray(psth["time"].values, dtype=float)
+    t0, t1 = float(window[0]), float(window[1])
+    n = int(((time >= t0) & (time < t1)).sum())
+    if n >= 1:
+        return (t0, t1), n
+    mid = 0.5 * (t0 + t1)
+    j = int(np.argmin(np.abs(time - mid)))
+    dt = float(np.median(np.diff(time))) if time.size >= 2 else 1.0
+    lo, hi = float(time[j] - dt / 2.0), float(time[j] + dt / 2.0)
+    if verbose:
+        print(
+            f"  [snap] window {tuple(window)} spans no PSTH bin (bin width ~{dt:.3g}s); "
+            f"using nearest bin centered at {time[j]:.3g}s -> ({lo:.3g}, {hi:.3g})"
+        )
+    return (lo, hi), 1
+
+
 # ---------------------------------------------------------------------------
 # Result container
 # ---------------------------------------------------------------------------
@@ -242,6 +268,13 @@ def build_axis(
     """
     axis = resolve_axis(axis_name)
     avail = set(int(t) for t in _psth_trial_ids(psth, align))
+
+    # Snap sub-bin windows to the nearest PSTH bin so coarse PSTHs (e.g. 0.2 s
+    # bins) don't silently select zero samples and abort the CD fit.
+    fit_window, _ = _snap_window(psth, fit_window)
+    if proj_window is not None:
+        proj_window, _ = _snap_window(psth, proj_window)
+
     if exclude_trial_ids is None:
         excl = set(int(t) for t in laser_trial_ids(nwb))
     else:
@@ -469,6 +502,91 @@ def plot_axis_traces(
     else:
         plt.close(fig)
     return fig, ax
+
+
+def plot_trace_grid(
+    axis_cache: dict,
+    stim_conditions: dict,
+    *,
+    axis_name: str,
+    condition,
+    sel_order: Sequence[str],
+    window_order: Sequence[str],
+    stim_label: Optional[str] = None,
+    sharey: bool = True,
+    save_path: Optional[str] = None,
+    show: bool = True,
+    figsize: Optional[Tuple[float, float]] = None,
+):
+    """
+    Grid of time-resolved CD projections across unit-selection x fit-window.
+
+    One combined figure for a single ``axis_name`` and stim ``condition``: rows
+    are unit selections, columns are fit windows. Each panel shows mean ± SEM
+    traces for unstim class A, unstim class B and the stimulation trials, reusing
+    the per-combo :class:`AxisResult` objects stored in ``axis_cache`` (keyed by
+    ``(selection, window_label, axis_name)``).
+    """
+    import matplotlib.pyplot as plt
+
+    sel_order = list(sel_order)
+    window_order = list(window_order)
+    nrow, ncol = len(sel_order), len(window_order)
+    if figsize is None:
+        figsize = (3.4 * ncol, 2.7 * nrow)
+    cond_ids = np.asarray(stim_conditions.get(condition, []), dtype=np.int64)
+    slabel = stim_label if stim_label is not None else f"stim (cond {condition})"
+
+    fig, axes = plt.subplots(nrow, ncol, figsize=figsize, sharex=True, sharey=sharey, squeeze=False)
+
+    def mean_sem(res, ids):
+        _, tr = res.project_traces(ids)
+        if tr.size == 0:
+            return None, None
+        return np.nanmean(tr, axis=0), np.nanstd(tr, axis=0) / np.sqrt(max(tr.shape[0], 1))
+
+    for r, sel in enumerate(sel_order):
+        for c, win in enumerate(window_order):
+            ax = axes[r][c]
+            res = axis_cache.get((sel, win, axis_name))
+            if res is None:
+                ax.text(0.5, 0.5, "n/a", ha="center", va="center",
+                        transform=ax.transAxes, color="0.6")
+                ax.set_xticks([]); ax.set_yticks([])
+            else:
+                t = res.time
+                for ids, nm, col in [
+                    (res.ids_a, res.axis["label_a"], "tab:blue"),
+                    (res.ids_b, res.axis["label_b"], "tab:red"),
+                    (cond_ids, slabel, "tab:green"),
+                ]:
+                    m, sem = mean_sem(res, ids)
+                    if m is None:
+                        continue
+                    ax.plot(t, m, color=col, lw=1.2, label=nm)
+                    ax.fill_between(t, m - sem, m + sem, color=col, alpha=0.18)
+                ax.axvline(0, color="k", ls="--", lw=0.7)
+                if r == 0 and c == ncol - 1:
+                    ax.legend(frameon=False, fontsize=7, loc="best")
+            if r == 0:
+                ax.set_title(win, fontsize=9)
+            if c == 0:
+                ax.set_ylabel(f"{sel}\nCD proj", fontsize=8)
+            if r == nrow - 1:
+                ax.set_xlabel("Time from go cue (s)", fontsize=8)
+
+    fig.suptitle(
+        f"Time-resolved projection — axis={axis_name}, stim condition {condition}",
+        fontsize=11,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, axes
 
 
 def plot_sweep_summary(
