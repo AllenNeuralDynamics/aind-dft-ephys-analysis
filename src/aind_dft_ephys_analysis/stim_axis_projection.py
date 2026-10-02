@@ -76,6 +76,25 @@ def responded_flags(nwb) -> np.ndarray:
     return (resp != 2).astype(int)
 
 
+def stim_ids_for_axis(nwb, axis_name, trial_ids, *, exclude_no_response=None) -> np.ndarray:
+    """
+    Filter a set of stimulation trials for projection onto a given axis.
+
+    No-response trials have no reward outcome, so they are meaningless on the
+    ``reward`` axis. When ``exclude_no_response`` is ``None`` (default) they are
+    dropped automatically for the reward axis and kept otherwise; pass a bool to
+    force the behaviour. Returns the (possibly reduced) trial ids.
+    """
+    ids = np.asarray(trial_ids, dtype=np.int64).ravel()
+    name = axis_name["name"] if isinstance(axis_name, dict) else str(axis_name)
+    drop = (name == "reward") if exclude_no_response is None else bool(exclude_no_response)
+    if not drop or ids.size == 0:
+        return ids
+    resp = responded_flags(nwb)
+    keep = [int(t) for t in ids if int(t) < resp.size and resp[int(t)] == 1]
+    return np.asarray(keep, dtype=np.int64)
+
+
 def select_units(
     nwb,
     psth,
@@ -398,7 +417,13 @@ def _auc_binary(labels01, scores) -> float:
     return float(u / (n1 * n0))
 
 
-def condition_shift(res: AxisResult, cond_trial_ids: Sequence[int], nwb) -> Dict:
+def condition_shift(
+    res: AxisResult,
+    cond_trial_ids: Sequence[int],
+    nwb,
+    *,
+    exclude_no_response=None,
+) -> Dict:
     """
     Quantify how far a stimulation condition shifts along the CD axis and
     whether that shift predicts behaviour on the stimulated trials.
@@ -413,6 +438,9 @@ def condition_shift(res: AxisResult, cond_trial_ids: Sequence[int], nwb) -> Dict
     """
     from scipy.stats import mannwhitneyu
 
+    cond_trial_ids = stim_ids_for_axis(
+        nwb, res.axis, cond_trial_ids, exclude_no_response=exclude_no_response
+    )
     tids, scal = res.project(cond_trial_ids)
     _, a_scal = res.project(res.ids_engaged)
     di = res.disengagement_index(scal)
@@ -456,12 +484,19 @@ def plot_axis_distributions(
     cond_trial_ids: Sequence[int],
     *,
     stim_label: str = "stim",
+    nwb=None,
+    exclude_no_response=None,
     save_path: Optional[str] = None,
     show: bool = True,
     figsize: Tuple[float, float] = (6, 4),
 ):
     """Strip plot of unstim-A, unstim-B and stim fit-window projections."""
     import matplotlib.pyplot as plt
+
+    if nwb is not None:
+        cond_trial_ids = stim_ids_for_axis(
+            nwb, res.axis, cond_trial_ids, exclude_no_response=exclude_no_response
+        )
 
     rng = np.random.RandomState(0)
     _, eng = res.project(res.ids_engaged)
@@ -497,12 +532,19 @@ def plot_axis_traces(
     cond_trial_ids: Sequence[int],
     *,
     stim_label: str = "stim",
+    nwb=None,
+    exclude_no_response=None,
     save_path: Optional[str] = None,
     show: bool = True,
     figsize: Tuple[float, float] = (6, 4),
 ):
     """Time-resolved mean ± SEM CD projection for unstim-A, unstim-B and stim."""
     import matplotlib.pyplot as plt
+
+    if nwb is not None:
+        cond_trial_ids = stim_ids_for_axis(
+            nwb, res.axis, cond_trial_ids, exclude_no_response=exclude_no_response
+        )
 
     def mean_sem(ids):
         _, tr = res.project_traces(ids)
@@ -546,6 +588,8 @@ def plot_trace_grid(
     sel_order: Sequence[str],
     window_order: Sequence[str],
     stim_label: Optional[str] = None,
+    nwb=None,
+    exclude_no_response=None,
     sharey: bool = True,
     save_path: Optional[str] = None,
     show: bool = True,
@@ -568,6 +612,10 @@ def plot_trace_grid(
     if figsize is None:
         figsize = (3.4 * ncol, 2.7 * nrow)
     cond_ids = np.asarray(stim_conditions.get(condition, []), dtype=np.int64)
+    if nwb is not None:
+        cond_ids = stim_ids_for_axis(
+            nwb, axis_name, cond_ids, exclude_no_response=exclude_no_response
+        )
     slabel = stim_label if stim_label is not None else f"stim (cond {condition})"
 
     fig, axes = plt.subplots(nrow, ncol, figsize=figsize, sharex=True, sharey=sharey, squeeze=False)
@@ -613,6 +661,93 @@ def plot_trace_grid(
         fontsize=11,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.97))
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, axes
+
+
+def plot_strip_grid(
+    axis_cache: dict,
+    stim_conditions: dict,
+    *,
+    axis_name: str,
+    condition,
+    sel_order: Sequence[str],
+    window_order: Sequence[str],
+    stim_label: Optional[str] = None,
+    nwb=None,
+    exclude_no_response=None,
+    sharey: bool = False,
+    save_path: Optional[str] = None,
+    show: bool = True,
+    figsize: Optional[Tuple[float, float]] = None,
+):
+    """
+    Grid of fit-window projection strip plots across unit-selection x fit-window.
+
+    One combined figure for a single ``axis_name`` and stim ``condition``: rows
+    are unit selections, columns are fit windows. Each panel is the strip plot
+    (engaged / disengaged / stim fit-window projections with mean bars) that
+    :func:`plot_axis_distributions` draws, reusing the per-combo
+    :class:`AxisResult` objects in ``axis_cache`` (keyed by
+    ``(selection, window_label, axis_name)``).
+    """
+    import matplotlib.pyplot as plt
+
+    sel_order = list(sel_order)
+    window_order = list(window_order)
+    nrow, ncol = len(sel_order), len(window_order)
+    if figsize is None:
+        figsize = (3.1 * ncol, 2.7 * nrow)
+    cond_ids = np.asarray(stim_conditions.get(condition, []), dtype=np.int64)
+    if nwb is not None:
+        cond_ids = stim_ids_for_axis(
+            nwb, axis_name, cond_ids, exclude_no_response=exclude_no_response
+        )
+    slabel = stim_label if stim_label is not None else f"stim (cond {condition})"
+    rng = np.random.RandomState(0)
+
+    fig, axes = plt.subplots(nrow, ncol, figsize=figsize, sharex=True, sharey=sharey, squeeze=False)
+
+    for r, sel in enumerate(sel_order):
+        for c, win in enumerate(window_order):
+            ax = axes[r][c]
+            res = axis_cache.get((sel, win, axis_name))
+            if res is None:
+                ax.text(0.5, 0.5, "n/a", ha="center", va="center",
+                        transform=ax.transAxes, color="0.6")
+                ax.set_xticks([]); ax.set_yticks([])
+            else:
+                _, eng = res.project(res.ids_engaged)
+                _, dis = res.project(res.ids_diseng)
+                _, s = res.project(cond_ids)
+                for i, (vals, col) in enumerate(
+                    [(eng, "tab:blue"), (dis, "tab:red"), (s, "tab:green")]
+                ):
+                    if vals.size == 0:
+                        continue
+                    ax.scatter(np.full(vals.size, i) + rng.uniform(-0.09, 0.09, vals.size),
+                               vals, s=9, alpha=0.35, color=col)
+                    ax.hlines(np.nanmean(vals), i - 0.22, i + 0.22, color=col, lw=2.2)
+                ax.set_xticks(range(3))
+                ax.set_xticklabels(["eng", "diseng", "stim"], fontsize=7)
+                ax.set_title(f"d'={res.dprime:.2f}", fontsize=7)
+            if r == 0:
+                ax.annotate(win, xy=(0.5, 1.12), xycoords="axes fraction",
+                            ha="center", va="bottom", fontsize=9)
+            if c == 0:
+                ax.set_ylabel(f"{sel}\nCD proj", fontsize=8)
+
+    fig.suptitle(
+        f"Fit-window projections — axis={axis_name}, stim condition {condition} "
+        f"(blue=engaged, red=disengaged, green=stim)",
+        fontsize=11,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
     if save_path:
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
     if show:
