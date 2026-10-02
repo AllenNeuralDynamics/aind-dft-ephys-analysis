@@ -31,16 +31,22 @@ from behavior_utils import find_trials
 from ephys_dimension_reduction_CD import coding_direction_from_psth
 
 
-# Axis definitions: name -> (+1 class A type, -1 class B type, readable labels).
-# Class A is the "engaged/rewarded" pole, class B is the "disengaged/no-reward" pole.
+# Axis definitions: name -> (class A type, class B type, labels, engaged pole).
+# The CD is built as (class A - class B). We put the *disengaged / no-reward*
+# pole as class A so the axis is literally ``no_response - response`` and
+# ``no_reward - reward`` (positive projection = toward the disengaged pole).
+# ``engaged`` records which class ('a' or 'b') is the engaged/rewarded pole so
+# the disengagement index and stats keep a fixed meaning regardless of sign.
 AXES: Dict[str, Dict[str, str]] = {
     "response": dict(
-        type_a="response", type_b="no_response",
-        label_a="engaged (response)", label_b="disengaged (no-response)",
+        type_a="no_response", type_b="response",
+        label_a="disengaged (no-response)", label_b="engaged (response)",
+        engaged="b",
     ),
     "reward": dict(
-        type_a="rewarded", type_b="unrewarded",
-        label_a="reward", label_b="no-reward",
+        type_a="unrewarded", type_b="rewarded",
+        label_a="no-reward", label_b="reward",
+        engaged="b",
     ),
 }
 
@@ -196,11 +202,37 @@ class AxisResult:
     ids_b: np.ndarray                     # unstim class-B trial ids used for the fit
     proj_by_id: Dict[int, float]          # trial id -> scalar projection (fit window, unbiased)
     trace_by_id: Dict[int, np.ndarray]    # trial id -> time-resolved projection (unbiased)
-    mean_a: float                         # mean projection of unstim class A (engaged pole)
-    mean_b: float                         # mean projection of unstim class B (disengaged pole)
+    mean_a: float                         # mean projection of unstim class A (type_a pole)
+    mean_b: float                         # mean projection of unstim class B (type_b pole)
     dprime: float
     auc: float
+    engaged: str = "a"                     # which class ('a'/'b') is the engaged pole
     raw: Optional[dict] = field(repr=False, default=None)
+
+    # -- pole accessors (engaged vs disengaged, independent of CD sign) -----
+    @property
+    def ids_engaged(self) -> np.ndarray:
+        return self.ids_b if self.engaged == "b" else self.ids_a
+
+    @property
+    def ids_diseng(self) -> np.ndarray:
+        return self.ids_a if self.engaged == "b" else self.ids_b
+
+    @property
+    def mean_engaged(self) -> float:
+        return self.mean_b if self.engaged == "b" else self.mean_a
+
+    @property
+    def mean_diseng(self) -> float:
+        return self.mean_a if self.engaged == "b" else self.mean_b
+
+    @property
+    def label_engaged(self) -> str:
+        return self.axis["label_b"] if self.engaged == "b" else self.axis["label_a"]
+
+    @property
+    def label_diseng(self) -> str:
+        return self.axis["label_a"] if self.engaged == "b" else self.axis["label_b"]
 
     # -- projection lookups ------------------------------------------------
     def project(self, trial_ids: Sequence[int]) -> Tuple[np.ndarray, np.ndarray]:
@@ -218,12 +250,12 @@ class AxisResult:
         return tids, tr
 
     def disengagement_index(self, scal) -> np.ndarray:
-        """Rescale projections so 0 = engaged (A) pole, 1 = disengaged (B) pole."""
+        """Rescale projections so 0 = engaged pole, 1 = disengaged pole."""
         scal = np.asarray(scal, dtype=float)
-        denom = self.mean_b - self.mean_a
+        denom = self.mean_diseng - self.mean_engaged
         if abs(denom) < 1e-12:
             return np.full_like(scal, np.nan)
-        return (scal - self.mean_a) / denom
+        return (scal - self.mean_engaged) / denom
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +365,7 @@ def build_axis(
         mean_b=mean_b,
         dprime=float(res["metrics"]["overall"]["dprime"]),
         auc=float(res["metrics"]["overall"]["auc"]),
+        engaged=axis.get("engaged", "a"),
         raw=res,
     )
 
@@ -381,7 +414,7 @@ def condition_shift(res: AxisResult, cond_trial_ids: Sequence[int], nwb) -> Dict
     from scipy.stats import mannwhitneyu
 
     tids, scal = res.project(cond_trial_ids)
-    _, a_scal = res.project(res.ids_a)
+    _, a_scal = res.project(res.ids_engaged)
     di = res.disengagement_index(scal)
     a_di = res.disengagement_index(a_scal)
 
@@ -431,11 +464,11 @@ def plot_axis_distributions(
     import matplotlib.pyplot as plt
 
     rng = np.random.RandomState(0)
-    _, a = res.project(res.ids_a)
-    _, b = res.project(res.ids_b)
+    _, eng = res.project(res.ids_engaged)
+    _, dis = res.project(res.ids_diseng)
     _, s = res.project(cond_trial_ids)
-    groups = [a, b, s]
-    names = [res.axis["label_a"], res.axis["label_b"], stim_label]
+    groups = [eng, dis, s]
+    names = [res.label_engaged, res.label_diseng, stim_label]
     colors = ["tab:blue", "tab:red", "tab:green"]
 
     fig, ax = plt.subplots(figsize=figsize)
@@ -447,7 +480,7 @@ def plot_axis_distributions(
         ax.hlines(np.nanmean(vals), i - 0.22, i + 0.22, color=c, lw=2.5)
     ax.set_xticks(range(3))
     ax.set_xticklabels(names, rotation=12)
-    ax.set_ylabel(f"CD projection  ({res.axis['label_a']} +, {res.axis['label_b']} −)")
+    ax.set_ylabel(f"CD projection  ({res.label_diseng} +, {res.label_engaged} −)")
     ax.set_title(f"{res.axis['name']} axis — d'={res.dprime:.2f}, AUC={res.auc:.2f}")
     fig.tight_layout()
     if save_path:
@@ -480,8 +513,8 @@ def plot_axis_traces(
     t = res.time
     fig, ax = plt.subplots(figsize=figsize)
     for ids, nm, c in [
-        (res.ids_a, res.axis["label_a"], "tab:blue"),
-        (res.ids_b, res.axis["label_b"], "tab:red"),
+        (res.ids_engaged, res.label_engaged, "tab:blue"),
+        (res.ids_diseng, res.label_diseng, "tab:red"),
         (np.asarray(cond_trial_ids), stim_label, "tab:green"),
     ]:
         m, sem = mean_sem(ids)
@@ -556,8 +589,8 @@ def plot_trace_grid(
             else:
                 t = res.time
                 for ids, nm, col in [
-                    (res.ids_a, res.axis["label_a"], "tab:blue"),
-                    (res.ids_b, res.axis["label_b"], "tab:red"),
+                    (res.ids_engaged, res.label_engaged, "tab:blue"),
+                    (res.ids_diseng, res.label_diseng, "tab:red"),
                     (cond_ids, slabel, "tab:green"),
                 ]:
                     m, sem = mean_sem(res, ids)
