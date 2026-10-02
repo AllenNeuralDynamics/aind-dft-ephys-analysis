@@ -70,6 +70,77 @@ def responded_flags(nwb) -> np.ndarray:
     return (resp != 2).astype(int)
 
 
+def select_units(
+    nwb,
+    psth,
+    *,
+    use_tagged: bool = False,
+    probes: Optional[Sequence[str]] = None,
+    metrics_csv_path=None,
+    target_cond: Optional[Sequence] = None,
+    pulse_index: int = -1,
+) -> list:
+    """
+    Select units by combinable filters, mirroring the PSTH notebooks.
+
+    Starts from the default-QC units, then optionally keeps only opto-tagged
+    units (``use_tagged``) and/or only units on the given NWB ``device_name``
+    ``probes``. If both are set, a unit must satisfy BOTH. The result is
+    intersected with the units present in ``psth``.
+    """
+    device_names = np.asarray(nwb.units["device_name"][:]).astype(str)
+
+    from ephys_behavior import get_units_passed_default_qc
+
+    sel = set(int(u) for u in np.asarray(get_units_passed_default_qc(nwb), dtype=np.int64))
+
+    if use_tagged:
+        import re
+        import pandas as pd
+        from ast import literal_eval
+        from optical_tagging import select_tagged_units
+
+        if metrics_csv_path is None or target_cond is None:
+            raise ValueError("use_tagged=True requires metrics_csv_path and target_cond.")
+        tagged_df = select_tagged_units(
+            pd.read_csv(str(metrics_csv_path)),
+            alpha=0.05, effect_ratio=2.0, min_abs_increase=0.0,
+            min_reliability=0.2, max_latency=0.006, max_jitter=0.003, correction="fdr_bh",
+        )
+
+        def _as_tuple(c):
+            if isinstance(c, str):
+                c = re.sub(r"np\.\w+\(([^()]*)\)", r"\1", c)
+                try:
+                    c = literal_eval(c)
+                except (ValueError, SyntaxError):
+                    return None
+            return tuple(c) if isinstance(c, (tuple, list)) else None
+
+        _match_idx = [i for i in range(6) if i != 2]  # ignore laser_name (index 2)
+
+        def _matches(c):
+            c = _as_tuple(c)
+            return c is not None and len(c) == 6 and all(c[i] == target_cond[i] for i in _match_idx)
+
+        rows = tagged_df[
+            tagged_df["condition"].apply(_matches)
+            & (tagged_df["pulse_index"] == pulse_index)
+            & (tagged_df["tagged"] == True)
+        ]
+        sel &= set(int(u) for u in rows["unit_id"].unique())
+
+    if probes:
+        want = [str(p) for p in probes]
+        sel &= set(int(u) for u in np.where(np.isin(device_names, want))[0])
+
+    unit_ids = sorted(sel)
+    if "unit_index" in psth.coords:
+        pset = {int(u) for u in np.asarray(psth.coords["unit_index"].values)}
+        unit_ids = [u for u in unit_ids if u in pset]
+    return unit_ids
+
+
 def _psth_trial_ids(psth, align: str) -> np.ndarray:
     """Absolute trial IDs available in the PSTH for the chosen alignment."""
     coord = f"trial_index_{align}"
@@ -398,3 +469,79 @@ def plot_axis_traces(
     else:
         plt.close(fig)
     return fig, ax
+
+
+def plot_sweep_summary(
+    df,
+    *,
+    metric: str = "mean_di",
+    err: Optional[str] = "sem_di",
+    axis_order: Optional[Sequence[str]] = None,
+    window_order: Optional[Sequence[str]] = None,
+    sel_order: Optional[Sequence[str]] = None,
+    cond_order: Optional[Sequence] = None,
+    title: str = "Stim projection onto unstim CD — disengagement index",
+    save_path: Optional[str] = None,
+    show: bool = True,
+    figsize: Optional[Tuple[float, float]] = None,
+):
+    """
+    Collapse a full parameter sweep into one grid figure.
+
+    Expects a tidy DataFrame with columns ``axis``, ``window_label``,
+    ``selection``, ``condition`` and the ``metric`` (+ optional ``err``).
+    Grid: one row per axis, one column per fit window; within each panel the
+    x-axis is the unit selection and bars are grouped by stimulation condition.
+    Dashed guides mark the engaged (0) and disengaged (1) poles when plotting
+    the disengagement index.
+    """
+    import matplotlib.pyplot as plt
+
+    axis_order = list(axis_order) if axis_order is not None else sorted(df["axis"].unique())
+    window_order = list(window_order) if window_order is not None else list(dict.fromkeys(df["window_label"]))
+    sel_order = list(sel_order) if sel_order is not None else list(dict.fromkeys(df["selection"]))
+    cond_order = list(cond_order) if cond_order is not None else sorted(df["condition"].unique())
+
+    nrows, ncols = len(axis_order), len(window_order)
+    if figsize is None:
+        figsize = (3.6 * ncols, 3.1 * nrows)
+    fig, axs = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False, sharey=True)
+
+    cmap = plt.get_cmap("tab10")
+    x = np.arange(len(sel_order))
+    bw = 0.8 / max(len(cond_order), 1)
+    is_di = metric == "mean_di"
+
+    for r, ax_name in enumerate(axis_order):
+        for c, win in enumerate(window_order):
+            ax = axs[r][c]
+            sub = df[(df["axis"] == ax_name) & (df["window_label"] == win)]
+            for k, cond in enumerate(cond_order):
+                vals, errs = [], []
+                for s in sel_order:
+                    row = sub[(sub["selection"] == s) & (sub["condition"] == cond)]
+                    vals.append(float(row[metric].iloc[0]) if len(row) else np.nan)
+                    errs.append(float(row[err].iloc[0]) if (err and len(row)) else 0.0)
+                ax.bar(
+                    x + (k - (len(cond_order) - 1) / 2) * bw, vals, width=bw,
+                    yerr=errs, capsize=2, color=cmap(k), label=f"cond {cond}",
+                )
+            if is_di:
+                ax.axhline(0, color="tab:blue", ls="--", lw=0.8)
+                ax.axhline(1, color="tab:red", ls="--", lw=0.8)
+            ax.set_xticks(x)
+            ax.set_xticklabels(sel_order, rotation=30, ha="right", fontsize=8)
+            if c == 0:
+                ax.set_ylabel(f"{ax_name}\n{metric}")
+            if r == 0:
+                ax.set_title(win, fontsize=9)
+    axs[0][-1].legend(frameon=False, fontsize=7, loc="best")
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, axs
