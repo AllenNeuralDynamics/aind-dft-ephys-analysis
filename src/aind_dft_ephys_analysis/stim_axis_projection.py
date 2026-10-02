@@ -95,6 +95,24 @@ def stim_ids_for_axis(nwb, axis_name, trial_ids, *, exclude_no_response=None) ->
     return np.asarray(keep, dtype=np.int64)
 
 
+def shift_trials(trial_ids, lag, *, nwb=None) -> np.ndarray:
+    """
+    Shift trial ids by ``lag`` trials (``lag=1`` -> the next trial after each,
+    ``lag=2`` -> two trials later, ``lag=0`` -> the trials themselves).
+
+    Used to project the *trial after* a stimulation trial onto the CD, probing
+    whether a stim-induced shift persists on subsequent (non-stimulated) trials.
+    Out-of-range ids are dropped (needs ``nwb`` to know the trial count).
+    """
+    ids = np.asarray(trial_ids, dtype=np.int64).ravel() + int(lag)
+    if nwb is not None:
+        n = int(np.asarray(nwb.trials["animal_response"][:]).size)
+        ids = ids[(ids >= 0) & (ids < n)]
+    else:
+        ids = ids[ids >= 0]
+    return ids
+
+
 def select_units(
     nwb,
     psth,
@@ -766,6 +784,9 @@ def plot_sweep_summary(
     window_order: Optional[Sequence[str]] = None,
     sel_order: Optional[Sequence[str]] = None,
     cond_order: Optional[Sequence] = None,
+    group_col: str = "condition",
+    group_order: Optional[Sequence] = None,
+    group_label: str = "cond",
     title: str = "Stim projection onto unstim CD — disengagement index",
     save_path: Optional[str] = None,
     show: bool = True,
@@ -775,18 +796,22 @@ def plot_sweep_summary(
     Collapse a full parameter sweep into one grid figure.
 
     Expects a tidy DataFrame with columns ``axis``, ``window_label``,
-    ``selection``, ``condition`` and the ``metric`` (+ optional ``err``).
+    ``selection``, the grouping column (``group_col``, default ``condition``)
+    and the ``metric`` (+ optional ``err``).
     Grid: one row per axis, one column per fit window; within each panel the
-    x-axis is the unit selection and bars are grouped by stimulation condition.
-    Dashed guides mark the engaged (0) and disengaged (1) poles when plotting
-    the disengagement index.
+    x-axis is the unit selection and bars are grouped by ``group_col`` (e.g.
+    stim condition, or trial ``lag``). Dashed guides mark the engaged (0) and
+    disengaged (1) poles when plotting the disengagement index.
     """
     import matplotlib.pyplot as plt
 
     axis_order = list(axis_order) if axis_order is not None else sorted(df["axis"].unique())
     window_order = list(window_order) if window_order is not None else list(dict.fromkeys(df["window_label"]))
     sel_order = list(sel_order) if sel_order is not None else list(dict.fromkeys(df["selection"]))
-    cond_order = list(cond_order) if cond_order is not None else sorted(df["condition"].unique())
+    if group_order is None:
+        group_order = cond_order if (group_col == "condition" and cond_order is not None) \
+            else sorted(df[group_col].unique())
+    group_order = list(group_order)
 
     nrows, ncols = len(axis_order), len(window_order)
     if figsize is None:
@@ -795,22 +820,22 @@ def plot_sweep_summary(
 
     cmap = plt.get_cmap("tab10")
     x = np.arange(len(sel_order))
-    bw = 0.8 / max(len(cond_order), 1)
+    bw = 0.8 / max(len(group_order), 1)
     is_di = metric == "mean_di"
 
     for r, ax_name in enumerate(axis_order):
         for c, win in enumerate(window_order):
             ax = axs[r][c]
             sub = df[(df["axis"] == ax_name) & (df["window_label"] == win)]
-            for k, cond in enumerate(cond_order):
+            for k, g in enumerate(group_order):
                 vals, errs = [], []
                 for s in sel_order:
-                    row = sub[(sub["selection"] == s) & (sub["condition"] == cond)]
+                    row = sub[(sub["selection"] == s) & (sub[group_col] == g)]
                     vals.append(float(row[metric].iloc[0]) if len(row) else np.nan)
                     errs.append(float(row[err].iloc[0]) if (err and len(row)) else 0.0)
                 ax.bar(
-                    x + (k - (len(cond_order) - 1) / 2) * bw, vals, width=bw,
-                    yerr=errs, capsize=2, color=cmap(k), label=f"cond {cond}",
+                    x + (k - (len(group_order) - 1) / 2) * bw, vals, width=bw,
+                    yerr=errs, capsize=2, color=cmap(k), label=f"{group_label} {g}",
                 )
             if is_di:
                 ax.axhline(0, color="tab:blue", ls="--", lw=0.8)
