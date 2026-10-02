@@ -1,0 +1,400 @@
+# -*- coding: utf-8 -*-
+"""
+Project stimulation trials onto behavioural coding directions (CD).
+
+Hypothesis tooling for: *does stimulation move population activity along the
+natural disengagement axis?*
+
+Workflow
+--------
+1. Build a population coding direction (CD) from **unstimulated** trials only,
+   for one of two contrasts:
+     - "response" : engaged-response (+) vs no-response (-)
+     - "reward"   : rewarded (+)         vs unrewarded (-)
+2. Project **stimulation** trials of a chosen condition onto that unstim axis.
+3. Ask whether stimulation pushes the population toward the natural no-response
+   (disengaged) pole, and whether the per-trial shift predicts behaviour.
+
+This leans on ``ephys_dimension_reduction_CD.coding_direction_from_psth`` which
+fits the CD on the supplied A/B trials and already returns projections for
+*every* trial in the PSTH (including trials not used for fitting, i.e. the
+stimulation trials).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Sequence, Tuple
+
+import numpy as np
+
+from behavior_utils import find_trials
+from ephys_dimension_reduction_CD import coding_direction_from_psth
+
+
+# Axis definitions: name -> (+1 class A type, -1 class B type, readable labels).
+# Class A is the "engaged/rewarded" pole, class B is the "disengaged/no-reward" pole.
+AXES: Dict[str, Dict[str, str]] = {
+    "response": dict(
+        type_a="response", type_b="no_response",
+        label_a="engaged (response)", label_b="disengaged (no-response)",
+    ),
+    "reward": dict(
+        type_a="rewarded", type_b="unrewarded",
+        label_a="reward", label_b="no-reward",
+    ),
+}
+
+
+def resolve_axis(name: str) -> Dict[str, str]:
+    """Return the axis spec dict for ``name`` (adds a 'name' key)."""
+    if name not in AXES:
+        raise KeyError(f"Unknown axis {name!r}; choose from {list(AXES)}.")
+    return dict(name=name, **AXES[name])
+
+
+# ---------------------------------------------------------------------------
+# NWB helpers
+# ---------------------------------------------------------------------------
+
+def laser_trial_ids(nwb) -> np.ndarray:
+    """0-based absolute trial IDs where ``laser_on_trial == 1`` (empty if absent)."""
+    if "laser_on_trial" in nwb.trials.colnames:
+        laser_on = np.asarray(nwb.trials["laser_on_trial"][:])
+        return np.where(laser_on == 1)[0].astype(np.int64)
+    return np.array([], dtype=np.int64)
+
+
+def responded_flags(nwb) -> np.ndarray:
+    """Per-trial responded flag (1 = animal responded, 0 = no-response)."""
+    resp = np.asarray(nwb.trials["animal_response"][:])
+    return (resp != 2).astype(int)
+
+
+def _psth_trial_ids(psth, align: str) -> np.ndarray:
+    """Absolute trial IDs available in the PSTH for the chosen alignment."""
+    coord = f"trial_index_{align}"
+    if coord in psth.coords:
+        return np.asarray(psth.coords[coord].values, dtype=np.int64)
+    for c in psth.coords:
+        if str(c).startswith("trial_index_"):
+            return np.asarray(psth.coords[c].values, dtype=np.int64)
+    raise KeyError("No 'trial_index_<align>' coordinate found in the PSTH.")
+
+
+# ---------------------------------------------------------------------------
+# Result container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AxisResult:
+    """Fitted CD axis plus per-trial projections for every PSTH trial."""
+
+    axis: Dict[str, str]
+    unit_ids: np.ndarray
+    time: np.ndarray
+    align: str
+    fit_window: Tuple[float, float]
+    proj_window: Optional[Tuple[float, float]]
+    ids_a: np.ndarray                     # unstim class-A trial ids used for the fit
+    ids_b: np.ndarray                     # unstim class-B trial ids used for the fit
+    proj_by_id: Dict[int, float]          # trial id -> scalar projection (fit window, unbiased)
+    trace_by_id: Dict[int, np.ndarray]    # trial id -> time-resolved projection (unbiased)
+    mean_a: float                         # mean projection of unstim class A (engaged pole)
+    mean_b: float                         # mean projection of unstim class B (disengaged pole)
+    dprime: float
+    auc: float
+    raw: Optional[dict] = field(repr=False, default=None)
+
+    # -- projection lookups ------------------------------------------------
+    def project(self, trial_ids: Sequence[int]) -> Tuple[np.ndarray, np.ndarray]:
+        """Scalar (fit-window) projections for ``trial_ids`` present in the PSTH."""
+        tids = np.asarray(trial_ids, dtype=np.int64).ravel()
+        tids = np.array([t for t in tids if int(t) in self.proj_by_id], dtype=np.int64)
+        scal = np.array([self.proj_by_id[int(t)] for t in tids], dtype=float)
+        return tids, scal
+
+    def project_traces(self, trial_ids: Sequence[int]) -> Tuple[np.ndarray, np.ndarray]:
+        """Time-resolved projections for ``trial_ids`` present in the PSTH."""
+        tids = np.asarray(trial_ids, dtype=np.int64).ravel()
+        tids = np.array([t for t in tids if int(t) in self.trace_by_id], dtype=np.int64)
+        tr = np.array([self.trace_by_id[int(t)] for t in tids], dtype=float)
+        return tids, tr
+
+    def disengagement_index(self, scal) -> np.ndarray:
+        """Rescale projections so 0 = engaged (A) pole, 1 = disengaged (B) pole."""
+        scal = np.asarray(scal, dtype=float)
+        denom = self.mean_b - self.mean_a
+        if abs(denom) < 1e-12:
+            return np.full_like(scal, np.nan)
+        return (scal - self.mean_a) / denom
+
+
+# ---------------------------------------------------------------------------
+# Build a CD axis from unstimulated trials
+# ---------------------------------------------------------------------------
+
+def build_axis(
+    psth,
+    nwb,
+    unit_ids,
+    axis_name: str,
+    *,
+    align: str = "go_cue",
+    fit_window: Tuple[float, float] = (0.0, 0.5),
+    proj_window: Optional[Tuple[float, float]] = None,
+    exclude_trial_ids: Optional[Sequence[int]] = None,
+    zscore_units: bool = False,
+    random_state: int = 0,
+) -> AxisResult:
+    """
+    Fit a coding direction on **unstimulated** trials for the given contrast.
+
+    Parameters
+    ----------
+    psth : xr.Dataset
+        PSTH with ``psth_<align>`` data vars and ``trial_index_<align>`` coords.
+    nwb : NWB-like
+        Provides ``trials`` (for class membership and laser flags).
+    unit_ids : array-like of int
+        Units to build the axis from (absolute NWB unit indices).
+    axis_name : {"response", "reward"}
+        Which behavioural contrast defines the axis.
+    align, fit_window, proj_window : alignment + windows (see CD module).
+    exclude_trial_ids : array-like of int, optional
+        Trials excluded from the FIT (defaults to all laser-on trials). The
+        stimulation trials you later project should be in this excluded set so
+        the axis is purely unstimulated.
+    zscore_units : bool
+        Per-unit z-score inside the CD fit (default False = raw-rate CD).
+    random_state : int
+        Seed for the balanced half-split.
+    """
+    axis = resolve_axis(axis_name)
+    avail = set(int(t) for t in _psth_trial_ids(psth, align))
+    if exclude_trial_ids is None:
+        excl = set(int(t) for t in laser_trial_ids(nwb))
+    else:
+        excl = set(int(t) for t in np.asarray(exclude_trial_ids, dtype=np.int64))
+
+    ids_a = np.array(
+        sorted((set(int(t) for t in find_trials(nwb, axis["type_a"])) & avail) - excl),
+        dtype=np.int64,
+    )
+    ids_b = np.array(
+        sorted((set(int(t) for t in find_trials(nwb, axis["type_b"])) & avail) - excl),
+        dtype=np.int64,
+    )
+    if ids_a.size < 2 or ids_b.size < 2:
+        raise ValueError(
+            f"Too few unstimulated trials for axis {axis_name!r}: "
+            f"A({axis['type_a']})={ids_a.size}, B({axis['type_b']})={ids_b.size}."
+        )
+
+    res = coding_direction_from_psth(
+        psth,
+        trial_ids_typeA=ids_a,
+        trial_ids_typeB=ids_b,
+        align=align,
+        time_window=fit_window,
+        projection_time_window=proj_window,
+        random_state=random_state,
+        two_fold_cv=True,
+        norm_mode="divide_sqrtN",
+        unit_ids=np.asarray(unit_ids, dtype=np.int64),
+        zscore_units=zscore_units,
+        save_path=None,
+    )
+
+    tid_all = np.asarray(res["trial_ids_all_trials"], dtype=np.int64)
+    proj_all = np.asarray(res["projection_unbiased_all_trials"], dtype=float)
+    trace_all = np.asarray(res["projection_trace_unbiased_all_trials"], dtype=float)
+    proj_by_id = {int(t): float(p) for t, p in zip(tid_all, proj_all)}
+    trace_by_id = {int(t): trace_all[i] for i, t in enumerate(tid_all)}
+
+    mean_a = float(np.nanmean([proj_by_id[int(t)] for t in ids_a if int(t) in proj_by_id]))
+    mean_b = float(np.nanmean([proj_by_id[int(t)] for t in ids_b if int(t) in proj_by_id]))
+
+    return AxisResult(
+        axis=axis,
+        unit_ids=np.asarray(unit_ids, dtype=np.int64),
+        time=np.asarray(res["time_for_projection"], dtype=float),
+        align=align,
+        fit_window=fit_window,
+        proj_window=proj_window,
+        ids_a=ids_a,
+        ids_b=ids_b,
+        proj_by_id=proj_by_id,
+        trace_by_id=trace_by_id,
+        mean_a=mean_a,
+        mean_b=mean_b,
+        dprime=float(res["metrics"]["overall"]["dprime"]),
+        auc=float(res["metrics"]["overall"]["auc"]),
+        raw=res,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stimulation-condition projection + stats
+# ---------------------------------------------------------------------------
+
+def _auc_binary(labels01, scores) -> float:
+    """ROC-AUC with labels in {0, 1}; tie-aware (average ranks)."""
+    labels01 = np.asarray(labels01, dtype=int).ravel()
+    scores = np.asarray(scores, dtype=float).ravel()
+    m = np.isfinite(scores)
+    labels01, scores = labels01[m], scores[m]
+    pos = labels01 == 1
+    n1, n0 = int(pos.sum()), int((~pos).sum())
+    if n1 == 0 or n0 == 0:
+        return float("nan")
+    order = np.argsort(scores, kind="mergesort")
+    ranks = np.empty(scores.size, dtype=float)
+    sorted_scores = scores[order]
+    i = 0
+    while i < scores.size:
+        j = i
+        while j + 1 < scores.size and sorted_scores[j + 1] == sorted_scores[i]:
+            j += 1
+        ranks[order[i : j + 1]] = 0.5 * (i + j) + 1.0  # 1-based average rank
+        i = j + 1
+    u = ranks[pos].sum() - n1 * (n1 + 1) / 2.0
+    return float(u / (n1 * n0))
+
+
+def condition_shift(res: AxisResult, cond_trial_ids: Sequence[int], nwb) -> Dict:
+    """
+    Quantify how far a stimulation condition shifts along the CD axis and
+    whether that shift predicts behaviour on the stimulated trials.
+
+    Returns a dict with:
+      - n_stim, mean_di, sem_di : disengagement index (0=engaged, 1=disengaged)
+      - p_toward_disengaged     : Mann-Whitney one-sided p (stim more disengaged
+                                  than unstim engaged-pole trials)
+      - behavior_auc            : AUC using the per-trial projection to predict
+                                  no-response on the stimulated trials
+      - trial_ids, proj, di     : per-trial arrays for plotting
+    """
+    from scipy.stats import mannwhitneyu
+
+    tids, scal = res.project(cond_trial_ids)
+    _, a_scal = res.project(res.ids_a)
+    di = res.disengagement_index(scal)
+    a_di = res.disengagement_index(a_scal)
+
+    if di.size and a_di.size:
+        try:
+            u, p = mannwhitneyu(di, a_di, alternative="greater")
+        except ValueError:
+            u, p = float("nan"), float("nan")
+    else:
+        u, p = float("nan"), float("nan")
+
+    resp = responded_flags(nwb)
+    no_resp01 = np.array([1 - int(resp[int(t)]) for t in tids], dtype=int)  # 1 = no-response
+    beh_auc = _auc_binary(no_resp01, di)  # higher disengagement -> no-response?
+
+    return dict(
+        axis=res.axis["name"],
+        n_stim=int(tids.size),
+        mean_di=float(np.nanmean(di)) if di.size else float("nan"),
+        sem_di=float(np.nanstd(di) / np.sqrt(max(di.size, 1))) if di.size else float("nan"),
+        mean_a=res.mean_a,
+        mean_b=res.mean_b,
+        mannwhitney_u=float(u) if np.isfinite(u) else float("nan"),
+        p_toward_disengaged=float(p) if np.isfinite(p) else float("nan"),
+        n_no_response=int(no_resp01.sum()),
+        behavior_auc=beh_auc,
+        trial_ids=tids,
+        proj=scal,
+        di=di,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+def plot_axis_distributions(
+    res: AxisResult,
+    cond_trial_ids: Sequence[int],
+    *,
+    stim_label: str = "stim",
+    save_path: Optional[str] = None,
+    show: bool = True,
+    figsize: Tuple[float, float] = (6, 4),
+):
+    """Strip plot of unstim-A, unstim-B and stim fit-window projections."""
+    import matplotlib.pyplot as plt
+
+    rng = np.random.RandomState(0)
+    _, a = res.project(res.ids_a)
+    _, b = res.project(res.ids_b)
+    _, s = res.project(cond_trial_ids)
+    groups = [a, b, s]
+    names = [res.axis["label_a"], res.axis["label_b"], stim_label]
+    colors = ["tab:blue", "tab:red", "tab:green"]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    for i, (vals, c) in enumerate(zip(groups, colors)):
+        if vals.size == 0:
+            continue
+        ax.scatter(np.full(vals.size, i) + rng.uniform(-0.09, 0.09, vals.size),
+                   vals, s=12, alpha=0.4, color=c)
+        ax.hlines(np.nanmean(vals), i - 0.22, i + 0.22, color=c, lw=2.5)
+    ax.set_xticks(range(3))
+    ax.set_xticklabels(names, rotation=12)
+    ax.set_ylabel(f"CD projection  ({res.axis['label_a']} +, {res.axis['label_b']} −)")
+    ax.set_title(f"{res.axis['name']} axis — d'={res.dprime:.2f}, AUC={res.auc:.2f}")
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, ax
+
+
+def plot_axis_traces(
+    res: AxisResult,
+    cond_trial_ids: Sequence[int],
+    *,
+    stim_label: str = "stim",
+    save_path: Optional[str] = None,
+    show: bool = True,
+    figsize: Tuple[float, float] = (6, 4),
+):
+    """Time-resolved mean ± SEM CD projection for unstim-A, unstim-B and stim."""
+    import matplotlib.pyplot as plt
+
+    def mean_sem(ids):
+        _, tr = res.project_traces(ids)
+        if tr.size == 0:
+            return None, None
+        return np.nanmean(tr, axis=0), np.nanstd(tr, axis=0) / np.sqrt(max(tr.shape[0], 1))
+
+    t = res.time
+    fig, ax = plt.subplots(figsize=figsize)
+    for ids, nm, c in [
+        (res.ids_a, res.axis["label_a"], "tab:blue"),
+        (res.ids_b, res.axis["label_b"], "tab:red"),
+        (np.asarray(cond_trial_ids), stim_label, "tab:green"),
+    ]:
+        m, sem = mean_sem(ids)
+        if m is None:
+            continue
+        ax.plot(t, m, color=c, label=nm)
+        ax.fill_between(t, m - sem, m + sem, color=c, alpha=0.2)
+    ax.axvline(0, color="k", ls="--", lw=0.8)
+    ax.set_xlabel(f"Time from {res.align} (s)")
+    ax.set_ylabel("CD projection")
+    ax.set_title(f"{res.axis['name']} axis — time-resolved")
+    ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig, ax
