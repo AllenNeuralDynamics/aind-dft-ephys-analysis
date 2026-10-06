@@ -105,7 +105,7 @@ def select_common_units(metrics_df, tagged_df, qc_index, target_cond,
     pulse_mask = tagged_df["pulse_index"] == select_pulse_index
     sigrows = tagged_df[cond_mask & pulse_mask & (tagged_df["tagged"] == True)]  # noqa: E712
     common_units = sorted(set(qc_index) & set(sigrows["unit_id"]))
-    return common_units, target_exists, available_powers
+    return common_units, target_exists, available_powers, matched_targets
 
 
 def run_session(cfg):
@@ -138,8 +138,16 @@ def run_session(cfg):
     """
     import matplotlib
     matplotlib.use("Agg")  # headless; this is a fresh process in session-parallel mode
+    import time
 
     session_date = cfg["session_date"]
+    _progress = cfg.get("progress", True)
+
+    def _log(msg):
+        if _progress:
+            print(f"[{session_date}] {msg}", flush=True)
+
+    _t_start = time.perf_counter()
     result = {"session_date": session_date, "status": "ok", "error": None,
               "n_units": 0, "common_units": [], "target_exists": None,
               "available_powers": None, "matched_targets": None,
@@ -158,11 +166,17 @@ def run_session(cfg):
             f"/root/capsule/scratch/opto_tagging/metrics_{session_date}.csv",
         )
 
+        _log("loading session (OpticalTagging)...")
+        _t = time.perf_counter()
         ot = OpticalTagging(behavior_json_file=beh, ephys_nwb_file=nwb)
+        _log(f"loaded in {time.perf_counter() - _t:.1f}s")
 
         # ---- compute metrics ----
         compute_kwargs = cfg.get("compute_kwargs", {})
+        _t = time.perf_counter()
         metrics_df = ot.compute_tagging_metrics(**compute_kwargs)
+        _log(f"computed {len(metrics_df)} metric row(s) in "
+             f"{time.perf_counter() - _t:.1f}s")
         if cfg.get("save_metrics", True):
             os.makedirs(os.path.dirname(metrics_csv_path), exist_ok=True)
             metrics_df.to_csv(metrics_csv_path, index=False)
@@ -184,6 +198,8 @@ def run_session(cfg):
         result["target_exists"] = bool(target_exists)
         result["available_powers"] = available_powers
         result["matched_targets"] = matched_targets
+        _log(f"selected {len(common_units)} tagged unit(s) "
+             f"(target_exists={bool(target_exists)})")
 
         if not target_exists:
             result["status"] = "no_condition"
@@ -196,6 +212,7 @@ def run_session(cfg):
         # ---- render figures, sequentially, per alignment ----
         save_formats = cfg.get("save_formats", ["png"])
         alignments = cfg.get("alignments", {})
+        n_cu = len(common_units)
         for name, spec in alignments.items():
             out_dir = spec["out_dir"]
             plot_kwargs = dict(spec.get("plot_kwargs", {}))
@@ -205,8 +222,11 @@ def run_session(cfg):
                 if isinstance(_v, str) and _v == "__SELF_METRICS__":
                     plot_kwargs[_k] = metrics_df
             os.makedirs(out_dir, exist_ok=True)
+            _log(f"rendering {n_cu} '{name}' figure(s) -> {out_dir}")
+            _t = time.perf_counter()
+            _rstep = max(1, n_cu // 10)
             saved, failed, errors = 0, 0, []
-            for unit_id in common_units:
+            for j, unit_id in enumerate(common_units):
                 try:
                     ot.plot_raster_graph(
                         unit_index=int(unit_id),
@@ -218,13 +238,19 @@ def run_session(cfg):
                 except Exception as e:  # noqa: BLE001 - per-unit failures are non-fatal
                     failed += 1
                     errors.append((unit_id, repr(e)))
+                if _progress and ((j + 1) % _rstep == 0 or (j + 1) == n_cu):
+                    _log(f"  '{name}': {j + 1}/{n_cu} done "
+                         f"({saved} ok, {failed} failed) | "
+                         f"{time.perf_counter() - _t:.1f}s")
             result["alignments"][name] = {
                 "out_dir": out_dir, "saved": saved, "failed": failed,
                 "errors": errors,
             }
+        _log(f"finished in {time.perf_counter() - _t_start:.1f}s")
         return result
 
     except Exception as e:  # noqa: BLE001 - never kill the pool on one session
         result["status"] = "error"
         result["error"] = repr(e)
+        _log(f"ERROR after {time.perf_counter() - _t_start:.1f}s: {e!r}")
         return result

@@ -1992,6 +1992,10 @@ class OpticalTagging:
         """
         Compute opto-tagging metrics for one unit over a set of event times.
 
+        ``st`` MUST be sorted ascending; the baseline/test windows are located
+        with ``np.searchsorted`` so only the few spikes inside each tiny window
+        are touched (not the whole spike train).
+
         Returns a dict of metrics (rates, reliability, latency, jitter, effect
         size, and raw t-test / SALT p-values), or None if ``events`` is empty.
         """
@@ -2006,16 +2010,21 @@ class OpticalTagging:
         spt_test = np.zeros((n_events, nt))
 
         for i, t in enumerate(events):
-            # Baseline spikes -> rate + SALT baseline matrix
-            bspk = st[(st >= t + b0) & (st < t + b1)] - (t + b0)
+            # Baseline spikes -> rate + SALT baseline matrix.
+            # Window is [t+b0, t+b1); searchsorted restricts to just those spikes.
+            b_lo = np.searchsorted(st, t + b0, side="left")
+            b_hi = np.searchsorted(st, t + b1, side="left")
+            bspk = st[b_lo:b_hi] - (t + b0)
             if bspk.size:
                 bidx = np.floor(bspk / salt_dt).astype(int)
                 bidx = bidx[(bidx >= 0) & (bidx < nb)]
                 spt_baseline[i, bidx] = 1
             baseline_rates[i] = bspk.size / base_dur
 
-            # Test-window spikes -> rate + SALT test matrix + first latency
-            tspk = st[(st >= t + w0) & (st < t + w1)] - (t + w0)
+            # Test-window spikes -> rate + SALT test matrix + first latency.
+            t_lo = np.searchsorted(st, t + w0, side="left")
+            t_hi = np.searchsorted(st, t + w1, side="left")
+            tspk = st[t_lo:t_hi] - (t + w0)
             if tspk.size:
                 tidx = np.floor(tspk / salt_dt).astype(int)
                 tidx = tidx[(tidx >= 0) & (tidx < nt)]
@@ -2068,7 +2077,8 @@ class OpticalTagging:
                                 salt_dt=0.001,
                                 per_pulse=True,
                                 remove_artefacts=True, removal_window=0.002,
-                                align_to_event="pulse"):
+                                align_to_event="pulse",
+                                progress=True):
         """
         CALCULATION step of robust opto-tagging (no thresholding / selection).
 
@@ -2144,6 +2154,16 @@ class OpticalTagging:
         if filtered_spikes is None:
             return pd.DataFrame()
 
+        # Ensure spike arrays are sorted ascending (the inner metric loop locates
+        # windows with searchsorted). NWB spike_times are already sorted, so this
+        # is usually a no-op; done once per unit here to avoid re-sorting inside
+        # the condition loop.
+        for _u in unit_index:
+            _sv = np.asarray(filtered_spikes[_u], dtype=float)
+            if _sv.size and np.any(np.diff(_sv) < 0):
+                _sv = np.sort(_sv)
+            filtered_spikes[_u] = _sv
+
         b0, b1 = baseline_window
         w0, w1 = latency_window
         base_dur = b1 - b0
@@ -2151,8 +2171,18 @@ class OpticalTagging:
         nb = max(int(round(base_dur / salt_dt)), 1)
         nt = max(int(round(win_dur / salt_dt)), 1)
 
+        import time as _time
+        _t0 = _time.perf_counter()
+        _tag = getattr(self, "session_name", "session")
+        n_cond = len(unique_conditions)
+        n_units = len(unit_index)
+        if progress:
+            print(f"[{_tag}] compute_tagging_metrics: {n_units} unit(s) x "
+                  f"{n_cond} condition(s)", flush=True)
+        _step = max(1, n_units // 4)
+
         rows = []
-        for cond in unique_conditions:
+        for ci, cond in enumerate(unique_conditions):
             pwr_cond, loc_cond, lname_cond, cycle_cond, freq_cond, pdur_cond = cond
             sel_mask = (
                 (power_map == pwr_cond) &
@@ -2175,7 +2205,12 @@ class OpticalTagging:
                 for p in sorted(set(int(x) for x in cond_pidx)):
                     groups.append((p, cond_events[cond_pidx == p]))
 
-            for unit in unit_index:
+            if progress:
+                print(f"[{_tag}]   cond {ci + 1}/{n_cond} "
+                      f"(pwr={pwr_cond}, pdur={pdur_cond}, {lname_cond}): "
+                      f"{n_units} units x {len(groups)} group(s)", flush=True)
+
+            for ui, unit in enumerate(unit_index):
                 st = filtered_spikes[unit]
                 ccf = self.nwb_ephys_data.units['ccf_location'][unit]
                 est_x = self.nwb_ephys_data.units['estimated_x'][unit]
@@ -2207,8 +2242,16 @@ class OpticalTagging:
                     })
                     rows.append(row)
 
+                if progress and (ui + 1) % _step == 0:
+                    print(f"[{_tag}]     cond {ci + 1}/{n_cond}: "
+                          f"{ui + 1}/{n_units} units | "
+                          f"{_time.perf_counter() - _t0:.1f}s elapsed", flush=True)
+
         metrics_df = pd.DataFrame(rows)
         self.metrics_df = metrics_df
+        if progress:
+            print(f"[{_tag}] compute_tagging_metrics done: {len(metrics_df)} row(s) "
+                  f"in {_time.perf_counter() - _t0:.1f}s", flush=True)
         return metrics_df
 
     def select_tagged_units(self, metrics_df=None,

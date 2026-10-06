@@ -306,12 +306,25 @@ def cluster_estimated_x(
         Cluster labels 0…n_clusters−1, with ambiguous units set to 5.
     """
     # ensure 1D array
-    x = np.asarray(estimated_x).reshape(-1)
+    x = np.asarray(estimated_x, dtype=float).reshape(-1)
     N = x.size
 
-    # run KMeans
-    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init='auto')
-    raw_labels = kmeans.fit_predict(x.reshape(-1, 1))
+    # Only finite positions can be clustered. Units with NaN/inf estimated_x
+    # (e.g. missing channel localization) cannot go into KMeans, so they are
+    # labelled ambiguous (5) and excluded from the fit.
+    finite = np.isfinite(x)
+    n_finite = int(finite.sum())
+    final_labels = np.full(N, 5, dtype=int)
+
+    if n_finite == 0:
+        return final_labels
+
+    xf = x[finite]
+    k = min(n_clusters, n_finite)
+
+    # run KMeans on finite positions only
+    kmeans = KMeans(n_clusters=k, random_state=random_state, n_init='auto')
+    raw_labels = kmeans.fit_predict(xf.reshape(-1, 1))
     centers = kmeans.cluster_centers_.flatten()
 
     # sort cluster IDs by ascending center
@@ -320,16 +333,22 @@ def cluster_estimated_x(
     sorted_labels = np.vectorize(label_map.get)(raw_labels)
     sorted_centers = centers[order]
 
-    # compute distances to each sorted center
-    dists = np.abs(x.reshape(N, 1) - sorted_centers.reshape(1, -1))
-    closest, second = np.partition(dists, 1, axis=1)[:, 0], np.partition(dists, 1, axis=1)[:, 1]
+    # compute distances to each sorted center (finite units only)
+    nf = xf.size
+    dists = np.abs(xf.reshape(nf, 1) - sorted_centers.reshape(1, -1))
+    if sorted_centers.size >= 2:
+        closest = np.partition(dists, 1, axis=1)[:, 0]
+        second = np.partition(dists, 1, axis=1)[:, 1]
+        # ambiguous if gap is small relative to best
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ambiguous = (second - closest) / closest < threshold
+    else:
+        ambiguous = np.zeros(nf, dtype=bool)
 
-    # ambiguous if gap is small relative to best
-    ambiguous = (second - closest) / closest < threshold
-
-    # assign final labels (ambiguous → 5)
-    final_labels = sorted_labels.copy()
-    final_labels[ambiguous] = 5
+    # assign final labels (ambiguous → 5); NaN-position units stay 5
+    finite_labels = sorted_labels.copy()
+    finite_labels[ambiguous] = 5
+    final_labels[finite] = finite_labels
 
     # optional plotting
     if plot:
