@@ -3,6 +3,7 @@ from __future__ import annotations
 # ==============================
 # Standard library
 # ==============================
+import time
 from pathlib import Path
 from typing import (
     Any,
@@ -44,6 +45,7 @@ def extract_neuron_psth_to_zarr(
     overwrite: bool = True,
     include_raster: bool = True,
     unit_batch_size: Optional[int] = None,
+    show_progress: bool = True,
 ) -> xr.Dataset:
     """
     Parameters
@@ -84,6 +86,9 @@ def extract_neuron_psth_to_zarr(
         If set, units are processed and written to Zarr in batches of this size
         (appended along the `unit` dimension). This bounds peak memory regardless
         of the total unit count. None processes all units at once (legacy behaviour).
+    show_progress : bool, default True
+        If True, print progress messages (first-pass scan and per-batch writes with
+        elapsed/ETA timing), prefixed with the session id. Set False to silence.
 
     Returns
     -------
@@ -135,6 +140,18 @@ def extract_neuron_psth_to_zarr(
     if unit_batch_size is None or unit_batch_size <= 0:
         unit_batch_size = n_u_total
 
+    session_tag = getattr(nwb_data, "session_id", "session")
+
+    def _log(msg: str) -> None:
+        if show_progress:
+            print(f"[{session_tag}] {msg}", flush=True)
+
+    _t_start = time.perf_counter()
+    _log(
+        f"start: {n_u_total} units, events={events}, "
+        f"batch={unit_batch_size}, raster={include_raster}"
+    )
+
     def _sorted_spikes(u: int) -> np.ndarray:
         """Spike times for unit `u`, ascending (required by searchsorted)."""
         s = np.asarray(nwb_data.units["spike_times"][u], dtype=float)
@@ -147,6 +164,7 @@ def extract_neuron_psth_to_zarr(
     #    Vectorised over trials -> cheap (one searchsorted pair per unit/event).
     max_spikes: Dict[str, int] = {}
     if include_raster:
+        _log("first pass: scanning spikes to size the raster...")
         for evt, (event_times, _) in event_info.items():
             lo_edges = event_times + start
             hi_edges = event_times + end
@@ -160,9 +178,10 @@ def extract_neuron_psth_to_zarr(
                 if hi.size:
                     m = max(m, int((hi - lo).max()))
             max_spikes[evt] = m
+            _log(f"  first pass '{evt}': max_spikes/trial = {m}")
 
     # 4. Resolve destination up front (batched writes append to the same store).
-    session_id = getattr(nwb_data, "session_id", "session")
+    session_id = session_tag
     if save_name is None:
         save_name = f"{session_id}.zarr"
     elif not save_name.endswith(".zarr"):
@@ -184,8 +203,10 @@ def extract_neuron_psth_to_zarr(
 
     # 5. Process units in batches; compute PSTH (and optional raster) using a
     #    window-restricted slice of each unit's spikes, then stream to Zarr.
+    n_batches = (n_u_total + unit_batch_size - 1) // unit_batch_size
+    _t_loop = time.perf_counter()
     first_write = True
-    for b0 in range(0, n_u_total, unit_batch_size):
+    for bidx, b0 in enumerate(range(0, n_u_total, unit_batch_size)):
         batch_units = units[b0:b0 + unit_batch_size]
         nb_u = len(batch_units)
         data_vars = {}
@@ -262,9 +283,18 @@ def extract_neuron_psth_to_zarr(
         else:
             ds_batch.to_zarr(dest, append_dim="unit", consolidated=True)
 
-    print(f"PSTH{' and raster' if include_raster else ''} data saved to {dest} "
-          f"[events={events}, units={n_u_total}, "
-          f"batch={unit_batch_size}, raster={include_raster}]")
+        done = b0 + nb_u
+        elapsed = time.perf_counter() - _t_loop
+        eta = elapsed / done * (n_u_total - done) if done else 0.0
+        _log(
+            f"batch {bidx + 1}/{n_batches}: units {done}/{n_u_total} "
+            f"({100.0 * done / n_u_total:.0f}%) | elapsed {elapsed:.1f}s | eta {eta:.1f}s"
+        )
+
+    _log(
+        f"PSTH{' and raster' if include_raster else ''} saved to {dest} "
+        f"in {time.perf_counter() - _t_start:.1f}s"
+    )
 
     # Return the full (lazy) dataset read back from the store.
     return xr.open_zarr(dest, consolidated=True)
