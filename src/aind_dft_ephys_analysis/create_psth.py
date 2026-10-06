@@ -42,6 +42,8 @@ def extract_neuron_psth_to_zarr(
     save_folder: Union[str, Path] = "/root/capsule/results",
     save_name: Optional[str] = None,
     overwrite: bool = True,
+    include_raster: bool = True,
+    unit_batch_size: Optional[int] = None,
 ) -> xr.Dataset:
     """
     Parameters
@@ -73,6 +75,16 @@ def extract_neuron_psth_to_zarr(
     overwrite : bool, default True
         If True and the destination folder exists, it is deleted before writing.
 
+    include_raster : bool, default True
+        If True, also compute and store the padded `raster_<event>` arrays. These
+        are **much** larger than the PSTH (shape unit x trial x max_spikes) and are
+        the main memory cost for sessions with many units. Set to False to generate
+        PSTH only (far less memory, much faster) when rasters are not needed.
+    unit_batch_size : Optional[int], default None
+        If set, units are processed and written to Zarr in batches of this size
+        (appended along the `unit` dimension). This bounds peak memory regardless
+        of the total unit count. None processes all units at once (legacy behaviour).
+
     Returns
     -------
     xr.Dataset
@@ -102,12 +114,11 @@ def extract_neuron_psth_to_zarr(
     start, end = time_window
     edges = np.arange(start, end + bin_size, bin_size)
     centers = edges[:-1] + bin_size / 2.0
+    n_bins = len(centers)
 
-    data_vars = {}
-    n_trials_per_event = {}
-
+    # 2. Pre-resolve event times / trial indices once (shared across unit batches).
+    event_info: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
     for evt in events:
-        # 2. Extract event times and trial indices
         all_times = np.asarray(extract_event_timestamps(nwb_data, evt), dtype=float)
         if trial_type is not None:
             trial_idx = np.asarray(find_trials(nwb_data, trial_type), dtype=int)
@@ -115,101 +126,148 @@ def extract_neuron_psth_to_zarr(
         else:
             trial_idx = np.arange(len(all_times), dtype=int)
             event_times = all_times
-
         if len(event_times) == 0:
             raise ValueError(f"No trials matched for event '{evt}'.")
+        event_info[evt] = (event_times, trial_idx)
+    n_trials_per_event = {evt: len(event_info[evt][0]) for evt in events}
 
-        n_u, n_t = len(units), len(event_times)
+    n_u_total = len(units)
+    if unit_batch_size is None or unit_batch_size <= 0:
+        unit_batch_size = n_u_total
 
-        # 3. Compute PSTH
-        psth = np.zeros((n_u, n_t, len(centers)), dtype=np.float32)
+    def _sorted_spikes(u: int) -> np.ndarray:
+        """Spike times for unit `u`, ascending (required by searchsorted)."""
+        s = np.asarray(nwb_data.units["spike_times"][u], dtype=float)
+        if s.size and np.any(np.diff(s) < 0):
+            s = np.sort(s)
+        return s
 
-        # 4. Collect raw spike-time offsets per (unit, trial)
-        raster_lists = [[[] for _ in range(n_t)] for _ in range(n_u)]
-        for ui, u in enumerate(units):
-            spikes = np.asarray(nwb_data.units["spike_times"][u], dtype=float)
-            for ti, t0 in enumerate(event_times):
-                rel = spikes - t0
-                # PSTH bin counts
-                counts, _ = np.histogram(rel, bins=edges)
-                psth[ui, ti, :] = counts / bin_size
-                # Raster: keep only offsets within [start, end]
-                mask = (rel >= start) & (rel <= end)
-                raster_lists[ui][ti] = rel[mask]
+    # 3. (raster only) First pass: global max spikes-in-window per event so the
+    #    padded raster has a consistent `spike` dimension across unit batches.
+    #    Vectorised over trials -> cheap (one searchsorted pair per unit/event).
+    max_spikes: Dict[str, int] = {}
+    if include_raster:
+        for evt, (event_times, _) in event_info.items():
+            lo_edges = event_times + start
+            hi_edges = event_times + end
+            m = 0
+            for u in units:
+                s = _sorted_spikes(u)
+                if s.size == 0:
+                    continue
+                lo = np.searchsorted(s, lo_edges, side="left")
+                hi = np.searchsorted(s, hi_edges, side="right")
+                if hi.size:
+                    m = max(m, int((hi - lo).max()))
+            max_spikes[evt] = m
 
-        # 5. Pad raster lists into fixed-size array
-        max_spikes = max(len(raster_lists[ui][ti]) for ui in range(n_u) for ti in range(n_t))
-        raster = np.full((n_u, n_t, max_spikes), np.nan, dtype=np.float32)
-        for ui in range(n_u):
-            for ti in range(n_t):
-                sl = raster_lists[ui][ti]
-                raster[ui, ti, : len(sl)] = sl
-
-        trial_dim = f"trial_{evt}"
-        coord_trial = f"trial_index_{evt}"
-
-        # 6. Build DataArrays
-        da_psth = xr.DataArray(
-            psth,
-            dims=("unit", trial_dim, "time"),
-            coords={
-                "unit_index": ("unit", units),
-                coord_trial: (trial_dim, trial_idx),
-                "time": ("time", centers),
-            },
-            name=f"psth_{evt}",
-            attrs={
-                "align_to_event": evt,
-                "time_window": time_window,
-                "bin_size": bin_size,
-                "trial_type": trial_type or "all",
-            },
-        )
-        da_raster = xr.DataArray(
-            raster,
-            dims=("unit", trial_dim, "spike"),
-            coords={
-                "unit_index": ("unit", units),
-                coord_trial: (trial_dim, trial_idx),
-                "spike": np.arange(max_spikes),
-            },
-            name=f"raster_{evt}",
-            attrs={
-                "align_to_event": evt,
-                "time_window": time_window,
-                "description": "relative spike times (s), padded with NaN",
-            },
-        )
-
-        data_vars[f"psth_{evt}"] = da_psth
-        data_vars[f"raster_{evt}"] = da_raster
-        n_trials_per_event[evt] = n_t
-
-    # 7. Assemble Dataset and save to Zarr
-    ds = xr.Dataset(data_vars)
-    ds.attrs.update({
-        "session_id": getattr(nwb_data, "session_id", "unknown"),
-        "align_to_events": events,
-        "bin_size": bin_size,
-        "n_units": len(units),
-        "n_trials_per_event": n_trials_per_event,
-        "created_with": "extract_neuron_psth_to_zarr",
-    })
-
+    # 4. Resolve destination up front (batched writes append to the same store).
     session_id = getattr(nwb_data, "session_id", "session")
     if save_name is None:
         save_name = f"{session_id}.zarr"
     elif not save_name.endswith(".zarr"):
         save_name += ".zarr"
-
     dest = Path(save_folder).expanduser() / save_name
     if dest.exists() and overwrite:
         import shutil
         shutil.rmtree(dest)
-    ds.to_zarr(dest, mode="w", consolidated=True)
-    print(f"PSTH and raster data saved to {dest} [events={events}]")
 
-    return ds
+    global_attrs = {
+        "session_id": session_id,
+        "align_to_events": events,
+        "bin_size": bin_size,
+        "n_units": n_u_total,
+        "n_trials_per_event": n_trials_per_event,
+        "include_raster": bool(include_raster),
+        "created_with": "extract_neuron_psth_to_zarr",
+    }
+
+    # 5. Process units in batches; compute PSTH (and optional raster) using a
+    #    window-restricted slice of each unit's spikes, then stream to Zarr.
+    first_write = True
+    for b0 in range(0, n_u_total, unit_batch_size):
+        batch_units = units[b0:b0 + unit_batch_size]
+        nb_u = len(batch_units)
+        data_vars = {}
+
+        for evt in events:
+            event_times, trial_idx = event_info[evt]
+            n_t = len(event_times)
+            trial_dim = f"trial_{evt}"
+            coord_trial = f"trial_index_{evt}"
+
+            psth = np.zeros((nb_u, n_t, n_bins), dtype=np.float32)
+            if include_raster:
+                ms = max_spikes[evt]
+                raster = np.full((nb_u, n_t, ms), np.nan, dtype=np.float32)
+
+            for bi, u in enumerate(batch_units):
+                s = _sorted_spikes(u)
+                if s.size == 0:
+                    continue
+                for ti, t0 in enumerate(event_times):
+                    lo = np.searchsorted(s, t0 + start, side="left")
+                    hi = np.searchsorted(s, t0 + end, side="right")
+                    if hi <= lo:
+                        continue
+                    rel = s[lo:hi] - t0
+                    counts, _ = np.histogram(rel, bins=edges)
+                    psth[bi, ti, :] = counts
+                    if include_raster:
+                        raster[bi, ti, : rel.size] = rel
+
+            psth /= bin_size  # counts -> firing rate (spikes / s)
+
+            da_psth = xr.DataArray(
+                psth,
+                dims=("unit", trial_dim, "time"),
+                coords={
+                    "unit_index": ("unit", batch_units),
+                    coord_trial: (trial_dim, trial_idx),
+                    "time": ("time", centers),
+                },
+                name=f"psth_{evt}",
+                attrs={
+                    "align_to_event": evt,
+                    "time_window": time_window,
+                    "bin_size": bin_size,
+                    "trial_type": trial_type or "all",
+                },
+            )
+            data_vars[f"psth_{evt}"] = da_psth
+
+            if include_raster:
+                da_raster = xr.DataArray(
+                    raster,
+                    dims=("unit", trial_dim, "spike"),
+                    coords={
+                        "unit_index": ("unit", batch_units),
+                        coord_trial: (trial_dim, trial_idx),
+                        "spike": np.arange(max_spikes[evt]),
+                    },
+                    name=f"raster_{evt}",
+                    attrs={
+                        "align_to_event": evt,
+                        "time_window": time_window,
+                        "description": "relative spike times (s), padded with NaN",
+                    },
+                )
+                data_vars[f"raster_{evt}"] = da_raster
+
+        ds_batch = xr.Dataset(data_vars)
+        if first_write:
+            ds_batch.attrs.update(global_attrs)
+            ds_batch.to_zarr(dest, mode="w", consolidated=True)
+            first_write = False
+        else:
+            ds_batch.to_zarr(dest, append_dim="unit", consolidated=True)
+
+    print(f"PSTH{' and raster' if include_raster else ''} data saved to {dest} "
+          f"[events={events}, units={n_u_total}, "
+          f"batch={unit_batch_size}, raster={include_raster}]")
+
+    # Return the full (lazy) dataset read back from the store.
+    return xr.open_zarr(dest, consolidated=True)
 
 
 def load_psth_raster_subset(
