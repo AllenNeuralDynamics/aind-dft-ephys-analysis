@@ -995,7 +995,14 @@ class OpticalTagging:
         # Optional mean-waveform inset in the top-right corner of the last raster.
         if show_waveform and last_raster_ax is not None:
             try:
-                units_table = self.nwb_ephys_data.units[:]
+                # The units table never changes during a session, so materialise
+                # it once and reuse. Reading self.nwb_ephys_data.units[:] every
+                # call rebuilds the full DataFrame (all waveforms) just to grab
+                # one row, which dominates render time for large sessions.
+                units_table = getattr(self, "_units_df_cache", None)
+                if units_table is None:
+                    units_table = self.nwb_ephys_data.units[:]
+                    self._units_df_cache = units_table
                 wf = np.array(units_table.loc[unit_index[0], "waveform_mean"])
                 # Peak channel = the one with the most negative trough
                 peak_ch = int(np.argmin(np.min(wf, axis=0)))
