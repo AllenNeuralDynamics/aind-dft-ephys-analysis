@@ -15,6 +15,15 @@ def _as_paths_list(folder_path: Union[str, Iterable[str]]) -> List[str]:
     return list(folder_path)
 
 
+# Sessions where the default ephys NWB (experiment1_recording1) lacks the units
+# table and the correct data lives in a different recording. Maps the core
+# session name (XXXXXX_YYYY-MM-DD_HH-MM-SS) -> the experimentN_recordingM token
+# to load instead. Applied in read_ephys_nwb, so combine_nwb benefits too.
+EPHYS_RECORDING_OVERRIDES = {
+    "858802_2026-08-13_14-12-20": "experiment1_recording2",
+}
+
+
 class NWBUtils:
     """
     Utility class offering static methods to locate and read ephys, behavior, and ophys NWB files.
@@ -73,7 +82,12 @@ class NWBUtils:
             return None
         nwb_folder = matched_folders[0]
 
-        exp_pattern = os.path.join(nwb_folder, 'nwb', '*experiment1_recording1.nwb')
+        # Default to experiment1_recording1, unless this session is overridden
+        # (e.g. a multi-recording session whose units live in recording2).
+        recording_token = EPHYS_RECORDING_OVERRIDES.get(core, 'experiment1_recording1')
+        if recording_token != 'experiment1_recording1':
+            print(f"Using ephys recording override for '{core}': {recording_token}")
+        exp_pattern = os.path.join(nwb_folder, 'nwb', f'*{recording_token}.nwb')
         files = glob.glob(exp_pattern)
         if not files:
             print(f"Warning: No NWB file found with pattern '{exp_pattern}'.")
