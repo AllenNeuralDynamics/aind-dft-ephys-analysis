@@ -31,6 +31,13 @@ def resolve_session_paths(session_date, data_root="/root/capsule/data"):
     Returns ``(behavior_json_file, ephys_nwb_file)``. Raises ``FileNotFoundError``
     if either cannot be located (the sorted folder carries an extra timestamp, so
     the NWB is found by glob).
+
+    The sorted asset may carry a plain ``_sorted_`` suffix OR a variant such as
+    ``_sorted-opto_`` / ``_sorted-bandpass_``; all are matched. When both a plain
+    ``_sorted_`` and a variant exist, the plain one is preferred. A few
+    multi-recording sessions store units in a recording other than recording1;
+    those are handled via ``EPHYS_RECORDING_OVERRIDES`` so the correct file is
+    returned.
     """
     behavior_json_file = (
         f"{data_root}/ecephys_{session_date}/behavior/{session_date}.json"
@@ -38,14 +45,25 @@ def resolve_session_paths(session_date, data_root="/root/capsule/data"):
     if not os.path.exists(behavior_json_file):
         raise FileNotFoundError(f"behavior JSON not found: {behavior_json_file}")
 
-    matches = glob.glob(
-        f"{data_root}/ecephys_{session_date}_sorted_*/nwb/"
-        f"ecephys_{session_date}_experiment1_recording1.nwb"
-    )
+    # Which recording holds the units (default recording1; a few multi-recording
+    # sessions put the units table in a different recording).
+    from nwb_utils import EPHYS_RECORDING_OVERRIDES
+    recording_token = EPHYS_RECORDING_OVERRIDES.get(
+        session_date, "experiment1_recording1")
+
+    # Match "_sorted_", "_sorted-opto_", "_sorted-bandpass_", etc.
+    matches = sorted(glob.glob(
+        f"{data_root}/ecephys_{session_date}_sorted*/nwb/"
+        f"ecephys_{session_date}_{recording_token}.nwb"
+    ))
     if not matches:
         raise FileNotFoundError(
-            f"no sorted NWB for session {session_date} under {data_root}")
-    return behavior_json_file, matches[0]
+            f"no sorted NWB ({recording_token}) for session {session_date} "
+            f"under {data_root}")
+    # Prefer a plain "_sorted_" asset over a "_sorted-<variant>_" one.
+    plain = [m for m in matches if "_sorted_" in m]
+    ephys_nwb_file = plain[0] if plain else matches[0]
+    return behavior_json_file, ephys_nwb_file
 
 
 def _as_tuple(c):
