@@ -189,15 +189,24 @@ def run_session(cfg):
         ot = OpticalTagging(behavior_json_file=beh, ephys_nwb_file=nwb)
         _log(f"loaded in {time.perf_counter() - _t:.1f}s")
 
-        # ---- compute metrics ----
+        # ---- compute metrics (or reuse an existing CSV) ----
         compute_kwargs = cfg.get("compute_kwargs", {})
-        _t = time.perf_counter()
-        metrics_df = ot.compute_tagging_metrics(**compute_kwargs)
-        _log(f"computed {len(metrics_df)} metric row(s) in "
-             f"{time.perf_counter() - _t:.1f}s")
-        if cfg.get("save_metrics", True):
-            os.makedirs(os.path.dirname(metrics_csv_path), exist_ok=True)
-            metrics_df.to_csv(metrics_csv_path, index=False)
+        skip_existing = cfg.get("skip_existing_metrics", False)
+        if skip_existing and os.path.exists(metrics_csv_path):
+            import pandas as pd
+            metrics_df = pd.read_csv(metrics_csv_path)
+            result["metrics_reused"] = True
+            _log(f"reused existing metrics ({len(metrics_df)} row(s)) from "
+                 f"{metrics_csv_path}; skipping recompute")
+        else:
+            _t = time.perf_counter()
+            metrics_df = ot.compute_tagging_metrics(**compute_kwargs)
+            result["metrics_reused"] = False
+            _log(f"computed {len(metrics_df)} metric row(s) in "
+                 f"{time.perf_counter() - _t:.1f}s")
+            if cfg.get("save_metrics", True):
+                os.makedirs(os.path.dirname(metrics_csv_path), exist_ok=True)
+                metrics_df.to_csv(metrics_csv_path, index=False)
         result["metrics_csv_path"] = metrics_csv_path
         result["n_metric_rows"] = int(len(metrics_df))
 
