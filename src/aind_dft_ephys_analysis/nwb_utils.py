@@ -78,9 +78,19 @@ class NWBUtils:
             print(f"Warning: No folder matching 'ecephys_{core}_*sorted*' found under {bases}.")
             return None
         if len(matched_folders) > 1:
-            print(f"Warning: Multiple ephys folders found for session '{core}': {matched_folders}.")
-            return None
-        nwb_folder = matched_folders[0]
+            # If the caller passed a complete folder name (i.e. it includes the
+            # sort suffix/timestamp, not just the core), honor that exact folder
+            # instead of bailing out on the ambiguity.
+            wanted = {session_name, f"ecephys_{session_name}"}
+            exact = [f for f in matched_folders if os.path.basename(f) in wanted]
+            if len(exact) == 1:
+                nwb_folder = exact[0]
+                print(f"Multiple ephys folders for '{core}'; using exact match: {os.path.basename(nwb_folder)}")
+            else:
+                print(f"Warning: Multiple ephys folders found for session '{core}': {matched_folders}.")
+                return None
+        else:
+            nwb_folder = matched_folders[0]
 
         # Default to experiment1_recording1, unless this session is overridden
         # (e.g. a multi-recording session whose units live in recording2).
