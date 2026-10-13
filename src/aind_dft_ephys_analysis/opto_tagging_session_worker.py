@@ -15,6 +15,7 @@ process ONE session with per-unit parallelism, use ``opto_tagging_figure_worker`
 picklable by ``spawn`` workers.
 """
 import os
+import re
 import sys
 import glob
 from ast import literal_eval
@@ -33,8 +34,10 @@ def resolve_session_paths(session_date, data_root="/root/capsule/data"):
     the NWB is found by glob).
 
     The sorted asset may carry a plain ``_sorted_`` suffix OR a variant such as
-    ``_sorted-opto_`` / ``_sorted-bandpass_``; all are matched. When both a plain
-    ``_sorted_`` and a variant exist, the plain one is preferred. A few
+    ``_sorted-opto_`` / ``_sorted-bandpass_``; all are matched. When several
+    sorted assets exist, the one with the **latest trailing sort timestamp**
+    (``..._YYYY-MM-DD_HH-MM-SS``) is used, regardless of the sorted variant
+    (so a newer ``_sorted-opto_`` beats an older ``_sorted_``). A few
     multi-recording sessions store units in a recording other than recording1;
     those are handled via ``EPHYS_RECORDING_OVERRIDES`` so the correct file is
     returned.
@@ -60,9 +63,21 @@ def resolve_session_paths(session_date, data_root="/root/capsule/data"):
         raise FileNotFoundError(
             f"no sorted NWB ({recording_token}) for session {session_date} "
             f"under {data_root}")
-    # Prefer a plain "_sorted_" asset over a "_sorted-<variant>_" one.
-    plain = [m for m in matches if "_sorted_" in m]
-    ephys_nwb_file = plain[0] if plain else matches[0]
+
+    # Pick the asset with the latest trailing sort timestamp
+    # (``..._YYYY-MM-DD_HH-MM-SS``), regardless of the sorted variant, so a
+    # newer ``_sorted-opto_`` is preferred over an older ``_sorted_``. Assets
+    # whose folder has no parseable timestamp sort last (fall back to name).
+    ts_re = re.compile(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})(?=[^\d]*$)")
+
+    def sort_timestamp(match_path):
+        # The sorted folder is the grandparent of the .nwb file
+        # (<sorted_folder>/nwb/<file>.nwb).
+        folder = os.path.basename(os.path.dirname(os.path.dirname(match_path)))
+        m = ts_re.search(folder)
+        return (m.group(1) if m else "", folder)
+
+    ephys_nwb_file = max(matches, key=sort_timestamp)
     return behavior_json_file, ephys_nwb_file
 
 
